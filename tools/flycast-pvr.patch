@@ -1,0 +1,143 @@
+diff --git a/core/cfg/cfg.h b/core/cfg/cfg.h
+--- a/core/cfg/cfg.h
++++ b/core/cfg/cfg.h
+@@ -6,6 +6,8 @@
+ namespace config
+ {
+ 
++extern bool Headless;
++
+ bool open();
+ int loadInt(const std::string& section, const std::string& key, int def = 0);
+ void saveInt(const std::string& section, const std::string& key, int value);
+diff --git a/core/cfg/cl.cpp b/core/cfg/cl.cpp
+--- a/core/cfg/cl.cpp
++++ b/core/cfg/cl.cpp
+@@ -26,6 +26,8 @@
+ namespace config
+ {
+ 
++bool Headless;
++
+ static void usage(const char *exe)
+ {
+ 	fprintf(stderr, "Usage: %s [option]... [<rom path>]\n", exe);
+@@ -33,6 +35,7 @@ static void usage(const char *exe)
+ 	fprintf(stderr, "Options:\n");
+ 	fprintf(stderr, "-config section:key=value,...  set a transient config value.\n");
+ 	fprintf(stderr, "                               Transient config values won't be saved to emu.cfg.\n");
++	fprintf(stderr, "-headless                      create a hidden rendering window\n");
+ 	fprintf(stderr, "-help                          display this help\n");
+ }
+ 
+@@ -183,6 +186,11 @@ void parseCommandLine(int argc, const char * const argv[])
+ 				parseConfigOption(argv[++i]);
+ 			continue;
+ 		}
++		if (!strcmp(argv[i], "-headless") || !strcmp(argv[i], "--headless"))
++		{
++			Headless = true;
++			continue;
++		}
+ 		// macOS
+ 		if (!strncmp(argv[i], "-NSDocumentRevisions", 20)) {
+ 			i++;
+diff --git a/core/cfg/option.cpp b/core/cfg/option.cpp
+--- a/core/cfg/option.cpp
++++ b/core/cfg/option.cpp
+@@ -148,6 +148,7 @@
+ Option<bool> GDB("Debug.GDBEnabled");
+ Option<int> GDBPort("Debug.GDBPort", debugger::DEFAULT_PORT);
+ Option<bool> GDBWaitForConnection("Debug.GDBWaitForConnection");
++Option<bool> FastForward("Debug.FastForward");
+ Option<bool> UseReios("UseReios");
+ Option<bool> FastGDRomLoad("FastGDRomLoad", false);
+ Option<bool> RamMod32MB("Dreamcast.RamMod32MB", false);
+diff --git a/core/cfg/option.h b/core/cfg/option.h
+--- a/core/cfg/option.h
++++ b/core/cfg/option.h
+@@ -497,6 +497,7 @@
+ extern Option<bool> GDB;
+ extern Option<int> GDBPort;
+ extern Option<bool> GDBWaitForConnection;
++extern Option<bool> FastForward;
+ extern Option<bool> UseReios;
+ extern Option<bool> FastGDRomLoad;
+ extern Option<bool> RamMod32MB;
+diff --git a/core/emulator.cpp b/core/emulator.cpp
+--- a/core/emulator.cpp
++++ b/core/emulator.cpp
+@@ -704,7 +704,8 @@ void Emulator::loadGame(const char *path, LoadProgress *progress)
+ 		// reload settings so that all settings can be overridden
+ 		loadGameSpecificSettings();
+ 		NetworkHandshake::init();
+-		settings.input.fastForwardMode = false;
++		settings.input.fastForwardMode = config::FastForward
++				&& !settings.network.online && !settings.naomi.multiboard;
+ 		EventManager::event(Event::Start);
+ 		if (!settings.content.path.empty())
+ 		{
+diff --git a/core/sdl/sdl.cpp b/core/sdl/sdl.cpp
+--- a/core/sdl/sdl.cpp
++++ b/core/sdl/sdl.cpp
+@@ -704,6 +704,8 @@ HWND getNativeHwnd()
+ bool sdl_recreate_window(u32 flags)
+ {
+ 	windowFlags = flags;
++	if (config::Headless)
++		flags |= SDL_WINDOW_HIDDEN;
+ #ifdef _WIN32
+     //Enable HiDPI mode in Windows
+     typedef enum PROCESS_DPI_AWARENESS {
+@@ -850,7 +852,7 @@ bool sdl_recreate_window(u32 flags)
+ 	settings.display.height = windowPos.h * hdpiScaling;
+ 
+ #ifdef __linux__
+-	if (flags & SDL_WINDOW_RESIZABLE)
++	if ((flags & SDL_WINDOW_RESIZABLE) && !config::Headless)
+ 	{
+ 		// The position passed to SDL_CreateWindow doesn't take decorations into account on linux.
+ 		// SDL_ShowWindow retrieves the border dimensions and SDL_SetWindowPosition uses them
+diff --git a/core/hw/sh4/modules/fastmmu.cpp b/core/hw/sh4/modules/fastmmu.cpp
+--- a/core/hw/sh4/modules/fastmmu.cpp
++++ b/core/hw/sh4/modules/fastmmu.cpp
+@@ -56,12 +56,23 @@ static void cache_entry(const TLB_Entry &entry)
+ {
+ 	if (entry.Data.SZ0 == 0 && entry.Data.SZ1 == 0)
+ 		return;
++	u16 bucket = bucket_index(entry.Address.VPN << 10, entry.Data.SZ1 * 2 + entry.Data.SZ0, entry.Address.ASID);
++	for (TLB_LinkedEntry *cached = entry_buckets[bucket]; cached != nullptr; cached = cached->next_entry)
++	{
++		if (cached->entry.Address.VPN == entry.Address.VPN
++				&& cached->entry.Address.ASID == entry.Address.ASID
++				&& cached->entry.Data.SZ0 == entry.Data.SZ0
++				&& cached->entry.Data.SZ1 == entry.Data.SZ1)
++		{
++			cached->entry = entry;
++			return;
++		}
++	}
+ 	if (full_table_size >= std::size(full_table))
+ 		return;
+ 
+ 	full_table[full_table_size].entry = entry;
+ 
+-	u16 bucket = bucket_index(entry.Address.VPN << 10, entry.Data.SZ1 * 2 + entry.Data.SZ0, entry.Address.ASID);
+ 	full_table[full_table_size].next_entry = entry_buckets[bucket];
+ 	entry_buckets[bucket] = &full_table[full_table_size];
+ 	full_table_size++;
+diff --git a/core/rend/TexCache.cpp b/core/rend/TexCache.cpp
+--- a/core/rend/TexCache.cpp
++++ b/core/rend/TexCache.cpp
+@@ -1143,10 +1143,7 @@ template void ReadFramebuffer<BGRAPacker>(const FramebufferInfo& info, PixelBuff
+ template<int bits>
+ static inline u8 roundColor(u8 in)
+ {
+-	u8 out = in >> (8 - bits);
+-	if (out != 0xffu >> (8 - bits))
+-		out += (in >> (8 - bits - 1)) & 1;
+-	return out;
++	return (u32(in) * ((1u << bits) - 1) + 127) / 255;
+ }
+ 
+ // write to 32-bit vram area (framebuffer)

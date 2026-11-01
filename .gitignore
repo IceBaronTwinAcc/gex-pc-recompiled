@@ -1,0 +1,13 @@
+/Gex/
+/pcrecomp/
+/.venv/
+/.deps/
+/build/
+/config/pe_analysis.json
+/config/functions.json
+/config/*.log
+/src/recomp/gen/
+__pycache__/
+*.pyc
+core
+core.*

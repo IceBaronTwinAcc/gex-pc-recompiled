@@ -1,0 +1,3747 @@
+diff --git a/runtime/recomp32/recomp_types.h b/runtime/recomp32/recomp_types.h
+index d827cad..166e4f4 100644
+--- a/runtime/recomp32/recomp_types.h
++++ b/runtime/recomp32/recomp_types.h
+@@ -68,10 +68,12 @@ extern uint16_t g_fpu_cw;
+  * Defined here, weakly, so no project's runtime has to. */
+ #if defined(_MSC_VER)
+ #define RECOMP_WEAK __declspec(selectany)
++#elif defined(__MINGW32__)
++#define RECOMP_WEAK __attribute__((selectany))
+ #else
+ #define RECOMP_WEAK __attribute__((weak))
+ #endif
+-RECOMP_WEAK uint32_t g_flag_k, g_flag_a, g_flag_b, g_flag_cf;
++RECOMP_WEAK uint32_t g_flag_k = 0, g_flag_a = 0, g_flag_b = 0, g_flag_cf = 0;
+ #define RECOMP_FLAGS_OUT() (g_flag_k = _flag_k, g_flag_a = _flag_a, g_flag_b = _flag_b, g_flag_cf = _cf)
+ #define RECOMP_FLAGS_IN()  (_flag_k = g_flag_k, _flag_a = g_flag_a, _flag_b = g_flag_b, _cf = g_flag_cf)
+ 
+@@ -216,12 +218,25 @@ void     recomp_sti(void);
+ void     recomp_hlt(void);
+ void     recomp_set_seg(int sreg, uint32_t selector);
+ 
+-#define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
++#ifdef RECOMP_UNALIGNED_MEMORY
++typedef struct __attribute__((packed, may_alias)) { uint16_t value; } recomp_u16;
++typedef struct __attribute__((packed, may_alias)) { uint32_t value; } recomp_u32;
++typedef struct __attribute__((packed, may_alias)) { uint64_t value; } recomp_u64;
++typedef struct __attribute__((packed, may_alias)) { float value; } recomp_float;
++typedef struct __attribute__((packed, may_alias)) { double value; } recomp_double;
++#define MEM16(addr) (((volatile recomp_u16 *)ADDR(addr))->value)
++#define MEM32(addr) (((volatile recomp_u32 *)ADDR(addr))->value)
++#define MEM64(addr) (((volatile recomp_u64 *)ADDR(addr))->value)
++#define MEMF(addr) (((volatile recomp_float *)ADDR(addr))->value)
++#define MEMD(addr) (((volatile recomp_double *)ADDR(addr))->value)
++#else
+ #define MEM16(addr)  (*(volatile uint16_t *)ADDR(addr))
+ #define MEM32(addr)  (*(volatile uint32_t *)ADDR(addr))
+ #define MEM64(addr)  (*(volatile uint64_t *)ADDR(addr))
+ #define MEMF(addr)   (*(volatile float    *)ADDR(addr))
+ #define MEMD(addr)   (*(volatile double   *)ADDR(addr))
++#endif
++#define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
+ 
+ /* Set 32-bit values in memory (for rep stosd) */
+ static inline void MEMSET32(void* dst, uint32_t val, uint32_t count) {
+@@ -983,6 +998,8 @@ static inline uint32_t sse_cmp_pred(double a, double b, int p) {
+  * project runtime has to grow a definition for it. */
+ #if defined(_MSC_VER)
+ #define RECOMP_SHARED_DATA __declspec(selectany)
++#elif defined(__MINGW32__)
++#define RECOMP_SHARED_DATA __attribute__((selectany))
+ #else
+ #define RECOMP_SHARED_DATA __attribute__((weak))
+ #endif
+@@ -1110,7 +1127,7 @@ extern uint32_t g_cur_func;
+  * alias_entries). Without it every alias is a second copy of the rest of its
+  * parent. One instance is enough: it is set and read with no guest code in
+  * between, under the machine lock. */
+-RECOMP_WEAK uint32_t g_alias_entry;
++RECOMP_WEAK uint32_t g_alias_entry = 0;
+ 
+ /* ICALL trace ring buffer for crash diagnostics.
+  *
+@@ -1271,8 +1288,8 @@ void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume);
+  * there. The registers go back to the globals around the hand-over, which is
+  * all a native call does. The counter is global and unsynchronised on purpose:
+  * only the thread holding the machine runs lifted code. */
+-RECOMP_WEAK void (*recomp_yield_hook)(void);
+-RECOMP_WEAK uint32_t g_backedges;
++RECOMP_WEAK void (*recomp_yield_hook)(void) = NULL;
++RECOMP_WEAK uint32_t g_backedges = 0;
+ #ifndef RECOMP_YIELD_EVERY
+ #define RECOMP_YIELD_EVERY 0x10000u
+ #endif
+diff --git a/runtime/win32hle/advapi32.c b/runtime/win32hle/advapi32.c
+index 002514a..093e632 100644
+--- a/runtime/win32hle/advapi32.c
++++ b/runtime/win32hle/advapi32.c
+@@ -6,15 +6,16 @@
+  * The registry is in memory: a tree of keys, each with named values. A host
+  * seeds what the game expects an installer to have written
+  * (hle_reg_set_string/_dword), and may give it a file to persist to
+- * (hle_reg_load/hle_reg_save: one "key\name=type:value" per line).
++ * (hle_reg_load/hle_reg_flush: one "key\name=type:value" per line).
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
++#include <errno.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
++#include "platform/filesystem.h"
+ 
+ #define ERROR_SUCCESS        0u
+ #define ERROR_FILE_NOT_FOUND 2u
+@@ -45,7 +46,7 @@ static rkey_t *subkey(rkey_t *k, const char *path, int create) {
+         while (*path == '\\') path++;
+         if (!part[0]) continue;
+         rkey_t *c = k->child;
+-        while (c && strcasecmp(c->name, part)) c = c->next;
++        while (c && gex_string_compare_case(c->name, part)) c = c->next;
+         if (!c && create) {
+             c = (rkey_t *)calloc(1, sizeof *c);
+             snprintf(c->name, sizeof c->name, "%s", part);
+@@ -58,7 +59,7 @@ static rkey_t *subkey(rkey_t *k, const char *path, int create) {
+ static value_t *find_value(rkey_t *k, const char *name, int create) {
+     value_t *v = k->values;
+     if (!name) name = "";
+-    while (v && strcasecmp(v->name, name)) v = v->next;
++    while (v && gex_string_compare_case(v->name, name)) v = v->next;
+     if (!v && create) {
+         v = (value_t *)calloc(1, sizeof *v);
+         snprintf(v->name, sizeof v->name, "%s", name);
+@@ -76,9 +77,9 @@ static void set_value(rkey_t *k, const char *name, uint32_t type, const void *da
+ }
+ 
+ static int root_index(const char *name) {
+-    for (int i = 0; i < 6; i++) if (!strcasecmp(name, g_root_names[i])) return i;
+-    if (!strcasecmp(name, "HKLM")) return 2;
+-    if (!strcasecmp(name, "HKCU")) return 1;
++    for (int i = 0; i < 6; i++) if (!gex_string_compare_case(name, g_root_names[i])) return i;
++    if (!gex_string_compare_case(name, "HKLM")) return 2;
++    if (!gex_string_compare_case(name, "HKCU")) return 1;
+     return -1;
+ }
+ void hle_reg_set_string(uint32_t root, const char *path, const char *name, const char *s) {
+@@ -89,31 +90,67 @@ void hle_reg_set_dword(uint32_t root, const char *path, const char *name, uint32
+ }
+ 
+ /* the file: HKEY_LOCAL_MACHINE\SOFTWARE\x\name=sz:text | dword:0x1 | hex:0a0b */
+-void hle_reg_load(const char *file) {
++int hle_reg_load(const char *file) {
+     FILE *f = fopen(file, "r");
+     char line[2048];
+-    g_reg_file = file;
+-    while (f && fgets(line, sizeof line, f)) {
++    if (!f) {
++        if (gex_fs_error() == GEX_IO_MISSING) { g_reg_file = file; return 0; }
++        fprintf(stderr, "[reg] cannot read %s: %s\n", file, gex_fs_error_text());
++        return 1;
++    }
++    unsigned line_number = 0;
++    while (fgets(line, sizeof line, f)) {
++        ++line_number;
++        if (!strchr(line, '\n') && !feof(f)) goto invalid;
+         line[strcspn(line, "\r\n")] = 0;
++        if (!line[0] || line[0] == '#') continue;
+         char *eq = strchr(line, '='), *colon = eq ? strchr(eq, ':') : NULL;
+-        if (!eq || !colon) continue;
++        if (!eq || !colon) goto invalid;
+         *eq = 0, *colon = 0;
+         char *bs = strchr(line, '\\'), *name = strrchr(line, '\\');
+-        if (!bs || !name) continue;
++        if (!bs || !name) goto invalid;
+         *bs = 0, *name++ = 0;
+         int r = root_index(line);
+-        if (r < 0) continue;
++        if (r < 0) goto invalid;
+         rkey_t *k = subkey(&g_roots[r], name == bs + 1 ? "" : bs + 1, 1);
+         if (!strcmp(eq + 1, "sz")) set_value(k, name, REG_SZ, colon + 1, (uint32_t)strlen(colon + 1) + 1);
+-        else if (!strcmp(eq + 1, "dword")) { uint32_t v = (uint32_t)strtoul(colon + 1, NULL, 0); set_value(k, name, REG_DWORD, &v, 4); }
+-        else {
++        else if (!strcmp(eq + 1, "dword")) {
++            char *end;
++            errno = 0;
++            unsigned long number = strtoul(colon + 1, &end, 0);
++            if (errno || end == colon + 1 || *end || number > UINT32_MAX) goto invalid;
++            uint32_t v = (uint32_t)number;
++            set_value(k, name, REG_DWORD, &v, 4);
++        } else if (!strcmp(eq + 1, "hex")) {
+             uint8_t buf[1024];
+             uint32_t n = 0;
+-            for (const char *p = colon + 1; p[0] && p[1] && n < sizeof buf; p += 2) { unsigned b; sscanf(p, "%2x", &b); buf[n++] = (uint8_t)b; }
++            size_t length = strlen(colon + 1);
++            if (length % 2 || length > sizeof buf * 2) goto invalid;
++            for (const char *p = colon + 1; *p; p += 2) {
++                if (!strchr("0123456789abcdefABCDEF", p[0]) ||
++                    !strchr("0123456789abcdefABCDEF", p[1])) goto invalid;
++                unsigned b;
++                if (sscanf(p, "%2x", &b) != 1) goto invalid;
++                buf[n++] = (uint8_t)b;
++            }
+             set_value(k, name, REG_BINARY, buf, n);
+-        }
++        } else goto invalid;
++    }
++    if (ferror(f)) {
++        fprintf(stderr, "[reg] error reading %s: %s\n", file, gex_fs_error_text());
++        fclose(f);
++        return 1;
++    }
++    if (fclose(f)) {
++        fprintf(stderr, "[reg] error closing %s: %s\n", file, gex_fs_error_text());
++        return 1;
+     }
+-    if (f) fclose(f);
++    g_reg_file = file;
++    return 0;
++invalid:
++    fprintf(stderr, "[reg] invalid settings in %s at line %u\n", file, line_number);
++    fclose(f);
++    return 1;
+ }
+ static void save_key(FILE *f, rkey_t *k, const char *path) {
+     for (value_t *v = k->values; v; v = v->next) {
+@@ -128,12 +165,20 @@ static void save_key(FILE *f, rkey_t *k, const char *path) {
+         save_key(f, c, p);
+     }
+ }
+-static void reg_save(void) {
+-    if (!g_reg_file) return;
+-    FILE *f = fopen(g_reg_file, "w");
+-    if (!f) return;
++uint32_t hle_reg_flush(void) {
++    if (!g_reg_file) return ERROR_SUCCESS;
++    char *temporary = NULL;
++    FILE *f = gex_fs_replace_begin(g_reg_file, &temporary);
++    if (!f) {
++        fprintf(stderr, "[reg] cannot create settings file for %s: %s\n", g_reg_file, gex_fs_error_text());
++        return 5u;
++    }
+     for (int i = 0; i < 6; i++) save_key(f, &g_roots[i], g_root_names[i]);
+-    fclose(f);
++    int failed = gex_fs_replace_commit(f, temporary, g_reg_file);
++    if (failed)
++        fprintf(stderr, "[reg] cannot save settings to %s: %s\n", g_reg_file, gex_fs_error_text());
++    free(temporary);
++    return failed ? 5u : ERROR_SUCCESS;
+ }
+ 
+ static uint32_t open_key(uint32_t parent, const char *path, uint32_t out, int create) {
+@@ -173,21 +218,19 @@ static void r_RegSetValueExA(void) {                     /* (key, name, 0, type,
+     rkey_t *k = root_of(A32(0));
+     if (!k) RET(6u, 6);
+     set_value(k, ASTR(1), A32(3), APTR(4), A32(5));
+-    reg_save();
+-    RET(ERROR_SUCCESS, 6);
++    RET(hle_reg_flush(), 6);
+ }
+ static void r_RegDeleteValueA(void) {
+     rkey_t *k = root_of(A32(0));
+     for (value_t **v = k ? &k->values : NULL; v && *v; v = &(*v)->next)
+-        if (!strcasecmp((*v)->name, ASTR(1) ? ASTR(1) : "")) { value_t *d = *v; *v = d->next; free(d->data); free(d); reg_save(); RET(0, 2); }
++        if (!gex_string_compare_case((*v)->name, ASTR(1) ? ASTR(1) : "")) { value_t *d = *v; *v = d->next; free(d->data); free(d); RET(hle_reg_flush(), 2); }
+     RET(ERROR_FILE_NOT_FOUND, 2);
+ }
+ static void r_RegDeleteKeyA(void) {                      /* (key, sub): a key without subkeys */
+     rkey_t *k = root_of(A32(0)), *d = k ? subkey(k, ASTR(1), 0) : NULL;
+     if (!d || d->child || !d->parent) RET(ERROR_FILE_NOT_FOUND, 2);
+     for (rkey_t **c = &d->parent->child; *c; c = &(*c)->next) if (*c == d) { *c = d->next; break; }
+-    reg_save();
+-    RET(ERROR_SUCCESS, 2);
++    RET(hle_reg_flush(), 2);
+ }
+ static void r_RegEnumKeyExA(void) {                      /* (key, index, name, &nameN, 0, class, &classN, &time) */
+     rkey_t *k = root_of(A32(0)), *c = k ? k->child : NULL;
+diff --git a/runtime/win32hle/ddraw.c b/runtime/win32hle/ddraw.c
+index 1c33129..a700178 100644
+--- a/runtime/win32hle/ddraw.c
++++ b/runtime/win32hle/ddraw.c
+@@ -376,6 +376,9 @@ static void mark(surf_t *d) {
+     g_frame_seq++;
+     if (hle_dd_primary_hook) hle_dd_primary_hook();
+ }
++void hle_dd_primary_touched(void) {
++    if (g_primary) mark(g_primary);
++}
+ 
+ /* The copy: same format at both ends (DirectDraw does not convert either),
+  * clipped to both surfaces, stretched nearest-neighbour when the sizes
+diff --git a/runtime/win32hle/dsound.c b/runtime/win32hle/dsound.c
+index 8880749..c44a28a 100644
+--- a/runtime/win32hle/dsound.c
++++ b/runtime/win32hle/dsound.c
+@@ -1,26 +1,14 @@
+ /*
+- * dsound.c - DirectSound on SDL2 audio: IDirectSound and IDirectSoundBuffer,
+- * with a software mixer.
+- *
+- * A secondary buffer is guest memory the game Locks and writes, as it would
+- * be on Windows; the mixer (SDL's audio thread) reads it at the buffer's
+- * frequency, volume and pan and moves its play cursor in real time, so a
+- * game that streams into a looping buffer by watching GetCurrentPosition
+- * keeps doing so. The primary buffer is only its format: everything is mixed
+- * at the device's rate. One mutex covers the buffers' state, between the
+- * mixer and the shims.
+- *
+- * With no audio device (SDL_AUDIODRIVER=dummy, a headless box) SDL's dummy
+- * driver still runs the callback in real time, so the cursors still move.
++ * Guest DirectSound objects. Playback, cursors, gain and sample-rate conversion
++ * belong to platform audio voices, not to the recompiled game or a CPU mixer.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
+-#include <pthread.h>
+-#include <SDL2/SDL.h>
++#include "platform/runtime.h"
++#include "platform/audio.h"
+ #include "win32hle.h"
+ 
+ #define DS_OK               0u
+@@ -34,26 +22,21 @@
+ #define DSBSTATUS_PLAYING   0x00000001u
+ #define DSBSTATUS_LOOPING   0x00000004u
+ 
+-#define OUT_RATE 44100
+-
+ typedef struct {
+     uint8_t *data;              /* the samples, guest-visible */
+     int *data_refs;             /* shared with duplicates */
+     uint32_t bytes, flags;
+-    int channels, bits, rate, block;
++    int channels, bits, rate, original_rate, block;
+     int playing, looping, primary;
+-    double pos;                 /* the play cursor, in frames */
++    gex_audio_voice *voice;
+     int volume, pan;            /* hundredths of a dB; -10000..10000 */
+     float gl, gr;
+ } dsbuf;
+ 
+-static pthread_mutex_t g_mix = PTHREAD_MUTEX_INITIALIZER;
++static gex_mutex g_mix = GEX_MUTEX_INIT;
+ #define MAX_BUFS 256
+ static dsbuf *g_buf[MAX_BUFS];
+-static SDL_AudioDeviceID g_dev;
+-static int g_audio_ok = -1;
+-static float g_master = 1.0f;
+-void hle_dsound_set_master(float gain) { g_master = gain; }
++void hle_dsound_set_master(float gain) { gex_audio_master(gain); }
+ 
+ static void gains(dsbuf *b) {
+     float v = b->volume <= -10000 ? 0.0f : powf(10.0f, (float)b->volume / 2000.0f);
+@@ -61,211 +44,32 @@ static void gains(dsbuf *b) {
+     if (b->pan < 0) r = b->pan <= -10000 ? 0.0f : powf(10.0f, (float)b->pan / 2000.0f);
+     if (b->pan > 0) l = b->pan >= 10000 ? 0.0f : powf(10.0f, (float)-b->pan / 2000.0f);
+     b->gl = v * l, b->gr = v * r;
++    if (b->voice) gex_audio_voice_gain(b->voice, b->gl, b->gr);
+ }
+ 
+-static inline float sample(const dsbuf *b, uint32_t frame, int ch) {
+-    const uint8_t *p = b->data + (size_t)frame * (uint32_t)b->block + (b->channels > 1 ? (size_t)ch * (uint32_t)(b->bits / 8) : 0);
+-    return b->bits == 16 ? (float)*(const int16_t *)p / 32768.0f : ((float)*p - 128.0f) / 128.0f;
+-}
+-
+-static int audio_open(void);
+-static int audio_open_once(void) { return audio_open(); }
+-
+-/* Host streams: PCM a host pushes (a movie's sound), mixed with the
+- * buffers. A ring of interleaved s16 at the stream's rate, played at that
+- * rate. */
++static int audio_open_once(void) { return gex_audio_open(); }
+ #define MAX_STREAMS 4
+-#define STREAM_FRAMES (1 << 17)
+-static struct { int used, channels, rate; float gain; int16_t *ring; uint32_t rd, wr; double pos; } g_stream[MAX_STREAMS];
++#define STREAM_FRAMES GEX_AUDIO_STREAM_FRAMES
+ int hle_audio_stream_open(int rate, int channels) {
+-    if (!audio_open_once()) return -1;
+-    pthread_mutex_lock(&g_mix);
+-    int id = -1;
+-    for (int i = 0; i < MAX_STREAMS && id < 0; i++)
+-        if (!g_stream[i].used) {
+-            id = i;
+-            g_stream[i].ring = (int16_t *)calloc(STREAM_FRAMES * 2, 2);
+-            g_stream[i].used = 1, g_stream[i].channels = channels, g_stream[i].rate = rate, g_stream[i].gain = 1.0f;
+-            g_stream[i].rd = g_stream[i].wr = 0, g_stream[i].pos = 0;
+-        }
+-    pthread_mutex_unlock(&g_mix);
+-    return id;
+-}
+-void hle_audio_stream_push(int id, const int16_t *pcm, int frames) {
+-    if (id < 0 || id >= MAX_STREAMS) return;
+-    pthread_mutex_lock(&g_mix);
+-    for (int f = 0; f < frames && g_stream[id].wr - g_stream[id].rd < STREAM_FRAMES - 1; f++, g_stream[id].wr++) {
+-        uint32_t k = g_stream[id].wr % STREAM_FRAMES;
+-        g_stream[id].ring[2 * k] = pcm[f * g_stream[id].channels];
+-        g_stream[id].ring[2 * k + 1] = pcm[f * g_stream[id].channels + (g_stream[id].channels > 1)];
+-    }
+-    pthread_mutex_unlock(&g_mix);
++    return gex_audio_stream_open(rate, channels);
+ }
+-int hle_audio_stream_queued(int id) {                    /* frames not yet played */
+-    if (id < 0 || id >= MAX_STREAMS) return 0;
+-    pthread_mutex_lock(&g_mix);
+-    int n = (int)(g_stream[id].wr - g_stream[id].rd);
+-    pthread_mutex_unlock(&g_mix);
+-    return n;
+-}
+-void hle_audio_stream_gain(int id, float gain) { if (id >= 0 && id < MAX_STREAMS) g_stream[id].gain = gain; }
+-void hle_audio_stream_close(int id) {
+-    if (id < 0 || id >= MAX_STREAMS) return;
+-    pthread_mutex_lock(&g_mix);
+-    free(g_stream[id].ring);
+-    memset(&g_stream[id], 0, sizeof g_stream[id]);
+-    pthread_mutex_unlock(&g_mix);
+-}
+-
+-static void mix(void *ud, Uint8 *stream, int len) {
+-    (void)ud;
+-    int frames = len / 4;
+-    static float acc[2 * 8192];
+-    if (frames > 8192) frames = 8192;
+-    memset(acc, 0, sizeof(float) * 2 * (size_t)frames);
+-    pthread_mutex_lock(&g_mix);
+-    for (int i = 0; i < MAX_BUFS; i++) {
+-        dsbuf *b = g_buf[i];
+-        if (!b || !b->playing || b->primary || !b->block) continue;
+-        uint32_t nframes = b->bytes / (uint32_t)b->block;
+-        double step = (double)b->rate / OUT_RATE;
+-        for (int f = 0; f < frames && b->playing; f++) {
+-            uint32_t at = (uint32_t)b->pos;
+-            if (at >= nframes) {
+-                if (b->looping) { b->pos -= nframes; at = (uint32_t)b->pos; if (at >= nframes) b->pos = 0, at = 0; }
+-                else { b->playing = 0; b->pos = 0; break; }
+-            }
+-            float l = sample(b, at, 0), r = b->channels > 1 ? sample(b, at, 1) : l;
+-            acc[2 * f] += l * b->gl;
+-            acc[2 * f + 1] += r * b->gr;
+-            b->pos += step;
+-        }
+-    }
+-    for (int i = 0; i < MAX_STREAMS; i++) {
+-        if (!g_stream[i].used) continue;
+-        double step = (double)g_stream[i].rate / OUT_RATE;
+-        for (int f = 0; f < frames && g_stream[i].rd < g_stream[i].wr; f++) {
+-            uint32_t k = g_stream[i].rd % STREAM_FRAMES;
+-            acc[2 * f] += g_stream[i].ring[2 * k] / 32768.0f * g_stream[i].gain;
+-            acc[2 * f + 1] += g_stream[i].ring[2 * k + 1] / 32768.0f * g_stream[i].gain;
+-            g_stream[i].pos += step;
+-            while (g_stream[i].pos >= 1.0 && g_stream[i].rd < g_stream[i].wr) g_stream[i].pos -= 1.0, g_stream[i].rd++;
+-        }
+-    }
+-    pthread_mutex_unlock(&g_mix);
+-    int16_t *out = (int16_t *)stream;
+-    for (int k = 0; k < 2 * frames; k++) {
+-        float v = acc[k] * g_master * 32767.0f;
+-        out[k] = (int16_t)(v > 32767.0f ? 32767 : v < -32768.0f ? -32768 : v);
+-    }
++int hle_audio_stream_write(int id, const int16_t *pcm, int frames) {
++    return gex_audio_stream_write(id, pcm, frames);
+ }
+-
+-#ifdef __EMSCRIPTEN__
+-/* In a browser SDL's audio cannot be opened from the game's thread (its
+- * Emscripten driver keeps its state on the page's thread), so the mixer
+- * feeds a ring of stereo s16 frames in shared memory from a thread of its
+- * own, and an AudioWorklet on the page's thread (plain JS, started here)
+- * plays the ring out. [0] is the read index (the worklet's), [1] the
+- * write index (the feeder's), both free-running frame counts. */
+-#include <emscripten.h>
+-#include <emscripten/threading.h>
+-#include <unistd.h>
+-#define RING_FRAMES 16384u                                /* 370 ms; the feeder keeps ~90 ms queued */
+-#define RING_KEEP   4096u
+-static int16_t g_ring[RING_FRAMES * 2];
+-static uint32_t g_ring_idx[2];
+-EM_JS(void, web_audio_start_js, (int rate, void *ring, int frames, void *idx), {
+-    try {
+-        var ctx = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' });
+-        var code = "class R extends AudioWorkletProcessor {" +
+-            " constructor(o) { super(); var p = o.processorOptions; this.pcm = new Int16Array(p.buffer, p.ring, p.frames * 2); this.idx = new Uint32Array(p.buffer, p.idx, 2); this.mask = p.frames - 1; }" +
+-            " process(inputs, outputs) { var out = outputs[0], L = out[0], R = out[1] || out[0], n = L.length;" +
+-            "  var rd = Atomics.load(this.idx, 0), wr = Atomics.load(this.idx, 1), avail = (wr - rd) >>> 0, take = Math.min(n, avail), i;" +
+-            "  for (i = 0; i < take; i++) { var f = ((rd + i) & this.mask) * 2; L[i] = this.pcm[f] / 32768; R[i] = this.pcm[f + 1] / 32768; }" +
+-            "  for (; i < n; i++) { L[i] = 0; R[i] = 0; }" +
+-            "  Atomics.store(this.idx, 0, (rd + take) >>> 0); return true; } }" +
+-            " registerProcessor('ra2-ring', R);";
+-        var url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+-        ctx.audioWorklet.addModule(url).then(function() {
+-            var node = new AudioWorkletNode(ctx, 'ra2-ring', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+-                processorOptions: { buffer: wasmMemory.buffer, ring: ring, frames: frames, idx: idx } });
+-            node.connect(ctx.destination);
+-        }).catch(function(e) { err('[dsound] worklet: ' + e); });
+-        var resume = function() { if (ctx.state !== 'running') ctx.resume(); };
+-        document.addEventListener('click', resume);
+-        document.addEventListener('keydown', resume);
+-        resume();
+-        Module['ra2Audio'] = ctx;
+-    } catch (e) { err('[dsound] web audio: ' + e); }
+-});
+-static void web_audio_start(int rate, void *ring, int frames, void *idx) {
+-    /* on the page's thread, which owns the AudioContext */
+-    emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VIIII, web_audio_start_js, rate, ring, frames, idx);
++void hle_audio_stream_push(int id, const int16_t *pcm, int frames) {
++    if (hle_audio_stream_write(id, pcm, frames) != frames)
++        hle_fatal("audio stream %d overflow: use hle_audio_stream_write for backpressure", id);
+ }
+-static void *audio_feeder(void *arg) {
+-    (void)arg;
+-    uint8_t chunk[1024 * 4];
+-    uint32_t last_rd = 0, moved_at = hle_ticks_ms();
+-    for (;;) {
+-        uint32_t rd = __atomic_load_n(&g_ring_idx[0], __ATOMIC_ACQUIRE), wr = g_ring_idx[1];
+-        uint32_t used = wr - rd, now = hle_ticks_ms();
+-        if (rd != last_rd) last_rd = rd, moved_at = now;
+-        if (used < RING_KEEP && RING_FRAMES - used >= 1024u) {
+-            mix(NULL, chunk, sizeof chunk);
+-            for (uint32_t i = 0; i < 1024u; i++) {
+-                uint32_t f = (wr + i) & (RING_FRAMES - 1);
+-                g_ring[2 * f] = ((int16_t *)chunk)[2 * i];
+-                g_ring[2 * f + 1] = ((int16_t *)chunk)[2 * i + 1];
+-            }
+-            __atomic_store_n(&g_ring_idx[1], wr + 1024u, __ATOMIC_RELEASE);
+-        } else if (now - moved_at > 500) {
+-            /* the page is not playing (its AudioContext suspended, the tab in
+-             * the background): the mixer runs anyway, into nothing, so the
+-             * buffers' play cursors keep moving and a game watching them
+-             * (streaming music, waiting for a sound to end) goes on */
+-            mix(NULL, chunk, sizeof chunk);
+-            usleep(1024u * 1000u / OUT_RATE * 1000u);
+-        } else {
+-            usleep(5000);
+-        }
+-    }
+-    return NULL;
++int hle_audio_stream_queued(int id) { return gex_audio_stream_queued(id); }
++void hle_audio_stream_gain(int id, float gain) {
++    gex_audio_stream_gain(id, gain);
+ }
+-static int audio_open(void) {
+-    if (g_audio_ok >= 0) return g_audio_ok;
+-    g_audio_ok = 0;
+-    pthread_t t;
+-    if (pthread_create(&t, NULL, audio_feeder, NULL) != 0) { fprintf(stderr, "[dsound] no feeder thread: silent\n"); return 0; }
+-    pthread_detach(t);
+-    web_audio_start(OUT_RATE, g_ring, (int)RING_FRAMES, g_ring_idx);
+-    fprintf(stderr, "[dsound] web audio, %d Hz\n", OUT_RATE);
+-    return g_audio_ok = 1;
++void hle_audio_stream_pause(int id, int paused) {
++    gex_audio_stream_pause(id, paused);
+ }
+-#else
+-static int audio_open(void) {
+-    if (g_audio_ok >= 0) return g_audio_ok;
+-    g_audio_ok = 0;
+-    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process, not WM_CLOSE */
+-    SDL_AudioSpec want, have;
+-    SDL_zero(want);
+-    want.freq = OUT_RATE, want.format = AUDIO_S16SYS, want.channels = 2, want.samples = 1024, want.callback = mix;
+-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+-    if (!g_dev) {
+-        /* No sound card (a server, a container): a silent device whose
+-         * cursors still move, rather than DirectSound failing. A game whose
+-         * sound DLL takes the failure for granted (Civilization III's
+-         * sound.dll) would fault on it. */
+-        fprintf(stderr, "[dsound] no audio device (%s): silent\n", SDL_GetError());
+-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+-        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+-        if (!g_dev) { fprintf(stderr, "[dsound] no audio: %s\n", SDL_GetError()); return 0; }
+-    }
+-    SDL_PauseAudioDevice(g_dev, 0);
+-    fprintf(stderr, "[dsound] %s, %d Hz\n", SDL_GetCurrentAudioDriver(), have.freq);
+-    return g_audio_ok = 1;
++void hle_audio_stream_close(int id) {
++    gex_audio_stream_close(id);
+ }
+-#endif
+ 
+ /* the object: vtable, refs, then the buffer slot */
+ #define SLOT(self) MEM32((self) + 8)
+@@ -273,11 +77,11 @@ static dsbuf *buf_of(uint32_t self) { uint32_t i = SLOT(self); return i < MAX_BU
+ 
+ static uint32_t g_vt_ds, g_vt_buf;
+ static uint32_t new_buffer(dsbuf *b) {
+-    pthread_mutex_lock(&g_mix);
++    gex_mutex_lock(&g_mix);
+     int slot = -1;
+     for (int i = 0; i < MAX_BUFS && slot < 0; i++) if (!g_buf[i]) slot = i;
+     if (slot >= 0) g_buf[slot] = b;
+-    pthread_mutex_unlock(&g_mix);
++    gex_mutex_unlock(&g_mix);
+     if (slot < 0) return 0;
+     uint32_t o = hle_com_new(g_vt_buf, 12);
+     SLOT(o) = (uint32_t)slot;
+@@ -288,11 +92,12 @@ static uint32_t new_buffer(dsbuf *b) {
+ static void b_Release(void) {
+     uint32_t self = A32(0), n = --MEM32(self + 4);
+     if (!n) {
+-        pthread_mutex_lock(&g_mix);
++        gex_mutex_lock(&g_mix);
+         dsbuf *b = buf_of(self);
+         g_buf[SLOT(self)] = NULL;
+-        pthread_mutex_unlock(&g_mix);
++        gex_mutex_unlock(&g_mix);
+         if (b) {
++            gex_audio_voice_destroy(b->voice);
+             if (--*b->data_refs == 0) { hle_free(b->data); free(b->data_refs); }
+             free(b);
+         }
+@@ -304,16 +109,18 @@ static void b_GetCaps(void) {                            /* (this, &DSBCAPS) */
+     dsbuf *b = buf_of(A32(0));
+     uint32_t c = A32(1);
+     if (!b || !c) RET(DSERR_INVALIDPARAM, 2);
+-    MEM32(c + 4) = b->flags | 0x8u /* LOCSOFTWARE */, MEM32(c + 8) = b->bytes, MEM32(c + 12) = 0, MEM32(c + 16) = 0;
++    MEM32(c + 4) = b->flags, MEM32(c + 8) = b->bytes, MEM32(c + 12) = 0, MEM32(c + 16) = 0;
+     RET(DS_OK, 2);
+ }
+ static void b_GetCurrentPosition(void) {                 /* (this, &play, &write) */
+     dsbuf *b = buf_of(A32(0));
+     if (!b) RET(DSERR_INVALIDPARAM, 3);
+-    pthread_mutex_lock(&g_mix);
+-    uint32_t play = b->block ? (uint32_t)b->pos * (uint32_t)b->block : 0;
+-    uint32_t lead = b->block ? (uint32_t)(b->rate / 100) * (uint32_t)b->block : 0;   /* 10 ms ahead */
+-    pthread_mutex_unlock(&g_mix);
++    gex_mutex_lock(&g_mix);
++    gex_audio_position p = b->voice ? gex_audio_voice_position(b->voice) : (gex_audio_position){0};
++    b->playing = p.playing;
++    uint32_t play = p.frame * (uint32_t)b->block;
++    uint32_t lead = b->block ? (p.write_lead > (uint32_t)(b->rate / 50) ? p.write_lead : (uint32_t)(b->rate / 50)) * (uint32_t)b->block : 0;
++    gex_mutex_unlock(&g_mix);
+     if (b->bytes) play %= b->bytes;
+     if (A32(1)) MEM32(A32(1)) = play;
+     if (A32(2)) MEM32(A32(2)) = b->bytes ? (play + (b->playing ? lead : 0)) % b->bytes : 0;
+@@ -336,6 +143,7 @@ static void b_GetPan(void)       { dsbuf *b = buf_of(A32(0)); if (A32(1) && b) M
+ static void b_GetFrequency(void) { dsbuf *b = buf_of(A32(0)); if (A32(1) && b) MEM32(A32(1)) = (uint32_t)b->rate; RET(b ? DS_OK : DSERR_INVALIDPARAM, 2); }
+ static void b_GetStatus(void) {
+     dsbuf *b = buf_of(A32(0));
++    if (b && b->voice) b->playing = gex_audio_voice_position(b->voice).playing;
+     if (A32(1) && b) MEM32(A32(1)) = (b->playing ? DSBSTATUS_PLAYING : 0u) | (b->playing && b->looping ? DSBSTATUS_LOOPING : 0u);
+     RET(b ? DS_OK : DSERR_INVALIDPARAM, 2);
+ }
+@@ -346,9 +154,11 @@ static void b_Lock(void) {                               /* (this, offset, bytes
+     uint32_t off = A32(1), n = A32(2), fl = A32(7);
+     if (fl & 2u) off = 0, n = b->bytes;                  /* DSBLOCK_ENTIREBUFFER */
+     else if (fl & 1u) {                                  /* DSBLOCK_FROMWRITECURSOR */
+-        pthread_mutex_lock(&g_mix);
+-        off = b->block ? ((uint32_t)b->pos * (uint32_t)b->block + (uint32_t)(b->rate / 100) * (uint32_t)b->block) % b->bytes : 0;
+-        pthread_mutex_unlock(&g_mix);
++        gex_mutex_lock(&g_mix);
++        gex_audio_position p = gex_audio_voice_position(b->voice);
++        uint32_t lead = p.write_lead > (uint32_t)(b->rate / 50) ? p.write_lead : (uint32_t)(b->rate / 50);
++        off = b->block ? ((p.frame + lead) * (uint32_t)b->block) % b->bytes : 0;
++        gex_mutex_unlock(&g_mix);
+     }
+     if (off >= b->bytes || n > b->bytes) RET(DSERR_INVALIDPARAM, 8);
+     uint32_t n1 = off + n <= b->bytes ? n : b->bytes - off;
+@@ -358,61 +168,93 @@ static void b_Lock(void) {                               /* (this, offset, bytes
+     if (A32(6)) MEM32(A32(6)) = n - n1;
+     RET(DS_OK, 8);
+ }
+-static void b_Unlock(void) { RET(DS_OK, 5); }            /* (this, p1, n1, p2, n2): the memory is the buffer */
++static void b_Unlock(void) {
++    dsbuf *b = buf_of(A32(0));
++    if (!b || b->primary) RET(DSERR_INVALIDPARAM, 5);
++    uint32_t base = hle_va(b->data);
++    for (int part = 0; part < 2; ++part) {
++        uint32_t ptr = A32(1 + part * 2), bytes = A32(2 + part * 2);
++        if (!bytes) continue;
++        if (ptr < base || ptr - base > b->bytes || bytes > b->bytes - (ptr - base) ||
++            (ptr - base) % (uint32_t)b->block || bytes % (uint32_t)b->block)
++            RET(DSERR_INVALIDPARAM, 5);
++    }
++    gex_mutex_lock(&g_mix);
++    for (int i = 0; i < MAX_BUFS; ++i) {
++        dsbuf *shared = g_buf[i];
++        if (!shared || shared->data != b->data || !shared->voice) continue;
++        for (int part = 0; part < 2; ++part) {
++            uint32_t ptr = A32(1 + part * 2), bytes = A32(2 + part * 2);
++            if (bytes) gex_audio_voice_update(shared->voice, (ptr - base) / (uint32_t)b->block,
++                                              hle_ptr(ptr), bytes / (uint32_t)b->block);
++        }
++    }
++    gex_mutex_unlock(&g_mix);
++    RET(DS_OK, 5);
++}
+ static void b_Play(void) {                               /* (this, reserved, priority, flags) */
+     dsbuf *b = buf_of(A32(0));
+     if (!b) RET(DSERR_INVALIDPARAM, 4);
+-    pthread_mutex_lock(&g_mix);
++    gex_mutex_lock(&g_mix);
+     b->playing = 1, b->looping = (A32(3) & DSBPLAY_LOOPING) != 0;
+-    pthread_mutex_unlock(&g_mix);
++    if (b->voice) gex_audio_voice_play(b->voice, b->looping);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 4);
+ }
+ static void b_SetCurrentPosition(void) {
+     dsbuf *b = buf_of(A32(0));
+     if (!b || !b->block) RET(DSERR_INVALIDPARAM, 2);
+-    pthread_mutex_lock(&g_mix);
+-    b->pos = (double)((A32(1) % (b->bytes ? b->bytes : 1)) / (uint32_t)b->block);
+-    pthread_mutex_unlock(&g_mix);
++    gex_mutex_lock(&g_mix);
++    if (b->voice) gex_audio_voice_seek(b->voice, (A32(1) % b->bytes) / (uint32_t)b->block);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 2);
+ }
+ static void b_SetFormat(void) {                          /* the primary's: the mix is at the device rate anyway */
+     dsbuf *b = buf_of(A32(0));
+     uint32_t w = A32(1);
+-    if (b && w) b->channels = MEM16(w + 2), b->rate = (int)MEM32(w + 4), b->bits = MEM16(w + 14), b->block = MEM16(w + 12);
++    if (!b || !b->primary || !w || MEM16(w) != 1 ||
++        (MEM16(w + 2) != 1 && MEM16(w + 2) != 2) ||
++        (MEM16(w + 14) != 8 && MEM16(w + 14) != 16) ||
++        MEM32(w + 4) < 100 || MEM32(w + 4) > 100000 ||
++        MEM16(w + 12) != MEM16(w + 2) * (MEM16(w + 14) / 8))
++        RET(DSERR_INVALIDPARAM, 2);
++    b->channels = MEM16(w + 2), b->rate = (int)MEM32(w + 4), b->bits = MEM16(w + 14), b->block = MEM16(w + 12);
+     RET(DS_OK, 2);
+ }
+ static void b_SetVolume(void) {
+     dsbuf *b = buf_of(A32(0));
+-    if (!b) RET(DSERR_INVALIDPARAM, 2);
+-    pthread_mutex_lock(&g_mix);
++    if (!b || (int32_t)A32(1) < -10000 || (int32_t)A32(1) > 0) RET(DSERR_INVALIDPARAM, 2);
++    gex_mutex_lock(&g_mix);
+     b->volume = (int)A32(1);
+     gains(b);
+-    pthread_mutex_unlock(&g_mix);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 2);
+ }
+ static void b_SetPan(void) {
+     dsbuf *b = buf_of(A32(0));
+-    if (!b) RET(DSERR_INVALIDPARAM, 2);
+-    pthread_mutex_lock(&g_mix);
++    if (!b || (int32_t)A32(1) < -10000 || (int32_t)A32(1) > 10000) RET(DSERR_INVALIDPARAM, 2);
++    gex_mutex_lock(&g_mix);
+     b->pan = (int)A32(1);
+     gains(b);
+-    pthread_mutex_unlock(&g_mix);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 2);
+ }
+ static void b_SetFrequency(void) {
+     dsbuf *b = buf_of(A32(0));
+-    if (!b) RET(DSERR_INVALIDPARAM, 2);
+-    pthread_mutex_lock(&g_mix);
+-    if (A32(1)) b->rate = (int)A32(1);
+-    pthread_mutex_unlock(&g_mix);
++    if (!b || (A32(1) && (A32(1) < 100 || A32(1) > 100000))) RET(DSERR_INVALIDPARAM, 2);
++    gex_mutex_lock(&g_mix);
++    b->rate = A32(1) ? (int)A32(1) : b->original_rate;
++    if (b->voice) gex_audio_voice_rate(b->voice, b->rate);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 2);
+ }
+ static void b_Stop(void) {
+     dsbuf *b = buf_of(A32(0));
+     if (!b) RET(DSERR_INVALIDPARAM, 1);
+-    pthread_mutex_lock(&g_mix);
++    gex_mutex_lock(&g_mix);
+     b->playing = 0;
+-    pthread_mutex_unlock(&g_mix);
++    if (b->voice) gex_audio_voice_stop(b->voice);
++    gex_mutex_unlock(&g_mix);
+     RET(DS_OK, 1);
+ }
+ static void b_Restore(void) { RET(DS_OK, 1); }
+@@ -428,25 +270,37 @@ static void d_CreateSoundBuffer(void) {                  /* (this, &DSBUFFERDESC
+     if (!d || !out) RET(DSERR_INVALIDPARAM, 4);
+     uint32_t flags = MEM32(d + 4), bytes = MEM32(d + 8), wfx = MEM32(d + 16);
+     dsbuf *b = (dsbuf *)calloc(1, sizeof *b);
++    if (!b) RET(DSERR_NODRIVER, 4);
+     b->flags = flags, b->primary = (flags & DSBCAPS_PRIMARYBUFFER) != 0;
+     b->channels = 2, b->bits = 16, b->rate = 22050, b->block = 4;
+     if (wfx) {
+         b->channels = MEM16(wfx + 2), b->rate = (int)MEM32(wfx + 4), b->block = MEM16(wfx + 12), b->bits = MEM16(wfx + 14);
+         if (MEM16(wfx) != 1 || (b->bits != 8 && b->bits != 16) || b->channels < 1 || b->channels > 2) {
+-            fprintf(stderr, "[dsound] buffer format tag %u, %d bits, %d channels: not PCM this mixer plays\n", MEM16(wfx), b->bits, b->channels);
++            fprintf(stderr, "[dsound] unsupported PCM format: tag %u, %d bits, %d channels\n", MEM16(wfx), b->bits, b->channels);
+             free(b);
+             RET(DSERR_INVALIDPARAM, 4);
+         }
+     }
+     if (b->primary) bytes = 4096 * 4;
++    if (b->rate < 100 || b->rate > 100000 || b->block != b->channels * (b->bits / 8) ||
++        !bytes || bytes % (uint32_t)b->block) { free(b); RET(DSERR_INVALIDPARAM, 4); }
+     b->bytes = bytes;
+     b->data = (uint8_t *)hle_alloc(bytes ? bytes : 4);
+-    if (b->bits == 8) memset(b->data, 128, bytes);
++    memset(b->data, b->bits == 8 ? 128 : 0, bytes);
++    b->original_rate = b->rate;
+     b->data_refs = (int *)malloc(sizeof(int));
++    if (!b->data_refs) { hle_free(b->data); free(b); RET(DSERR_NODRIVER, 4); }
+     *b->data_refs = 1;
++    if (!b->primary) {
++        b->voice = gex_audio_voice_create(b->data, bytes / (uint32_t)b->block,
++                                          b->rate, b->channels, b->bits);
++        if (!b->voice) {
++            hle_free(b->data); free(b->data_refs); free(b); RET(DSERR_NODRIVER, 4);
++        }
++    }
+     gains(b);
+     uint32_t o = new_buffer(b);
+-    if (!o) { hle_free(b->data); free(b->data_refs); free(b); RET(DSERR_INVALIDPARAM, 4); }
++    if (!o) { gex_audio_voice_destroy(b->voice); hle_free(b->data); free(b->data_refs); free(b); RET(DSERR_INVALIDPARAM, 4); }
+     MEM32(out) = o;
+     RET(DS_OK, 4);
+ }
+@@ -467,12 +321,18 @@ static void d_DuplicateSoundBuffer(void) {               /* (this, original, &ou
+     dsbuf *src = buf_of(A32(1));
+     if (!src || !A32(2)) RET(DSERR_INVALIDPARAM, 3);
+     dsbuf *b = (dsbuf *)malloc(sizeof *b);
+-    pthread_mutex_lock(&g_mix);
++    if (!b) RET(DSERR_NODRIVER, 3);
++    gex_mutex_lock(&g_mix);
+     *b = *src;
+     (*b->data_refs)++;
+-    pthread_mutex_unlock(&g_mix);
+-    b->playing = 0, b->pos = 0;
++    gex_mutex_unlock(&g_mix);
++    b->playing = 0;
++    b->voice = src->primary ? NULL : gex_audio_voice_create(b->data, b->bytes / (uint32_t)b->block,
++                                                           b->rate, b->channels, b->bits);
++    if (!src->primary && !b->voice) { --*b->data_refs; free(b); RET(DSERR_NODRIVER, 3); }
++    gains(b);
+     uint32_t o = new_buffer(b);
++    if (!o) { gex_audio_voice_destroy(b->voice); --*b->data_refs; free(b); }
+     MEM32(A32(2)) = o;
+     RET(o ? DS_OK : DSERR_INVALIDPARAM, 3);
+ }
+@@ -510,7 +370,7 @@ static void vtables(void) {
+ static void s_DirectSoundCreate(void) {                  /* (guid, &out, outer) */
+     vtables();
+     if (!A32(1)) RET(DSERR_INVALIDPARAM, 3);
+-    if (!audio_open()) { MEM32(A32(1)) = 0; RET(DSERR_NODRIVER, 3); }
++    if (!audio_open_once()) { MEM32(A32(1)) = 0; RET(DSERR_NODRIVER, 3); }
+     MEM32(A32(1)) = hle_com_new(g_vt_ds, 12);
+     RET(DS_OK, 3);
+ }
+@@ -527,7 +387,7 @@ static void s_DirectSoundEnumerateA(void) {              /* (callback, context):
+ static uint32_t ds_create(const uint8_t *iid, uint32_t *out) {
+     (void)iid;
+     vtables();
+-    if (!audio_open()) { *out = 0; return DSERR_NODRIVER; }
++    if (!audio_open_once()) { *out = 0; return DSERR_NODRIVER; }
+     *out = hle_com_new(g_vt_ds, 12);
+     return DS_OK;
+ }
+diff --git a/runtime/win32hle/gdi32.c b/runtime/win32hle/gdi32.c
+index 7906120..d8a0fd8 100644
+--- a/runtime/win32hle/gdi32.c
++++ b/runtime/win32hle/gdi32.c
+@@ -8,12 +8,12 @@
+  * Supports 32bpp BI_RGB DIBs, top-down or bottom-up, scaled with
+  * nearest-neighbour. 8/16/24bpp and palettes come with the palette layer.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ /* The destination the game's blits land on: a host-owned ARGB8888 framebuffer.
+  * The host (or the selftest) sets it; user32's present copies it to a texture. */
+@@ -35,21 +35,41 @@ static int32_t  bi_h(const uint8_t *b)   { return (int32_t)(b[8] | b[9]<<8 | b[1
+ static uint16_t bi_bpp(const uint8_t *b) { return (uint16_t)(b[14] | b[15]<<8); }
+ 
+ /* A CreateDIBSection handle: the pixel buffer and its geometry. */
+-#define MAX_DIBS 8192
+-static struct { uint32_t h; uint32_t *bits; int w, h_abs, topdown; } g_dibs[MAX_DIBS];
++#ifndef HLE_MAX_DIBS
++#define HLE_MAX_DIBS 8192
++#endif
++#define MAX_DIBS HLE_MAX_DIBS
++static struct { uint32_t h; uint32_t *bits; int w, h_abs, topdown; void *mapping; } g_dibs[MAX_DIBS];
+ static int g_dib_n;
+ static uint32_t g_next_handle = 0xD1B00001u;
+ 
+ /* A DIB section for a BITMAPINFO (header, then masks or colour table): its
+  * pixels in guest memory, *bits_out pointing at them; the HBITMAP, or 0.
+  * CreateDIBSection, and LoadImageA's bitmaps (user32.c). */
+-uint32_t hle_gdi_dib_section(const uint8_t *bmi, uint32_t **bits_out) {
++static uint32_t dib_section(const uint8_t *bmi, uint32_t **bits_out,
++                             uint32_t section, uint32_t offset) {
++    if (bits_out) *bits_out = NULL;
++    if (!bmi || g_dib_n >= MAX_DIBS) { hle_set_last_error(8); return 0; }
+     int w = bi_w(bmi), h = bi_h(bmi), bpp = bi_bpp(bmi);
++    if (w <= 0 || !h || h == INT32_MIN ||
++        (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)) {
++        hle_set_last_error(87);
++        return 0;
++    }
+     int hab = h < 0 ? -h : h;
+     /* any depth gets its pixels (rows are DWORD-aligned), and a bitmap object
+      * (gdidc.c) a DC can select and blit from: 16bpp is 5-6-5 only when its
+      * BI_BITFIELDS masks say so, and 8bpp and below bring a colour table */
+-    uint32_t *bits = (uint32_t *)hle_alloc((uint32_t)((w * bpp + 31) / 32 * hab + 1) * 4u);   /* guest memory: the guest draws into it */
++    uint64_t bytes = ((uint64_t)w * bpp + 31) / 32 * 4 * (unsigned)hab;
++    if (bytes > UINT32_MAX - 4) { hle_set_last_error(8); return 0; }
++    void *mapping = NULL;
++    uint8_t *storage = NULL;
++    if (section) {
++        mapping = hle_mapping_acquire(section, offset, (uint32_t)bytes, &storage);
++        if (!mapping) return 0;
++    } else storage = hle_alloc((uint32_t)bytes + 4);
++    if (!storage) { hle_set_last_error(8); return 0; }
++    uint32_t *bits = (uint32_t *)storage;
+     uint32_t size = (uint32_t)(bmi[0] | bmi[1] << 8), comp = (uint32_t)(bmi[16] | bmi[17] << 8);
+     uint32_t used = (uint32_t)(bmi[32] | bmi[33] << 8 | bmi[34] << 16);
+     const uint8_t *after = bmi + size;
+@@ -61,17 +81,21 @@ uint32_t hle_gdi_dib_section(const uint8_t *bmi, uint32_t **bits_out) {
+         g_dibs[g_dib_n].h = handle;
+         g_dibs[g_dib_n].bits = bits; g_dibs[g_dib_n].w = w;
+         g_dibs[g_dib_n].h_abs = hab; g_dibs[g_dib_n].topdown = h < 0;
++        g_dibs[g_dib_n].mapping = mapping;
+         g_dib_n++;
+     }
+     if (bits_out) *bits_out = bits;
+     return handle;
+ }
++uint32_t hle_gdi_dib_section(const uint8_t *bmi, uint32_t **bits_out) {
++    return dib_section(bmi, bits_out, 0, 0);
++}
+ 
+ /* CreateDIBSection(hdc, pbmi, usage, ppvBits, hSection, offset): allocate the
+  * pixel array, hand the guest its pointer through *ppvBits, return an HBITMAP. */
+ static void g_CreateDIBSection(void) {
+     uint32_t *bits = NULL, *ppv = (uint32_t *)APTR(3);
+-    uint32_t handle = hle_gdi_dib_section((const uint8_t *)APTR(1), &bits);
++    uint32_t handle = dib_section((const uint8_t *)APTR(1), &bits, A32(4), A32(5));
+     if (ppv) *ppv = hle_va(bits);   /* the guest draws straight into this */
+     RET(handle, 6);
+ }
+@@ -113,7 +137,12 @@ static void g_CreateCompatibleDC(void){ RET(0x0DC00002u, 1); }
+ static void g_DeleteDC(void)          { RET(1, 1); }
+ int hle_gdi_dib_delete(uint32_t h) {
+     for (int i = 0; i < g_dib_n; i++)
+-        if (g_dibs[i].h == h && g_dibs[i].bits) { hle_free(g_dibs[i].bits); g_dibs[i] = g_dibs[--g_dib_n]; return 1; }   /* the last takes its slot */
++        if (g_dibs[i].h == h && g_dibs[i].bits) {
++            if (g_dibs[i].mapping) hle_mapping_release(g_dibs[i].mapping);
++            else hle_free(g_dibs[i].bits);
++            g_dibs[i] = g_dibs[--g_dib_n];
++            return 1;
++        }
+     return 0;
+ }
+ 
+diff --git a/runtime/win32hle/gdidc.c b/runtime/win32hle/gdidc.c
+index 40fe7d8..3b9d1ec 100644
+--- a/runtime/win32hle/gdidc.c
++++ b/runtime/win32hle/gdidc.c
+@@ -1,5 +1,6 @@
+ /*
+- * gdidc.c - GDI device contexts, fonts and text, on SDL2_ttf.
++ * gdidc.c - GDI device contexts, font selection and text compositing.
++ * The platform font interface provides metrics and coverage masks.
+  *
+  * A DC is a small state record (font, colours, background mode, alignment,
+  * origins) that may be bound to pixels: a DirectDraw surface's, through its
+@@ -10,17 +11,14 @@
+  * Fonts are CreateFont's requests matched to TrueType files the way a
+  * desktop's font substitution would: Arial and MS Sans Serif to Liberation
+  * Sans (Arial's metrics), Times to Liberation Serif, Courier to Liberation
+- * Mono, else DejaVu, found by fontconfig (fc-match) or in the usual places.
++ * Mono. The backend locates and rasterizes these host font families.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+-#include <unistd.h>
+-#include <SDL2/SDL.h>
+-#include <SDL2/SDL_ttf.h>
++#include "platform/runtime.h"
++#include "platform/font.h"
+ #include "win32hle.h"
+ 
+ #define TRANSPARENT 1
+@@ -36,12 +34,18 @@ typedef struct {
+     uint32_t bmp;                                        /* the bitmap selected into it */
+     int clip, cl, ct, cr, cb;                            /* SelectClipRgn's rectangle, in pixels */
+ } dc_t;
+-#define MAX_DC 4096                      /* Civilization III's jgl keeps one per surface */
++#ifndef HLE_MAX_DC
++#define HLE_MAX_DC 4096
++#endif
++#define MAX_DC HLE_MAX_DC
+ static dc_t g_dc[MAX_DC], g_saved[MAX_DC];
+ #define DC_BASE 0x0DC10000u
+ 
+-typedef struct { int used; int height, weight, italic, quality; char face[32]; TTF_Font *ttf; int crisp, synth_bold, underline; } font_t;
+-#define MAX_FONTS 1024                    /* Civilization III: 37 sizes in each of 8 styles */
++typedef struct { int used; int height, weight, italic, quality; char face[32]; gex_font *ttf; int crisp, synth_bold, underline; } font_t;
++#ifndef HLE_MAX_FONTS
++#define HLE_MAX_FONTS 1024
++#endif
++#define MAX_FONTS HLE_MAX_FONTS
+ static font_t g_font[MAX_FONTS];
+ #define FONT_BASE 0x0DF10000u
+ #define SYSTEM_FONT (FONT_BASE + MAX_FONTS)              /* the stock font: 13 px MS Sans Serif */
+@@ -121,10 +125,10 @@ static int font_data(const char *path) {                 /* its slot, read on fi
+     }
+     return i;
+ }
+-static TTF_Font *open_font(const char *path, int size) {
++static gex_font *open_font(const char *path, int size) {
+     int i = font_data(path);
+-    if (i < 0) return TTF_OpenFont(path, size);
+-    return TTF_OpenFontRW(SDL_RWFromConstMem(g_font_files[i].data, (int)g_font_files[i].n), 1, size);
++    return gex_font_open(path, i < 0 ? NULL : g_font_files[i].data,
++                         i < 0 ? 0 : (size_t)g_font_files[i].n, size);
+ }
+ /* Whether Windows smooths this face at this size: its 'gasp' table says,
+  * range by range (GASP_DOGRAY); with none, it does. Civilization III's
+@@ -165,7 +169,7 @@ static void g_CreateScalableFontResourceA(void) {        /* (hidden, fot, ttf, p
+     if (win32hle_trace) fprintf(stderr, "[gdi] CreateScalableFontResourceA(%u, \"%s\", \"%s\", \"%s\")\n", A32(0), fot ? fot : "", ttf ? ttf : "", dir ? dir : "");
+     if (!fot || !ttf) RET(0, 4);
+     for (int i = 0; i < g_nfot; i++)                     /* made already: Windows says the file exists */
+-        if (!strcasecmp(g_fot[i].fot, fot)) { hle_set_last_error(80); RET(0, 4); }   /* ERROR_FILE_EXISTS */
++        if (!gex_string_compare_case(g_fot[i].fot, fot)) { hle_set_last_error(80); RET(0, 4); }   /* ERROR_FILE_EXISTS */
+     if (g_nfot >= MAX_ADDED) RET(0, 4);
+     int in_dir = dir && *dir && !strchr(ttf, '\\');        /* a bare file name is in path */
+     snprintf(guest, sizeof guest, "%s%s%s", in_dir ? dir : "", in_dir ? "\\" : "", ttf);
+@@ -181,62 +185,35 @@ static void g_AddFontResourceA(void) {
+     const char *name = ASTR(0), *path = NULL;
+     char host[512];
+     if (!name) RET(0, 1);
+-    for (int i = 0; i < g_nfot; i++) if (!strcasecmp(g_fot[i].fot, name)) path = g_fot[i].ttf;
++    for (int i = 0; i < g_nfot; i++) if (!gex_string_compare_case(g_fot[i].fot, name)) path = g_fot[i].ttf;
+     if (!path && hle_host_path(name, host, sizeof host)) path = host;
+     for (int i = 0; path && i < g_nadded; i++) if (!strcmp(g_added[i].path, path)) RET(1, 1);   /* added already */
+-    if (!path || (!TTF_WasInit() && TTF_Init() != 0)) {
++    if (!path || !gex_font_initialize()) {
+         fprintf(stderr, "[gdi] AddFontResourceA(\"%s\"): no such file\n", name);
+         RET(0, 1);
+     }
+-    TTF_Font *f = open_font(path, 12);
+-    const char *family = f ? TTF_FontFaceFamilyName(f) : NULL;
++    gex_font *f = open_font(path, 12);
++    const char *family = f ? gex_font_family(f) : NULL;
+     if (family && g_nadded < MAX_ADDED) {
+         snprintf(g_added[g_nadded].family, sizeof g_added[0].family, "%s", family);
+         snprintf(g_added[g_nadded++].path, sizeof g_added[0].path, "%s", path);
+         fprintf(stderr, "[gdi] font \"%s\" from %s\n", family, path);
+     }
+-    if (f) TTF_CloseFont(f);
+-    if (!family) fprintf(stderr, "[gdi] AddFontResourceA(\"%s\"): no font in %s (%s)\n", name, path, TTF_GetError());
+-    RET(family ? 1u : 0u, 1);
++    int found = family != NULL;
++    if (f) gex_font_close(f);
++    if (!found) fprintf(stderr, "[gdi] AddFontResourceA(\"%s\"): no font in %s (%s)\n", name, path, gex_font_error());
++    RET(found ? 1u : 0u, 1);
+ }
+ static void g_RemoveFontResourceA(void) { RET(1, 1); }
+ 
+ const char *hle_font_file(const char *face, int bold, int italic) {
+-    static char path[512];
+-    for (int i = 0; i < g_nadded; i++) if (!strcasecmp(g_added[i].family, face)) return g_added[i].path;   /* ponytail: one file per face, its style whatever bold asks */
+-    const char *family = "Liberation Sans", *style = bold && italic ? "Bold Italic" : bold ? "Bold" : italic ? "Italic" : "Regular";
+-    if (!strncasecmp(face, "Times", 5) || !strcasecmp(face, "MS Serif") || !strcasecmp(face, "Georgia")) family = "Liberation Serif";
+-    else if (!strncasecmp(face, "Courier", 7) || !strcasecmp(face, "Fixedsys") || !strcasecmp(face, "Terminal")) family = "Liberation Mono";
+-    char cmd[256];
+-    snprintf(cmd, sizeof cmd, "fc-match -f '%%{file}' '%s:style=%s' 2>/dev/null", family, style);
+-    FILE *p = popen(cmd, "r");
+-    if (p) {
+-        size_t n = fread(path, 1, sizeof path - 1, p);
+-        pclose(p);
+-        path[n] = 0;
+-        if (n && access(path, R_OK) == 0) return path;
+-    }
+-    static const char *const dirs[] = { "/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/truetype/liberation2/",
+-                                        "/usr/share/fonts/liberation/", "/usr/share/fonts/liberation-sans/",
+-                                        "/usr/share/fonts/TTF/", "/usr/share/fonts/truetype/dejavu/" };
+-    char file[64];
+-    snprintf(file, sizeof file, "%s-%s.ttf", strstr(family, "Serif") ? "LiberationSerif" : strstr(family, "Mono") ? "LiberationMono" : "LiberationSans",
+-             bold && italic ? "BoldItalic" : bold ? "Bold" : italic ? "Italic" : "Regular");
+-    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+-        snprintf(path, sizeof path, "%s%s", dirs[i], file);
+-        if (access(path, R_OK) == 0) return path;
+-    }
+-    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+-        snprintf(path, sizeof path, "%s%s", dirs[i], bold ? "DejaVuSans-Bold.ttf" : "DejaVuSans.ttf");
+-        if (access(path, R_OK) == 0) return path;
+-    }
+-    /* macOS has the faces Liberation stands in for */
+-    const char *mac = strstr(family, "Serif") ? "Times New Roman" : strstr(family, "Mono") ? "Courier New" : "Arial";
+-    snprintf(path, sizeof path, "/System/Library/Fonts/Supplemental/%s%s.ttf", mac,
+-             bold && italic ? " Bold Italic" : bold ? " Bold" : italic ? " Italic" : "");
+-    if (access(path, R_OK) == 0) return path;
+-    return NULL;
++    for (int i = 0; i < g_nadded; i++) if (!gex_string_compare_case(g_added[i].family, face)) return g_added[i].path;   /* ponytail: one file per face, its style whatever bold asks */
++    const char *family = "Liberation Sans";
++    if (!gex_string_compare_case_n(face, "Times", 5) || !gex_string_compare_case(face, "MS Serif") || !gex_string_compare_case(face, "Georgia")) family = "Liberation Serif";
++    else if (!gex_string_compare_case_n(face, "Courier", 7) || !gex_string_compare_case(face, "Fixedsys") || !gex_string_compare_case(face, "Terminal")) family = "Liberation Mono";
++    return gex_font_locate(family, bold, italic);
+ }
++
+ static font_t *FONT(uint32_t h) {
+     if (h == SYSTEM_FONT || h < FONT_BASE || h - FONT_BASE >= MAX_FONTS || !g_font[h - FONT_BASE].used) {
+         static font_t sys = { 1, -11, 400, 0, 0, "MS Sans Serif", NULL };   /* 8 pt at 96 dpi: 11 px em, 13 px cell */
+@@ -244,9 +221,9 @@ static font_t *FONT(uint32_t h) {
+     }
+     return &g_font[h - FONT_BASE];
+ }
+-static TTF_Font *ttf_of(font_t *f) {
++static gex_font *ttf_of(font_t *f) {
+     if (f->ttf) return f->ttf;
+-    if (!TTF_WasInit() && TTF_Init() != 0) return NULL;
++    if (!gex_font_initialize()) return NULL;
+     const char *file = hle_font_file(f->face, f->weight >= 600, f->italic);
+     if (!file) { fprintf(stderr, "[gdi] no TrueType font for \"%s\": text is not drawn\n", f->face); return NULL; }
+     /* A negative height is the em in pixels; a positive one the cell (ascent
+@@ -256,17 +233,15 @@ static TTF_Font *ttf_of(font_t *f) {
+     /* Windows never smooths a raster font, and these three are only ever
+      * raster: a program that reads its label pixels back (eJay 2's sample
+      * blocks, in Small Fonts) expects exactly the text colour or not. */
+-    int raster = !strcasecmp(f->face, "Small Fonts") || !strcasecmp(f->face, "Terminal") || !strcasecmp(f->face, "Fixedsys");
++    int raster = !gex_string_compare_case(f->face, "Small Fonts") || !gex_string_compare_case(f->face, "Terminal") || !gex_string_compare_case(f->face, "Fixedsys");
+     f->crisp = raster || f->quality == 3 || (f->quality != 4 && f->quality != 5 && !gasp_gray(file, em));   /* not ANTIALIASED, CLEARTYPE */
+     if (!f->ttf) return NULL;
+     /* Crisp text is hinted fully, as GDI hints it, advances included: what
+      * FreeType does only for monochrome. */
+-    TTF_SetFontHinting(f->ttf, f->crisp ? TTF_HINTING_MONO : TTF_HINTING_NORMAL);
+-    TTF_SetFontKerning(f->ttf, 0);                       /* GDI's TextOut does not kern */
+     int one_face = 0;                                    /* a game's own font, one file for every style */
+     for (int i = 0; i < g_nadded; i++) one_face |= file == g_added[i].path;
+     f->synth_bold = one_face && f->weight >= 600;        /* bold and italic as Windows makes them */
+-    TTF_SetFontStyle(f->ttf, (one_face && f->italic ? TTF_STYLE_ITALIC : 0) | (f->underline ? TTF_STYLE_UNDERLINE : 0));
++    gex_font_configure(f->ttf, f->crisp, one_face && f->italic, f->underline);
+     return f->ttf;
+ }
+ 
+@@ -311,7 +286,10 @@ typedef struct {
+     uint32_t *pal; int paln;                             /* palette: paln COLORREFs; a DIB's colour table, 0x00RRGGBB */
+     int is555;                                           /* a 16bpp DIB in 5-5-5 (BI_RGB) */
+ } gobj_t;
+-#define MAX_GOBJ 8192
++#ifndef HLE_MAX_GOBJ
++#define HLE_MAX_GOBJ 8192
++#endif
++#define MAX_GOBJ HLE_MAX_GOBJ
+ static gobj_t g_obj[MAX_GOBJ];
+ #define GOBJ_BASE 0x0DB10000u
+ static gobj_t *GOBJ(uint32_t h) { uint32_t i = h - GOBJ_BASE; return h >= GOBJ_BASE && i < MAX_GOBJ && g_obj[i].used ? &g_obj[i] : NULL; }
+@@ -426,7 +404,7 @@ static void g_DeleteObject(void) {
+     uint32_t h = A32(0);
+     if (h >= FONT_BASE && h - FONT_BASE < MAX_FONTS && g_font[h - FONT_BASE].used) {
+         font_t *f = &g_font[h - FONT_BASE];
+-        if (f->ttf) TTF_CloseFont(f->ttf);
++        if (f->ttf) gex_font_close(f->ttf);
+         f->used = 0, f->ttf = NULL;
+         RET(1, 1);
+     }
+@@ -597,16 +575,16 @@ static void g_ModifyWorldTransform(void) { RET(1, 3); }
+ static void g_GetTextExtentPoint32A(void) {              /* (hdc, text, n, &SIZE) */
+     dc_t *d = DC(A32(0));
+     font_t *f = FONT(d ? d->font : SYSTEM_FONT);
+-    TTF_Font *t = ttf_of(f);
++    gex_font *t = ttf_of(f);
+     int n = (int)A32(2), w = 6 * n, h = 13;
+     if (t && n > 0) {
+         char buf[1024];
+         if (n >= (int)sizeof buf) n = sizeof buf - 1;
+         memcpy(buf, APTR(1), (size_t)n), buf[n] = 0;
+-        TTF_SizeText(t, buf, &w, &h);
++        gex_font_measure(t, buf, &w, &h);
+         if (f->synth_bold) w += n;                       /* a pixel more per character */
+     } else if (t) {
+-        w = 0, h = TTF_FontHeight(t);
++        w = 0, h = gex_font_height(t);
+     }
+     if (A32(3)) MEM32(A32(3)) = (uint32_t)w, MEM32(A32(3) + 4) = (uint32_t)h;
+     RET(1, 4);
+@@ -614,12 +592,12 @@ static void g_GetTextExtentPoint32A(void) {              /* (hdc, text, n, &SIZE
+ static void g_GetTextMetricsA(void) {                    /* TEXTMETRICA */
+     dc_t *d = DC(A32(0));
+     font_t *f = FONT(d ? d->font : SYSTEM_FONT);
+-    TTF_Font *t = ttf_of(f);
++    gex_font *t = ttf_of(f);
+     uint32_t m = A32(1);
+     if (!m) RET(0, 2);
+     memset(hle_ptr(m), 0, 56);
+-    int asc = t ? TTF_FontAscent(t) : 10, desc = t ? -TTF_FontDescent(t) : 3, ave = 6, max = 12;
+-    if (t) { int w; TTF_SizeText(t, "x", &ave, &w); TTF_SizeText(t, "W", &max, &w); }
++    int asc = t ? gex_font_ascent(t) : 10, desc = t ? -gex_font_descent(t) : 3, ave = 6, max = 12;
++    if (t) { int w; gex_font_measure(t, "x", &ave, &w); gex_font_measure(t, "W", &max, &w); }
+     int em = f->height < 0 ? -f->height : f->height > 0 ? f->height * 87 / 100 : 11, bold = f->synth_bold;
+     MEM32(m) = (uint32_t)(asc + desc), MEM32(m + 4) = (uint32_t)asc, MEM32(m + 8) = (uint32_t)desc;
+     MEM32(m + 12) = (uint32_t)(asc + desc > em ? asc + desc - em : 0);   /* tmInternalLeading: the cell above the em */
+@@ -681,60 +659,24 @@ static uint32_t mix(const dc_t *d, uint32_t under, uint32_t over, int a) {
+  * gives it. Crisp text is FreeType's monochrome rendering. Synthetic bold
+  * (a face with no bold file) is Windows': every glyph drawn twice, a pixel
+  * apart, and every advance a pixel wider. */
+-static void ink_from(uint8_t *ink, int iw, int ih, int x0, SDL_Surface *s) {
+-    SDL_LockSurface(s);
+-    for (int j = 0; j < s->h && j < ih; j++)
+-        for (int i = 0; i < s->w; i++) {
+-            int x = x0 + i, a;
+-            if (x < 0 || x >= iw) continue;
+-            if (s->format->BytesPerPixel == 1) a = ((const uint8_t *)s->pixels)[j * s->pitch + i] ? 255 : 0;
+-            else a = (int)(((const uint32_t *)((const uint8_t *)s->pixels + j * s->pitch))[i] >> 24);
+-            if (a > ink[j * iw + x]) ink[j * iw + x] = (uint8_t)a;
+-        }
+-    SDL_UnlockSurface(s);
+-}
+-static SDL_Surface *render(const font_t *f, TTF_Font *t, const char *s) {
+-    SDL_Color white = { 255, 255, 255, 255 };
+-    return f->crisp ? TTF_RenderText_Solid(t, s, white) : TTF_RenderText_Blended(t, s, white);
+-}
+-static uint8_t *text_ink(const font_t *f, TTF_Font *t, const char *buf, int n, int *iw, int *ih) {
+-    int w, h;
+-    if (TTF_SizeText(t, buf, &w, &h) != 0) return NULL;
+-    *iw = w + (f->synth_bold ? n + 1 : 0), *ih = h;
+-    uint8_t *ink = (uint8_t *)calloc((size_t)*iw * *ih + 1, 1);
+-    if (!f->synth_bold) {
+-        SDL_Surface *s = render(f, t, buf);
+-        if (s) ink_from(ink, *iw, *ih, 0, s), SDL_FreeSurface(s);
+-        return ink;
+-    }
+-    for (int k = 0, x = 0; k < n; k++) {
+-        char one[2] = { buf[k], 0 };
+-        int adv = 0;
+-        if (TTF_GlyphMetrics(t, (uint8_t)buf[k], NULL, NULL, NULL, NULL, &adv) != 0) TTF_SizeText(t, one, &adv, NULL);
+-        SDL_Surface *s = render(f, t, one);
+-        if (s) ink_from(ink, *iw, *ih, x, s), ink_from(ink, *iw, *ih, x + 1, s), SDL_FreeSurface(s);
+-        x += adv + 1;
+-    }
+-    return ink;
+-}
+ 
+ static void g_TextOutA(void) {                           /* (hdc, x, y, text, n) */
+     dc_t *d = DC(A32(0));
+     int n = (int)A32(4);
+     if (!d || !d->px || n <= 0 || (d->bpp != 16 && d->bpp != 32)) RET(1, 5);
+     font_t *f = FONT(d->font);
+-    TTF_Font *t = ttf_of(f);
++    gex_font *t = ttf_of(f);
+     if (!t) RET(1, 5);
+     char buf[1024];
+     if (n >= (int)sizeof buf) n = sizeof buf - 1;
+     memcpy(buf, APTR(3), (size_t)n), buf[n] = 0;
+     int iw, ih;
+-    uint8_t *ink = text_ink(f, t, buf, n, &iw, &ih);
++    uint8_t *ink = gex_font_coverage(t, buf, n, f->crisp, f->synth_bold, &iw, &ih);
+     if (!ink) RET(1, 5);
+     int x = (int)A32(1) - d->wox + d->vox, y = (int)A32(2) - d->woy + d->voy;
+     if ((d->align & 6) == 6) x -= iw / 2;                /* TA_CENTER */
+     else if (d->align & 2) x -= iw;                      /* TA_RIGHT */
+-    if ((d->align & 24) == 24) y -= TTF_FontAscent(t);   /* TA_BASELINE */
++    if ((d->align & 24) == 24) y -= gex_font_ascent(t);   /* TA_BASELINE */
+     else if (d->align & 8) y -= ih;                      /* TA_BOTTOM */
+     uint32_t fg = pack(d, d->text), bg = pack(d, d->bk);
+     for (int j = 0; j < ih; j++) {
+diff --git a/runtime/win32hle/guest_mem.c b/runtime/win32hle/guest_mem.c
+index ea99921..377452d 100644
+--- a/runtime/win32hle/guest_mem.c
++++ b/runtime/win32hle/guest_mem.c
+@@ -13,22 +13,12 @@
+  * 4 KB (16 KB on Apple silicon), so reservations go in 64 KB units, the
+  * Windows allocation granularity.
+  */
+-#define _GNU_SOURCE   /* MAP_ANONYMOUS */
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <pthread.h>
+-#include <unistd.h>
+-#include <sys/mman.h>
+ #include "win32hle.h"
+-
+-#ifndef MAP_FIXED_NOREPLACE
+-#define MAP_FIXED_NOREPLACE 0x100000
+-#endif
+-#ifndef MAP_NORESERVE
+-#define MAP_NORESERVE 0
+-#endif
++#include "platform/runtime.h"
+ 
+ #define HDR   16u            /* [size][magic][class][-] before every heap block */
+ #define MAGIC 0x48454150u    /* 'HEAP' */
+@@ -37,78 +27,10 @@
+ #ifdef HLE_FLAT
+ /* ================================================================ flat */
+ 
+-#ifdef __EMSCRIPTEN__
+-/* WebAssembly: one linear memory, and a guest VA is an address in it. There
+- * is no mmap at a fixed address and no protection, so a fixed reservation
+- * (the PE image at its base) is simply a range below HLE_FIXED_END, where
+- * the toolchain puts nothing (the program is linked with GLOBAL_BASE there;
+- * everything of its own, data, stack and heap, is above), tracked here so
+- * two cannot overlap; a reservation anywhere is a 64 KB-aligned block from
+- * malloc. Both are zeroed. */
+-#ifndef HLE_FIXED_END
+-#define HLE_FIXED_END 0x01000000u
+-#endif
+-#define WASM_GRAN 0x10000u
+-#define WASM_MAX_RES 1024
+-static pthread_mutex_t g_res_lock = PTHREAD_MUTEX_INITIALIZER;
+-static struct { uint32_t lo, hi; int fixed; } g_res[WASM_MAX_RES];
+-static int g_nres;
+-
+-void hle_mem_init(void) {}
+-
+-uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
+-    if (!size) return 0;
+-    uint32_t r = 0;
+-    pthread_mutex_lock(&g_res_lock);
+-    if (g_nres >= WASM_MAX_RES) { pthread_mutex_unlock(&g_res_lock); return 0; }
+-    if (va) {
+-        uint64_t lo = va & ~(uint64_t)(WASM_GRAN - 1), hi = ((uint64_t)va + size + WASM_GRAN - 1) & ~(uint64_t)(WASM_GRAN - 1);
+-        int ok = lo >= WASM_GRAN && hi <= HLE_FIXED_END;
+-        for (int i = 0; ok && i < g_nres; i++) if (lo < g_res[i].hi && hi > g_res[i].lo) ok = 0;
+-        if (ok) {
+-            memset((void *)(uintptr_t)lo, 0, (size_t)(hi - lo));
+-            g_res[g_nres].lo = (uint32_t)lo, g_res[g_nres].hi = (uint32_t)hi, g_res[g_nres].fixed = 1, g_nres++;
+-            r = (uint32_t)lo;
+-        }
+-    } else {
+-        size_t n = ((size_t)size + WASM_GRAN - 1) & ~(size_t)(WASM_GRAN - 1);
+-        void *p = NULL;
+-        if (posix_memalign(&p, WASM_GRAN, n) == 0 && p) {
+-            memset(p, 0, n);
+-            g_res[g_nres].lo = (uint32_t)(uintptr_t)p, g_res[g_nres].hi = (uint32_t)((uintptr_t)p + n), g_res[g_nres].fixed = 0, g_nres++;
+-            r = (uint32_t)(uintptr_t)p;
+-        }
+-    }
+-    pthread_mutex_unlock(&g_res_lock);
+-    return r;
+-}
+-void hle_vm_release(uint32_t va, uint32_t size) {
+-    (void)size;
+-    pthread_mutex_lock(&g_res_lock);
+-    for (int i = 0; i < g_nres; i++) {
+-        if (g_res[i].lo != va) continue;
+-        if (g_res[i].fixed) memset((void *)(uintptr_t)va, 0, g_res[i].hi - g_res[i].lo);
+-        else free((void *)(uintptr_t)va);
+-        g_res[i] = g_res[--g_nres];
+-        break;
+-    }
+-    pthread_mutex_unlock(&g_res_lock);
+-}
+-void hle_vm_zero(uint32_t va, uint32_t size) { memset((void *)(uintptr_t)va, 0, size); }
+-
+-#else
+ void hle_mem_init(void) {}
+-
+-uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
+-    void *p = mmap(va ? (void *)(uintptr_t)(va & ~0xFFFFu) : NULL, size, PROT_READ | PROT_WRITE,
+-                   MAP_PRIVATE | MAP_ANONYMOUS | (va ? MAP_FIXED_NOREPLACE : 0), -1, 0);
+-    if (p == MAP_FAILED) return 0;
+-    if (va && (uint32_t)(uintptr_t)p != (va & ~0xFFFFu)) { munmap(p, size); return 0; }
+-    return (uint32_t)(uintptr_t)p;
+-}
+-void hle_vm_release(uint32_t va, uint32_t size) { munmap((void *)(uintptr_t)va, size); }
+-void hle_vm_zero(uint32_t va, uint32_t size)    { madvise((void *)(uintptr_t)va, size, MADV_DONTNEED); }
+-#endif /* !__EMSCRIPTEN__ */
++uint32_t hle_vm_reserve(uint32_t address, uint32_t size) { return gex_flat_vm_reserve(address, size); }
++void hle_vm_release(uint32_t address, uint32_t size) { gex_flat_vm_release(address, size); }
++void hle_vm_zero(uint32_t address, uint32_t size) { gex_flat_vm_zero(address, size); }
+ 
+ void *hle_heap_alloc(uint32_t n, int zero) {
+     uint8_t *p = (uint8_t *)(zero ? calloc(1, (size_t)n + HDR) : malloc((size_t)n + HDR));
+@@ -142,7 +64,7 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
+ #define SHIM_HI   0x80000000u
+ #define MAX_RANGES 8192
+ 
+-static pthread_mutex_t g_mem_lock = PTHREAD_MUTEX_INITIALIZER;
++static gex_mutex g_mem_lock = GEX_MUTEX_INIT;
+ static struct { uint64_t lo, hi; } g_rng[MAX_RANGES];   /* reserved, sorted by lo */
+ static int g_nrng;
+ static size_t g_host_page;
+@@ -153,7 +75,7 @@ uint32_t hle_va_bad(const void *p) {
+ }
+ 
+ static void mem_init_once(void) {
+-    g_host_page = (size_t)getpagesize();
++    g_host_page = gex_vm_page_size();
+     /* Nothing is accessible until reserved, page zero included: a guest NULL
+      * (or a VA nobody handed out) faults, as it would on Windows. */
+ #ifdef RECOMP_MEM_BASE
+@@ -162,29 +84,24 @@ static void mem_init_once(void) {
+      * mapped is replaced (Linux says so with NOREPLACE; macOS honours a free
+      * hint). */
+     void *want = (void *)(uintptr_t)(RECOMP_MEM_BASE);
+-    void *p = mmap(want, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+-#ifdef __linux__
+-                   | MAP_FIXED_NOREPLACE
+-#endif
+-                   , -1, 0);
+-    if (p != want) hle_fatal("cannot reserve the guest's 4 GB at %p (RECOMP_MEM_BASE): the range is in use", want);
++    void *p = gex_vm_reserve(want, SPAN, 0, 1);
++    if (!p) hle_fatal("cannot reserve guest address space at %p", want);
+ #else
+-    void *p = mmap(NULL, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+-    if (p == MAP_FAILED) hle_fatal("cannot reserve the guest's 4 GB");
++    void *p = gex_vm_reserve(NULL, SPAN, 0, 0);
++    if (!p) hle_fatal("cannot reserve guest address space");
+ #endif
+     g_mem_base = (ptrdiff_t)p;
+ }
+ void hle_mem_init(void) {
+-    static pthread_once_t once = PTHREAD_ONCE_INIT;
+-    pthread_once(&once, mem_init_once);
++    static gex_once once = GEX_ONCE_INIT;
++    gex_call_once(&once, mem_init_once);
+ }
+ 
+ static uint8_t *host(uint32_t va) { return (uint8_t *)g_mem_base + va; }
+ 
+ /* Fresh zero pages over [va, va+size), host-page aligned, with prot. */
+ static int remap(uint32_t va, uint64_t size, int prot) {
+-    void *p = mmap(host(va), (size_t)size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | (prot ? 0 : MAP_NORESERVE), -1, 0);
+-    return p == (void *)host(va) ? 0 : -1;
++    return gex_vm_replace(host(va), size, prot);
+ }
+ 
+ static int overlaps(uint64_t lo, uint64_t hi) {
+@@ -225,16 +142,16 @@ static uint32_t vm_reserve_locked(uint32_t va, uint32_t size) {
+     } else if (lo < GRAN || hi > SPAN || overlaps(lo, hi)) {
+         return 0;                                         /* page zero stays unmapped */
+     }
+-    if (g_nrng >= MAX_RANGES || remap((uint32_t)lo, hi - lo, PROT_READ | PROT_WRITE)) return 0;
++    if (g_nrng >= MAX_RANGES || remap((uint32_t)lo, hi - lo, 1)) return 0;
+     add_range(lo, hi);
+     return (uint32_t)lo;
+ }
+ 
+ uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
+     hle_mem_init();
+-    pthread_mutex_lock(&g_mem_lock);
++    gex_mutex_lock(&g_mem_lock);
+     uint32_t r = vm_reserve_locked(va, size);
+-    pthread_mutex_unlock(&g_mem_lock);
++    gex_mutex_unlock(&g_mem_lock);
+     return r;
+ }
+ 
+@@ -243,7 +160,8 @@ uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
+ static void vm_release_locked(uint32_t va) {
+     for (int i = 0; i < g_nrng; i++) {
+         if (g_rng[i].lo != va) continue;
+-        remap((uint32_t)g_rng[i].lo, g_rng[i].hi - g_rng[i].lo, PROT_NONE);
++        if (remap((uint32_t)g_rng[i].lo, g_rng[i].hi - g_rng[i].lo, 0))
++            hle_fatal("cannot release guest reservation");
+         memmove(&g_rng[i], &g_rng[i + 1], sizeof g_rng[0] * (size_t)(g_nrng - i - 1));
+         g_nrng--;
+         return;
+@@ -251,9 +169,9 @@ static void vm_release_locked(uint32_t va) {
+ }
+ void hle_vm_release(uint32_t va, uint32_t size) {
+     (void)size;
+-    pthread_mutex_lock(&g_mem_lock);
++    gex_mutex_lock(&g_mem_lock);
+     vm_release_locked(va);
+-    pthread_mutex_unlock(&g_mem_lock);
++    gex_mutex_unlock(&g_mem_lock);
+ }
+ 
+ /* Decommit: the range reads as zero when touched again. Whole host pages are
+@@ -263,7 +181,8 @@ void hle_vm_zero(uint32_t va, uint32_t size) {
+     uint64_t plo = (lo + g_host_page - 1) & ~(uint64_t)(g_host_page - 1), phi = hi & ~(uint64_t)(g_host_page - 1);
+     if (plo >= phi) { memset(host(va), 0, size); return; }
+     memset(host((uint32_t)lo), 0, (size_t)(plo - lo));
+-    remap((uint32_t)plo, phi - plo, PROT_READ | PROT_WRITE);
++    if (remap((uint32_t)plo, phi - plo, 1))
++        hle_fatal("cannot decommit guest pages");
+     memset(host((uint32_t)phi), 0, (size_t)(hi - phi));
+ }
+ 
+@@ -310,9 +229,9 @@ void *hle_heap_alloc(uint32_t n, int zero) {
+     if (n > 0xFFFFFFFFu - GRAN - HDR) return NULL;
+     uint32_t total = n + HDR, va;
+     int c = total <= SMALL_MAX ? class_of(total) : -1;
+-    pthread_mutex_lock(&g_mem_lock);
++    gex_mutex_lock(&g_mem_lock);
+     va = c >= 0 ? small_alloc(c) : vm_reserve_locked(0, total);
+-    pthread_mutex_unlock(&g_mem_lock);
++    gex_mutex_unlock(&g_mem_lock);
+     if (!va) return NULL;
+     uint32_t *h = (uint32_t *)host(va);
+     h[0] = n, h[1] = MAGIC, h[2] = c >= 0 ? (uint32_t)c : LARGE, h[3] = 0;
+@@ -330,10 +249,10 @@ void hle_heap_free(void *u) {
+     uint32_t *h = (uint32_t *)u - 4;
+     uint32_t va = hle_va(h);
+     h[1] = 0;
+-    pthread_mutex_lock(&g_mem_lock);
++    gex_mutex_lock(&g_mem_lock);
+     if (h[2] == LARGE) vm_release_locked(va);
+     else { *(uint32_t *)u = g_free[h[2]]; g_free[h[2]] = va; }
+-    pthread_mutex_unlock(&g_mem_lock);
++    gex_mutex_unlock(&g_mem_lock);
+ }
+ 
+ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
+@@ -380,7 +299,7 @@ uint32_t hle_guest_strdup(const char *s) {
+ /* ---- scratch ----
+  * 256 KB a thread, reserved on its first use and kept. */
+ #define SCRATCH 0x40000u
+-static __thread uint32_t g_scr_lo, g_scr_top;
++static _Thread_local uint32_t g_scr_lo, g_scr_top;
+ 
+ uint32_t hle_scratch_mark(void) { return g_scr_top; }
+ uint32_t hle_scratch(uint32_t n) {
+diff --git a/runtime/win32hle/hle_path.c b/runtime/win32hle/hle_path.c
+index 436a89e..4557d9b 100644
+--- a/runtime/win32hle/hle_path.c
++++ b/runtime/win32hle/hle_path.c
+@@ -20,17 +20,13 @@
+  * The reverse (a host directory as the guest should see it) is
+  * hle_guest_path, for GetCurrentDirectoryA and GetModuleFileNameA.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+-#include <dirent.h>
+-#include <pthread.h>
+-#include <unistd.h>
+-#include <sys/stat.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
++#include "platform/filesystem.h"
+ 
+ static char *g_drive[26];
+ 
+@@ -38,18 +34,18 @@ void hle_set_drive(char letter, const char *host_root) {
+     int i = (letter | 0x20) - 'a';
+     if (i < 0 || i >= 26) return;
+     free(g_drive[i]);
+-    g_drive[i] = host_root ? realpath(host_root, NULL) : NULL;
++    g_drive[i] = host_root ? gex_fs_canonical_path(host_root) : NULL;
+ }
+ 
+ static const char *drive_root(int i) {
+     if (g_drive[i]) return g_drive[i];
+-    return i == 'z' - 'a' ? "" : NULL;          /* Z: is the host's root */
++    return gex_fs_default_drive_root((unsigned)i);
+ }
+ 
+ static int at_or_under(const char *path, const char *root) {
+     size_t len = strlen(root);
+     if (strncmp(path, root, len)) return 0;
+-    if (len == 1 && root[0] == '/') return path[0] == '/';
++    if (len && root[len - 1] == '/') return 1;
+     return path[len] == '/' || path[len] == 0;
+ }
+ 
+@@ -64,9 +60,9 @@ static int at_or_under(const char *path, const char *root) {
+ typedef struct { char *name; int is_dir; } dent_t;
+ static struct { char *dir; dent_t *ents; int n; unsigned gen; } g_dc[DIR_CACHE];
+ static int g_dc_next;
+-static unsigned g_path_gen = 1;
+-static pthread_mutex_t g_dc_lock = PTHREAD_MUTEX_INITIALIZER;
+-void hle_path_changed(void) { __sync_fetch_and_add(&g_path_gen, 1); }
++static atomic_uint g_path_gen = 1;
++static gex_mutex g_dc_lock = GEX_MUTEX_INIT;
++void hle_path_changed(void) { atomic_fetch_add(&g_path_gen, 1); }
+ static void dc_drop(int i) {
+     for (int k = 0; k < g_dc[i].n; k++) free(g_dc[i].ents[k].name);
+     free(g_dc[i].ents), free(g_dc[i].dir);
+@@ -76,7 +72,7 @@ static void dc_drop(int i) {
+  * it, and whether it is a directory; 0 when there is none. */
+ static int dir_find(const char *dir, const char *want, char *name, size_t n, int *is_dir) {
+     unsigned gen = g_path_gen;
+-    pthread_mutex_lock(&g_dc_lock);
++    gex_mutex_lock(&g_dc_lock);
+     int slot = -1;
+     for (int i = 0; i < DIR_CACHE; i++)
+         if (g_dc[i].dir && !strcmp(g_dc[i].dir, dir)) { slot = i; break; }
+@@ -86,38 +82,32 @@ static int dir_find(const char *dir, const char *want, char *name, size_t n, int
+         dc_drop(slot);
+         int cap = 64, cnt = 0;
+         dent_t *ents = (dent_t *)malloc(sizeof *ents * (size_t)cap);
+-        DIR *d = opendir(dir);
+-        struct dirent *e;
+-        while (d && (e = readdir(d))) {
+-            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
++        gex_directory *d = gex_directory_open(dir);
++        const gex_directory_entry *e;
++        while (d && (e = gex_directory_next(d))) {
++            if (!strcmp(e->name, ".") || !strcmp(e->name, "..")) continue;
+             if (cnt == cap) ents = (dent_t *)realloc(ents, sizeof *ents * (size_t)(cap *= 2));
+-            ents[cnt].name = strdup(e->d_name);
+-            int t = e->d_type == DT_DIR ? 1 : e->d_type == DT_UNKNOWN ? -1 : 0;
+-            if (t < 0) {
+-                char full[1024];
+-                struct stat st;
+-                snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+-                t = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+-            }
++            ents[cnt].name = gex_string_duplicate(e->name);
++            int t = e->directory;
+             ents[cnt++].is_dir = t;
+         }
+-        if (d) closedir(d);
+-        g_dc[slot].dir = strdup(dir), g_dc[slot].ents = ents, g_dc[slot].n = cnt, g_dc[slot].gen = gen;
++        if (d) gex_directory_close(d);
++        g_dc[slot].dir = gex_string_duplicate(dir), g_dc[slot].ents = ents, g_dc[slot].n = cnt, g_dc[slot].gen = gen;
+     }
+     int found = 0;
+     for (int k = 0; k < g_dc[slot].n && !found; k++)
+-        if (!strcasecmp(g_dc[slot].ents[k].name, want)) {
++        if (!gex_string_compare_case(g_dc[slot].ents[k].name, want)) {
+             snprintf(name, n, "%s", g_dc[slot].ents[k].name);
+             if (is_dir) *is_dir = g_dc[slot].ents[k].is_dir;
+             found = 1;
+         }
+-    pthread_mutex_unlock(&g_dc_lock);
++    gex_mutex_unlock(&g_dc_lock);
+     return found;
+ }
+ /* stat, through the listings: 1 if there, with whether it is a directory. */
+ static int cached_stat(const char *path, int *is_dir) {
+     const char *slash = strrchr(path, '/');
+-    if (!slash || !slash[1]) { struct stat st; int r = stat(path, &st) == 0; if (r && is_dir) *is_dir = S_ISDIR(st.st_mode); return r; }
++    if (!slash || !slash[1]) { gex_file_info st; int r = gex_path_stat(path, &st) == 0; if (r && is_dir) *is_dir = st.directory; return r; }
+     char dir[1024], name[512];
+     size_t dl = (size_t)(slash - path);
+     if (dl >= sizeof dir) return 0;
+@@ -173,32 +163,36 @@ static char *g_overlay_base, *g_overlay;
+ 
+ void hle_set_overlay(const char *base, const char *overlay) {
+     free(g_overlay_base), free(g_overlay);
+-    g_overlay_base = base && overlay ? realpath(base, NULL) : NULL;
+-    g_overlay = base && overlay ? realpath(overlay, NULL) : NULL;
++    g_overlay_base = base && overlay ? gex_fs_canonical_path(base) : NULL;
++    g_overlay = base && overlay ? gex_fs_canonical_path(overlay) : NULL;
+     if (!g_overlay_base || !g_overlay) free(g_overlay_base), free(g_overlay), g_overlay_base = g_overlay = NULL;
+ }
+ 
+ /* host as an absolute path, if it is relative (to the cwd). */
+ static void absolute(const char *host, char *out, size_t n) {
+     char cwd[768];
+-    if (host[0] == '/' || !getcwd(cwd, sizeof cwd)) snprintf(out, n, "%s", host);
++    if (gex_fs_path_absolute(host) || !gex_fs_current_directory(cwd, sizeof cwd)) snprintf(out, n, "%s", host);
+     else snprintf(out, n, "%s/%s", cwd, strcmp(host, ".") ? host : "");
+     size_t l = strlen(out);
+-    while (l > 1 && out[l - 1] == '/') out[--l] = 0;
++    while (l > 1 && out[l - 1] == '/' && !(l == 3 && out[1] == ':')) out[--l] = 0;
+ }
+ 
+ static int under(const char *path, const char *dir) {
+     size_t l = strlen(dir);
+-    if (l == 1 && dir[0] == '/') return path[0] == '/';
++    if (l && dir[l - 1] == '/') return !strncmp(path, dir, l);
+     return !strncmp(path, dir, l) && (path[l] == '/' || !path[l]);
+ }
+ 
+-/* Lexically canonicalize an absolute POSIX path without resolving symlinks.
++/* Lexically canonicalize an absolute host path without resolving symlinks.
+  * This is used for overlay prefix classification, not filesystem isolation. */
+ static int normalize_absolute(const char *path, char *out, size_t n) {
+-    if (!path || path[0] != '/' || !n) return 0;
+-    if (snprintf(out, n, "/") >= (int)n) return 0;
+-    const char *p = path;
++    if (!path || !gex_fs_path_absolute(path) || !n) return 0;
++    int drive = path[0] && path[1] == ':';
++    char root[4] = "/";
++    if (drive) { root[0] = path[0]; root[1] = ':'; root[2] = '/'; root[3] = 0; }
++    size_t root_len = strlen(root);
++    if (snprintf(out, n, "%s", root) >= (int)n) return 0;
++    const char *p = path + (drive ? 2 : 0);
+     while (*p == '/') p++;
+     while (*p) {
+         const char *e = p;
+@@ -207,14 +201,15 @@ static int normalize_absolute(const char *path, char *out, size_t n) {
+         if (len == 1 && p[0] == '.') {
+             /* skip */
+         } else if (len == 2 && p[0] == '.' && p[1] == '.') {
+-            if (strcmp(out, "/")) {
++            if (strlen(out) > root_len) {
+                 char *slash = strrchr(out, '/');
+-                if (!slash || slash == out) snprintf(out, n, "/");
++                if (!slash || (size_t)(slash - out) < root_len) snprintf(out, n, "%s", root);
+                 else *slash = 0;
+             }
+         } else if (len) {
+             size_t used = strlen(out);
+-            int wrote = snprintf(out + used, n - used, "%s%.*s", used > 1 ? "/" : "", (int)len, p);
++            int wrote = snprintf(out + used, n - used, "%s%.*s",
++                                 out[used - 1] == '/' ? "" : "/", (int)len, p);
+             if (wrote < 0 || (size_t)wrote >= n - used) return 0;
+         }
+         p = e;
+@@ -252,7 +247,7 @@ int hle_host_path_for_write(const char *guest, char *out, size_t n, int keep) {
+     if (hle_overlay_of(out, ov, sizeof ov) < 0) return exists;
+     for (char *s = ov + strlen(g_overlay); *s && (s = strchr(s + 1, '/')); ) {   /* mkdir -p its directory */
+         *s = 0;
+-        mkdir(ov, 0755);
++        gex_directory_create(ov);
+         *s = '/';
+     }
+     if (keep && exists) {
+@@ -273,7 +268,7 @@ static int host_path_plain(const char *guest, char *out, size_t n);
+ int hle_host_path(const char *guest, char *out, size_t n) {
+     int exists = host_path_plain(guest, out, n);
+     char ov[1024];
+-    struct stat st;
++    gex_file_info st;
+     /* A file only: a directory stays the game's (the cwd is set through here,
+      * and FindFirstFileA lists both) */
+     int is_dir = 0;
+@@ -324,24 +319,27 @@ static int host_path_plain(const char *guest, char *out, size_t n) {
+  * drive; otherwise Z: and the whole path. Backslashes. */
+ void hle_guest_path(const char *host, char *out, size_t n) {
+     char abs[1024];
+-    if (host[0] != '/') {
++    if (!gex_fs_path_absolute(host)) {
+         char cwd[768];
+-        if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
++        if (!gex_fs_current_directory(cwd, sizeof cwd)) cwd[0] = 0;
+         snprintf(abs, sizeof abs, "%s/%s", cwd, host);
+     } else {
+         snprintf(abs, sizeof abs, "%s", host);
+     }
+-    char *real = realpath(abs, NULL);
++    char *real = gex_fs_canonical_path(abs);
+     const char *h = real ? real : abs;
+     int best = -1;
+     size_t best_len = 0;
+     for (int i = 0; i < 26; i++) {
+         const char *r = g_drive[i];
+         size_t l = r ? strlen(r) : 0;
+-        if (r && !strncmp(h, r, l) && (h[l] == '/' || !h[l]) && l >= best_len) best = i, best_len = l;
++        if (r && !strncmp(h, r, l) && (r[l - 1] == '/' || h[l] == '/' || !h[l]) &&
++            l >= best_len) best = i, best_len = l;
+     }
+-    const char *rest = best >= 0 ? h + best_len : h;
+-    snprintf(out, n, "%c:%s", best >= 0 ? 'A' + best : 'Z', *rest ? "" : "\\");
++    int native_drive = gex_fs_path_absolute(h) && h[0] && h[1] == ':';
++    const char *rest = best >= 0 ? h + best_len : native_drive ? h + 2 : h;
++    snprintf(out, n, "%c:%s", best >= 0 ? 'A' + best : native_drive ? h[0] : 'Z',
++             *rest == '/' ? "" : "\\");
+     size_t k = strlen(out);
+     for (; *rest && k + 1 < n; rest++) out[k++] = *rest == '/' ? '\\' : *rest;
+     out[k] = 0;
+diff --git a/runtime/win32hle/host.c b/runtime/win32hle/host.c
+index 9e7de1e..746a0db 100644
+--- a/runtime/win32hle/host.c
++++ b/runtime/win32hle/host.c
+@@ -3,7 +3,6 @@
+  * to the shims, and runs its entry point as lifted code. Portable C: no asm, no
+  * OS exception handler (win32hle.h explains why neither is needed).
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include "win32hle.h"
+@@ -23,14 +22,20 @@ void recomp_host_init(void) {
+     win32hle_register(win32hle_user32);
+     win32hle_register(win32hle_winmm);
+     win32hle_register(win32hle_lz32);
++#ifndef GEX_NO_NETWORK
+     win32hle_register(win32hle_wsock32);
++#endif
+     win32hle_register(win32hle_ole32);
+     win32hle_register(win32hle_storage);
+     win32hle_register(win32hle_advapi32);
+     win32hle_register(win32hle_dsound);
++#ifndef GEX_NO_DIRECTDRAW
+     win32hle_register(win32hle_ddraw);
+     win32hle_register(win32hle_bink);
++#endif
++#ifndef GEX_NO_MILES
+     win32hle_register(win32hle_mss);
++#endif
+     hle_dsound_register_com();
+ }
+ 
+diff --git a/runtime/win32hle/host_lite.c b/runtime/win32hle/host_lite.c
+index 4afaf0f..3487fb7 100644
+--- a/runtime/win32hle/host_lite.c
++++ b/runtime/win32hle/host_lite.c
+@@ -11,15 +11,14 @@
+  * code and the shim layer (the selftest does exactly that). A full game host
+  * adds image mapping and IAT binding on top; those are separate.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <string.h>
+-#include <pthread.h>
+-#include <sched.h>
++#include <stdatomic.h>
++#include "platform/runtime.h"
+ #include "win32hle.h"
+ 
+ /* ------------------------------------------------------------ register file
+@@ -63,59 +62,63 @@ void hle_fatal(const char *fmt, ...) {
+  * one's lifted code.) Every import is a yield point when another thread is
+  * waiting (shim_entry), as every native call is under native32, and so is
+  * every RECOMP_YIELD_EVERY-th loop back-edge (recomp_yield_hook). */
+-/* Letting a waiter in: sched_yield gives the CPU up on a real OS; in a
+- * browser's worker it returns at once, so the thread took the lock straight
+- * back and a timer thread never ran (the game then waited forever for a tick
+- * it never got). There, a short sleep instead. */
+-#ifdef __EMSCRIPTEN__
+-#include <unistd.h>
+-#define HLE_SPIN()  usleep(50)
+-#define HLE_SPINS   200
+-#else
+-#define HLE_SPIN()  sched_yield()
+-#define HLE_SPINS   1000
+-#endif
+-static pthread_mutex_t g_mach = PTHREAD_MUTEX_INITIALIZER;
+-static volatile int      g_waiters;     /* threads blocked in mach_take */
+-static volatile unsigned g_owner_gen;   /* bumped on every take */
++static atomic_int  g_waiters;     /* threads blocked in mach_take */
++static atomic_uint g_owner_gen;   /* bumped on every take */
+ 
+ extern volatile unsigned hle_dbg_takes;
+ int hle_debug_waiters(void) { return g_waiters; }
+ static void mach_take(void) {
+-    __sync_fetch_and_add(&g_waiters, 1);
+-    pthread_mutex_lock(&g_mach);
+-    __sync_fetch_and_sub(&g_waiters, 1);
++    atomic_fetch_add(&g_waiters, 1);
++    gex_runtime_machine_lock();
++    atomic_fetch_sub(&g_waiters, 1);
+     g_owner_gen++;
+     hle_dbg_takes++;
+ }
+ 
+ typedef struct {
+-    uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
++    uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, gs, cur;
++    uint32_t flag_k, flag_a, flag_b, flag_cf, mxcsr;
++    uint16_t cs, ds, es, seg_fs, seg_gs, ss;
++    const char *cur_import;
+     double   st[8];
+     int      fp_top;
+     uint16_t fpu_cw;
+     uint64_t mm[8];
++    xmm_t xmm[8];
+ } regs_t;
+ 
+ static void regs_save(regs_t *r) {
+     r->eax=g_eax; r->ecx=g_ecx; r->edx=g_edx; r->esp=g_esp;
+     r->ebx=g_ebx; r->esi=g_esi; r->edi=g_edi; r->ebp=g_ebp;
+-    r->fs=g_fs_base; r->cur=g_cur_func;
++    r->fs=g_fs_base; r->gs=g_gs_base; r->cur=g_cur_func; r->cur_import=g_cur_import;
++    r->flag_k=g_flag_k; r->flag_a=g_flag_a; r->flag_b=g_flag_b; r->flag_cf=g_flag_cf;
++    r->cs=g_seg_cs; r->ds=g_seg_ds; r->es=g_seg_es;
++    r->seg_fs=g_seg_fs; r->seg_gs=g_seg_gs; r->ss=g_seg_ss;
++    r->mxcsr=g_mxcsr;
+     memcpy(r->st, g_st, sizeof g_st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
+     memcpy(r->mm, g_mm, sizeof g_mm);
++    memcpy(r->xmm, g_xmm, sizeof g_xmm);
+ }
+ static void regs_load(const regs_t *r) {
+     g_eax=r->eax; g_ecx=r->ecx; g_edx=r->edx; g_esp=r->esp;
+     g_ebx=r->ebx; g_esi=r->esi; g_edi=r->edi; g_ebp=r->ebp;
+-    g_fs_base=r->fs; g_cur_func=r->cur;
++    g_fs_base=r->fs; g_gs_base=r->gs; g_cur_func=r->cur; g_cur_import=r->cur_import;
++    g_flag_k=r->flag_k; g_flag_a=r->flag_a; g_flag_b=r->flag_b; g_flag_cf=r->flag_cf;
++    g_seg_cs=r->cs; g_seg_ds=r->ds; g_seg_es=r->es;
++    g_seg_fs=r->seg_fs; g_seg_gs=r->seg_gs; g_seg_ss=r->ss;
++    g_mxcsr=r->mxcsr;
+     memcpy(g_st, r->st, sizeof g_st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
+     memcpy(g_mm, r->mm, sizeof g_mm);
++    memcpy(g_xmm, r->xmm, sizeof g_xmm);
+ }
+ 
+ /* A guest thread's stack and simulated TIB. Lifted code reads fs:[n] as
+  * MEM32(g_fs_base + n); the host's own TLS stays separate, so a guest SEH frame
+  * never lands on a chain the host walks. */
+-#define GUEST_STACK (4u << 20)
++#ifndef HLE_GUEST_STACK_SIZE
++#define HLE_GUEST_STACK_SIZE (4u << 20)
++#endif
++#define GUEST_STACK HLE_GUEST_STACK_SIZE
+ 
+ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
+     uint32_t *t = (uint32_t *)hle_alloc(0x1000);
+@@ -128,7 +131,7 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
+ }
+ 
+ typedef struct { regs_t r; int depth, inited; } mstate;
+-static __thread mstate g_ms;
++static _Thread_local mstate g_ms;
+ 
+ void mach_enter(void) {
+     if (g_ms.depth++ == 0) {
+@@ -138,28 +141,30 @@ void mach_enter(void) {
+             g_ms.r.esp    = lo + GUEST_STACK - 64;
+             g_ms.r.fs     = make_tib(lo, lo + GUEST_STACK);
+             g_ms.r.fpu_cw = 0x027F;
++            g_ms.r.mxcsr  = 0x1F80;
+             g_ms.inited   = 1;
+         }
+         mach_take();
++        recomp_yield_hook = hle_yield;
+         regs_load(&g_ms.r);
+     }
+ }
+ void mach_leave(void) {
+     if (--g_ms.depth == 0) {
+         regs_save(&g_ms.r);
+-        pthread_mutex_unlock(&g_mach);
++        gex_runtime_machine_unlock();
+     }
+ }
+ 
+ /* Give the machine up around a wait (a Sleep, an event, a contended critical
+  * section). The registers go with it; nothing between begin and end may touch
+  * the register file or guest-shared host state. */
+-static __thread unsigned g_block_gen;
++static _Thread_local unsigned g_block_gen;
+ void hle_block_begin(void) {
+     if (!g_ms.depth) return;
+     regs_save(&g_ms.r);
+     g_block_gen = g_owner_gen;
+-    pthread_mutex_unlock(&g_mach);
++    gex_runtime_machine_unlock();
+ }
+ /* The mutex is not fair: a thread that gives the machine up for a moment
+  * (a wait with no timeout, polled in a loop) took it straight back, and a
+@@ -168,7 +173,8 @@ void hle_block_begin(void) {
+  * first lets a waiter have its turn. */
+ void hle_block_end(void) {
+     if (!g_ms.depth) return;
+-    for (int spins = 0; g_waiters && g_owner_gen == g_block_gen && spins < HLE_SPINS; spins++) HLE_SPIN();
++    unsigned limit = gex_runtime_spin_limit();
++    for (unsigned spins = 0; g_waiters && g_owner_gen == g_block_gen && spins < limit; spins++) gex_runtime_yield();
+     mach_take();
+     regs_load(&g_ms.r);
+ }
+@@ -181,9 +187,9 @@ void hle_yield(void) {
+     unsigned gen = g_owner_gen;
+     hle_dbg_yields++;
+     hle_block_begin();
+-    int spins = 0;
+-    for (; g_waiters && g_owner_gen == gen && spins < HLE_SPINS; spins++) HLE_SPIN();
+-    if (g_owner_gen != gen) hle_dbg_handed++; else if (spins >= HLE_SPINS) hle_dbg_timeouts++;
++    unsigned spins = 0, limit = gex_runtime_spin_limit();
++    for (; g_waiters && g_owner_gen == gen && spins < limit; spins++) gex_runtime_yield();
++    if (g_owner_gen != gen) hle_dbg_handed++; else if (spins >= limit) hle_dbg_timeouts++;
+     hle_block_end();
+ }
+ 
+@@ -286,10 +292,10 @@ uint32_t hle_resolve_or_stub(const char *name) {
+ /* ------------------------------------------------------- native -> guest */
+ uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args) {
+     mach_enter();
++    regs_t saved; regs_save(&saved);
+     recomp_func_t f = recomp_lookup(va);       /* under the machine: shim_entry's index is shared */
+     if (!f) f = recomp_lookup_import(va);
+     if (!f) hle_fatal("no lifted function at 0x%08X", va);
+-    regs_t saved; regs_save(&saved);
+     for (int i = nargs - 1; i >= 0; i--) PUSH32(g_esp, args[i]);
+     PUSH32(g_esp, RECOMP_RETADDR);
+     f();
+@@ -300,8 +306,6 @@ uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args) {
+ }
+ 
+ /* Loops in lifted code hand the machine over too (RECOMP_BACKEDGE). */
+-static void yield_hook(void) { hle_yield(); }
+-__attribute__((constructor)) static void install_yield_hook(void) { recomp_yield_hook = yield_hook; }
+ 
+ /* ---------------------------------------------------------- handles
+  * Kernel objects the guest holds by HANDLE: files, find searches, events,
+diff --git a/runtime/win32hle/kernel32.c b/runtime/win32hle/kernel32.c
+index c4cd821..9cfd93e 100644
+--- a/runtime/win32hle/kernel32.c
++++ b/runtime/win32hle/kernel32.c
+@@ -9,21 +9,13 @@
+  * here (a CRITICAL_SECTION's fields, an event's flag) needs no lock of its own:
+  * a wait gives the machine up (hle_block_begin/end) and looks again.
+  */
+-#define _GNU_SOURCE   /* clock_gettime, usleep, MAP_ANONYMOUS */
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+-#include <unistd.h>
+-#include <pthread.h>
+-#include <sched.h>
+-#include <sys/stat.h>
+ #include "win32hle.h"
+-#ifdef __APPLE__
+-#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+-#endif
+-
++#include "platform/runtime.h"
+ #define HEAP_ZERO_MEMORY            0x00000008u
+ #define HEAP_REALLOC_IN_PLACE_ONLY  0x00000010u
+ #define ERROR_INVALID_HANDLE        6u
+@@ -37,7 +29,7 @@
+ #define INFINITE          0xFFFFFFFFu
+ 
+ /* --- error --- */
+-static __thread uint32_t g_last_error;
++static _Thread_local uint32_t g_last_error;
+ void hle_set_last_error(uint32_t code) { g_last_error = code; }
+ uint32_t hle_get_last_error(void) { return g_last_error; }
+ static void k_GetLastError(void)      { RET(g_last_error, 0); }
+@@ -45,48 +37,20 @@ static void k_SetLastError(void)      { g_last_error = A32(0); RETV(1); }
+ static void k_OutputDebugStringA(void){ fprintf(stderr, "[guest] %s", ASTR(0) ? ASTR(0) : ""); RETV(1); }
+ 
+ /* --- process --- */
+-int hle_exe_path(char *out, size_t n) {
+-#ifdef __EMSCRIPTEN__
+-    /* no program file: a name in the browser's saved folder (src/web/web.c),
+-     * so a host keeps its settings beside it as it would beside the program */
+-    struct stat st;
+-    if (n < 16) return 0;
+-    strcpy(out, stat("/opfs/save", &st) == 0 ? "/opfs/save/ra2" : "/save/ra2");
+-    return 1;
+-#elif defined(__APPLE__)
+-    char raw[4096], real[4096];
+-    uint32_t len = sizeof raw;
+-    if (!n || _NSGetExecutablePath(raw, &len) != 0 || !realpath(raw, real) || strlen(real) >= n) return 0;
+-    memcpy(out, real, strlen(real) + 1);
+-    return 1;
+-#else
+-    ssize_t len = n ? readlink("/proc/self/exe", out, n - 1) : -1;
+-    if (len <= 0) return 0;
+-    out[len] = 0;
+-    return 1;
+-#endif
+-}
++int hle_exe_path(char *out, size_t n) { return gex_runtime_executable_path(out, n); }
+ static const char g_default_cmdline[] = "game.exe";
+ static const char *g_cmdline = g_default_cmdline;
+ void hle_set_command_line(const char *cmdline) { g_cmdline = cmdline; }
+ 
+ /* A host may want to close a recording or a window before the process goes. */
+ void (*hle_on_exit)(int code);
+-#ifdef __EMSCRIPTEN__
+-/* From the game's thread (a pthread) only exit() reaches the page: _exit
+- * asks the page's thread to quit while it still holds the runtime alive for
+- * this one, so nothing happens. */
+-#define HLE_LEAVE(code) exit(code)
+-#else
+-#define HLE_LEAVE(code) _exit(code)
+-#endif
+ void hle_exit(int code) {
+-    static volatile int once;
+-    if (__sync_lock_test_and_set(&once, 1)) HLE_LEAVE(code);
++    static atomic_int once;
++    if (atomic_exchange(&once, 1)) gex_runtime_exit_process(code);
+     if (hle_on_exit) hle_on_exit(code);
+     fflush(stdout);
+     fflush(stderr);
+-    HLE_LEAVE(code);
++    gex_runtime_exit_process(code);
+ }
+ 
+ static void k_GetProcessHeap(void)      { RET(0x00000001u, 0); }        /* every heap is the one heap */
+@@ -99,7 +63,7 @@ static void k_GetCommandLineA(void) {
+     RET(va, 0);
+ }
+ static void k_GetCurrentProcess(void)   { RET(0xFFFFFFFFu, 0); }        /* pseudo-handle */
+-static void k_GetCurrentProcessId(void) { RET((uint32_t)getpid(), 0); }
++static void k_GetCurrentProcessId(void) { RET(gex_runtime_process_id(), 0); }
+ static void k_ExitProcess(void)         { fprintf(stderr, "[win32hle] ExitProcess(%u)\n", A32(0)); hle_exit((int)A32(0)); }
+ static void k_TerminateProcess(void) {
+     if (A32(0) == 0xFFFFFFFFu) { fprintf(stderr, "[win32hle] TerminateProcess(self, %u)\n", A32(1)); hle_exit((int)A32(1)); }
+@@ -136,9 +100,9 @@ static void k_FormatMessageA(void) {                     /* (flags, source, id,
+ static void k_GetExitCodeProcess(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(1, 2); }
+ 
+ /* Thread ids: small and stable per host thread (pthread_self is a pointer). */
+-static __thread uint32_t g_tid;
+-static volatile uint32_t g_next_tid = 0x100;
+-uint32_t hle_thread_id_new(void) { return __sync_add_and_fetch(&g_next_tid, 4); }
++static _Thread_local uint32_t g_tid;
++static atomic_uint_least32_t g_next_tid = 0x100;
++uint32_t hle_thread_id_new(void) { return atomic_fetch_add(&g_next_tid, 4) + 4; }
+ void hle_thread_id_adopt(uint32_t tid) { g_tid = tid; }
+ uint32_t hle_thread_id(void) {
+     if (!g_tid) g_tid = hle_thread_id_new();
+@@ -268,15 +232,13 @@ static void k_IsProcessorFeaturePresent(void) { RET(0, 1); }
+ 
+ /* --- time --- */
+ static uint32_t ticks_ms(void) {
+-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
++    return (uint32_t)(gex_runtime_time_us() / 1000u);
+ }
+ uint32_t hle_ticks_ms(void) { return ticks_ms(); }
+ static void k_GetTickCount(void) { RET(ticks_ms(), 0); }
+ static void k_QueryPerformanceFrequency(void) { if (A32(0)) MEM32(A32(0)) = 1000000u, MEM32(A32(0) + 4) = 0; RET(1, 1); }
+ static void k_QueryPerformanceCounter(void) {
+-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+-    uint64_t us = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++    uint64_t us = gex_runtime_time_us();
+     if (A32(0)) MEM32(A32(0)) = (uint32_t)us, MEM32(A32(0) + 4) = (uint32_t)(us >> 32);
+     RET(1, 1);
+ }
+@@ -285,11 +247,11 @@ static void k_QueryPerformanceCounter(void) {
+ static void k_Sleep(void) {
+     uint32_t ms = A32(0);
+     hle_block_begin();
+-    if (ms) usleep(ms * 1000u); else sched_yield();
++    if (ms) gex_runtime_sleep_us((uint64_t)ms * 1000u); else gex_runtime_yield();
+     hle_block_end();
+     RETV(1);
+ }
+-static void k_SleepEx(void) { uint32_t ms = A32(0); hle_block_begin(); if (ms) usleep(ms * 1000u); else sched_yield(); hle_block_end(); RET(0, 2); }
++static void k_SleepEx(void) { uint32_t ms = A32(0); hle_block_begin(); if (ms) gex_runtime_sleep_us((uint64_t)ms * 1000u); else gex_runtime_yield(); hle_block_end(); RET(0, 2); }
+ 
+ /* --- strings (KERNEL32's lstr*; the CRT has the rest) --- */
+ static void k_lstrlenA(void) { char *s = ASTR(0); RET(s ? (uint32_t)strlen(s) : 0u, 1); }
+@@ -298,7 +260,7 @@ static void k_lstrcpyA(void) { char *d = ASTR(0), *s = ASTR(1); if (d && s) memm
+ static void k_lstrcpynA(void) { char *d = ASTR(0), *s = ASTR(1); int n = (int)A32(2); if (d && s && n > 0) { strncpy(d, s, (size_t)n - 1); d[n - 1] = 0; } RETP(d, 3); }
+ static void k_lstrcatA(void) { char *d = ASTR(0), *s = ASTR(1); if (d && s) strcat(d, s); RETP(d, 2); }
+ static void k_lstrcmpA(void) { RET((uint32_t)strcmp(ASTR(0) ? ASTR(0) : "", ASTR(1) ? ASTR(1) : ""), 2); }
+-static void k_lstrcmpiA(void) { RET((uint32_t)strcasecmp(ASTR(0) ? ASTR(0) : "", ASTR(1) ? ASTR(1) : ""), 2); }
++static void k_lstrcmpiA(void) { RET((uint32_t)gex_string_compare_case(ASTR(0) ? ASTR(0) : "", ASTR(1) ? ASTR(1) : ""), 2); }
+ 
+ /* STARTUPINFOA is 68 bytes; the CRT reads it early. */
+ static void k_GetStartupInfoA(void) { uint32_t si = A32(0); if (si) { memset(hle_ptr(si), 0, 68); MEM32(si) = 68; } RETV(1); }
+@@ -314,8 +276,8 @@ void hle_enter_cs(uint32_t cs) {
+     uint32_t me = hle_thread_id();
+     while (CS_OWNER(cs) && CS_OWNER(cs) != me) {
+         hle_block_begin();
+-        sched_yield();
+-        usleep(50);
++        gex_runtime_yield();
++        gex_runtime_sleep_us(50);
+         hle_block_end();
+     }
+     CS_OWNER(cs) = me;
+@@ -337,11 +299,28 @@ static void k_TryEnterCriticalSection(void) {
+ }
+ 
+ /* --- Interlocked (on guest memory) --- */
+-static void k_InterlockedIncrement(void) { RET(__sync_add_and_fetch((volatile uint32_t *)APTR(0), 1u), 1); }
+-static void k_InterlockedDecrement(void) { RET(__sync_sub_and_fetch((volatile uint32_t *)APTR(0), 1u), 1); }
+-static void k_InterlockedExchange(void)  { RET(__sync_lock_test_and_set((volatile uint32_t *)APTR(0), A32(1)), 2); }
+-static void k_InterlockedExchangeAdd(void) { RET(__sync_fetch_and_add((volatile uint32_t *)APTR(0), A32(1)), 2); }
+-static void k_InterlockedCompareExchange(void) { RET(__sync_val_compare_and_swap((volatile uint32_t *)APTR(0), A32(2), A32(1)), 3); }
++/* Guest memory is not made of C atomic objects. Serialize these operations
++ * without imposing a host atomic type's alignment or representation on it. */
++static gex_mutex g_interlocked = GEX_MUTEX_INIT;
++static uint32_t interlocked_add(uint32_t *p, uint32_t add) {
++    gex_mutex_lock(&g_interlocked);
++    uint32_t previous = *p;
++    *p += add;
++    gex_mutex_unlock(&g_interlocked);
++    return previous;
++}
++static uint32_t interlocked_exchange(uint32_t *p, uint32_t value, uint32_t compare, int conditional) {
++    gex_mutex_lock(&g_interlocked);
++    uint32_t previous = *p;
++    if (!conditional || previous == compare) *p = value;
++    gex_mutex_unlock(&g_interlocked);
++    return previous;
++}
++static void k_InterlockedIncrement(void) { RET(interlocked_add(APTR(0), 1u) + 1u, 1); }
++static void k_InterlockedDecrement(void) { RET(interlocked_add(APTR(0), UINT32_MAX) - 1u, 1); }
++static void k_InterlockedExchange(void)  { RET(interlocked_exchange(APTR(0), A32(1), 0, 0), 2); }
++static void k_InterlockedExchangeAdd(void) { RET(interlocked_add(APTR(0), A32(1)), 2); }
++static void k_InterlockedCompareExchange(void) { RET(interlocked_exchange(APTR(0), A32(1), A32(2), 1), 3); }
+ 
+ /* --- events, mutexes, semaphores, waits --- */
+ typedef struct { int manual, signaled; } hevent;
+@@ -461,7 +440,7 @@ uint32_t hle_wait(int n, const uint32_t *h, int all, uint32_t timeout) {
+         }
+         if (timeout != INFINITE && ticks_ms() - start >= timeout) return WAIT_TIMEOUT;
+         hle_block_begin();
+-        usleep(timeout == 0 ? 0 : 200);
++        gex_runtime_sleep_us(timeout == 0 ? 0 : 200);
+         hle_block_end();
+         if (timeout == 0) return WAIT_TIMEOUT;
+     }
+@@ -477,7 +456,7 @@ static void k_WaitForMultipleObjects(void) {             /* (n, handles, all, ti
+ 
+ /* --- thread-local storage: per host thread --- */
+ #define TLS_SLOTS 64
+-static __thread uint32_t g_tls[TLS_SLOTS];
++static _Thread_local uint32_t g_tls[TLS_SLOTS];
+ static uint8_t g_tls_used[TLS_SLOTS];
+ static void k_TlsAlloc(void) {
+     for (int i = 0; i < TLS_SLOTS; i++) if (!g_tls_used[i]) { g_tls_used[i] = 1; RET((uint32_t)i, 0); }
+@@ -514,7 +493,7 @@ static uint32_t atom_intern(const char *s) {
+     if (!s) return 0;
+     for (int i = 0; i < g_atom_n; i++) if (!strcmp(g_atoms[i].s, s)) return ATOM_BASE + (uint32_t)i;
+     if (g_atom_n >= 1024) return 0;
+-    g_atoms[g_atom_n].s = strdup(s);
++    g_atoms[g_atom_n].s = gex_string_duplicate(s);
+     return ATOM_BASE + (uint32_t)g_atom_n++;
+ }
+ static const char *atom_name(uint32_t a) {
+diff --git a/runtime/win32hle/kernel32_crt.c b/runtime/win32hle/kernel32_crt.c
+index b4b150c..c952e81 100644
+--- a/runtime/win32hle/kernel32_crt.c
++++ b/runtime/win32hle/kernel32_crt.c
+@@ -9,17 +9,14 @@
+  * with ERROR_CALL_NOT_IMPLEMENTED, as on Windows 95: an MSVC CRT then takes
+  * its ANSI paths, which are implemented here for codepage 1252.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+ #include <ctype.h>
+ #include <time.h>
+-#include <unistd.h>
+-#include <pthread.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ #define ERROR_INSUFFICIENT_BUFFER  122u
+ #define ERROR_CALL_NOT_IMPLEMENTED 120u
+@@ -32,12 +29,12 @@
+ /* A thread's handle object: how many ResumeThreads it still waits for
+  * (CREATE_SUSPENDED), and once it has ended, its exit code, so a wait on the
+  * handle returns. Never freed: CloseHandle can come while it still runs. */
+-struct thread_arg { uint32_t start, param, tid; volatile int suspend, done; uint32_t code; };
+-static __thread struct thread_arg *t_self;
++struct thread_arg { uint32_t start, param, tid; atomic_int suspend, done; uint32_t code; };
++static _Thread_local struct thread_arg *t_self;
+ static void *thread_trampoline(void *p) {
+     struct thread_arg *a = (struct thread_arg *)p;
+     hle_thread_id_adopt(a->tid);                     /* the id CreateThread gave out (PostThreadMessageA) */
+-    while (a->suspend > 0) usleep(1000);
++    while (a->suspend > 0) gex_runtime_sleep_us(1000);
+     t_self = a;
+     uint32_t args[1] = { a->param };
+     a->code = hle_call_guest(a->start, 1, args);
+@@ -46,12 +43,14 @@ static void *thread_trampoline(void *p) {
+ }
+ static void k_CreateThread(void) {             /* (sa, stack, start, param, flags, &tid) */
+     struct thread_arg *a = (struct thread_arg *)calloc(1, sizeof *a);
++    if (!a) { hle_set_last_error(8u); RET(0, 6); }
+     a->start = A32(2); a->param = A32(3); a->suspend = (A32(4) & 4) != 0;   /* CREATE_SUSPENDED */
+     a->tid = hle_thread_id_new();
+     uint32_t h = hle_handle_alloc(HLE_H_THREAD, a);
+-    pthread_t t;
+-    if (!h || pthread_create(&t, NULL, thread_trampoline, a) != 0) { if (h) hle_handle_close(h); free(a); RET(0, 6); }
+-    pthread_detach(t);
++    if (!h || gex_runtime_start_thread(thread_trampoline, a) != 0) {
++        if (h) hle_handle_close(h);
++        free(a); hle_set_last_error(8u); RET(0, 6);
++    }
+     uint32_t ptid = A32(5); if (ptid) MEM32(ptid) = a->tid;
+     RET(h, 6);
+ }
+@@ -67,7 +66,7 @@ static void k_ResumeThread(void) {
+ static void k_ExitThread(void) {
+     if (t_self) t_self->code = A32(0), t_self->done = 1;
+     hle_block_begin();
+-    pthread_exit(NULL);
++    gex_runtime_exit_thread();
+ }
+ static void k_GetExitCodeThread(void) {        /* (h, &code) */
+     struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
+@@ -326,9 +325,11 @@ static int fmt_picture(const char *f, const uint16_t *st, char *out, int cap) {
+     return k + 1;
+ }
+ static void now_systemtime(uint16_t *st) {
+-    time_t s = time(NULL);
++    int64_t s;
++    long nanoseconds;
++    gex_runtime_realtime(&s, &nanoseconds);
+     struct tm t;
+-    localtime_r(&s, &t);
++    gex_runtime_calendar(s, 1, &t);
+     st[0] = (uint16_t)(t.tm_year + 1900), st[1] = (uint16_t)(t.tm_mon + 1), st[2] = (uint16_t)t.tm_wday;
+     st[3] = (uint16_t)t.tm_mday, st[4] = (uint16_t)t.tm_hour, st[5] = (uint16_t)t.tm_min, st[6] = (uint16_t)t.tm_sec, st[7] = 0;
+ }
+@@ -368,7 +369,7 @@ static void k_GetEnvironmentVariableA(void) {      /* (name, buf, n) */
+     const char *name = ASTR(0);
+     size_t nl = name ? strlen(name) : 0;
+     for (size_t k = 0; name && g_env[k]; k += strlen(g_env + k) + 1)
+-        if (!strncasecmp(g_env + k, name, nl) && g_env[k + nl] == '=') {
++        if (!gex_string_compare_case_n(g_env + k, name, nl) && g_env[k + nl] == '=') {
+             const char *v = g_env + k + nl + 1;
+             uint32_t len = (uint32_t)strlen(v);
+             if (len + 1 > A32(2)) RET(len + 1, 3);
+@@ -383,7 +384,7 @@ static void k_SetEnvironmentVariableA(void) {      /* (name, value or NULL) */
+     char rebuilt[ENV_SIZE];
+     size_t o = 0, nl = name ? strlen(name) : 0;
+     for (size_t k = 0; g_env[k]; k += strlen(g_env + k) + 1)
+-        if (!(name && !strncasecmp(g_env + k, name, nl) && g_env[k + nl] == '=')) {
++        if (!(name && !gex_string_compare_case_n(g_env + k, name, nl) && g_env[k + nl] == '=')) {
+             size_t l = strlen(g_env + k) + 1;
+             memcpy(rebuilt + o, g_env + k, l), o += l;
+         }
+diff --git a/runtime/win32hle/kernel32_ext.c b/runtime/win32hle/kernel32_ext.c
+index 8ec90c5..c3700a4 100644
+--- a/runtime/win32hle/kernel32_ext.c
++++ b/runtime/win32hle/kernel32_ext.c
+@@ -1,31 +1,19 @@
+ /*
+  * kernel32_ext.c - the KERNEL32 file system and .ini profile shims,
+- * on POSIX. Files are file descriptors behind typed handles (host_lite.c);
++ * using backend-owned file tokens behind typed handles (host_lite.c);
+  * paths go through hle_host_path, so a guest's `DATA\RULES.INI` finds
+  * `data/rules.ini` on a case-sensitive disk. Also the directory search
+  * (FindFirstFileA), attributes, and the FILETIME/SYSTEMTIME conversions a
+  * C runtime's stat and time functions are built on.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+-#include <errno.h>
+-#include <fcntl.h>
+ #include <time.h>
+-#include <dirent.h>
+-#include <unistd.h>
+-#include <sys/stat.h>
+-#include <sys/statvfs.h>
+-#include <sys/mman.h>
+ #include "win32hle.h"
+-
+-#ifdef __APPLE__                 /* struct stat's times by their BSD names */
+-#define st_mtim st_mtimespec
+-#define st_atim st_atimespec
+-#endif
++#include "platform/runtime.h"
++#include "platform/filesystem.h"
+ 
+ #define INVALID_HANDLE  0xFFFFFFFFu
+ #define ERROR_FILE_NOT_FOUND    2u
+@@ -45,17 +33,17 @@
+ 
+ static uint32_t errno_to_win(int e) {
+     switch (e) {
+-    case ENOENT:  return ERROR_FILE_NOT_FOUND;
+-    case ENOTDIR: return ERROR_PATH_NOT_FOUND;
+-    case EEXIST:  return ERROR_FILE_EXISTS;
+-    case EACCES: case EPERM: case EROFS: return ERROR_ACCESS_DENIED;
++    case GEX_IO_MISSING:  return ERROR_FILE_NOT_FOUND;
++    case GEX_IO_NOT_DIRECTORY: return ERROR_PATH_NOT_FOUND;
++    case GEX_IO_EXISTS:  return ERROR_FILE_EXISTS;
++    case GEX_IO_DENIED: return ERROR_ACCESS_DENIED;
+     default:      return ERROR_INVALID_FUNCTION;
+     }
+ }
+ 
+ /* ---- file objects ---- */
+ typedef struct { int fd; } hfile;
+-static void file_closer(void *o) { hfile *f = (hfile *)o; if (f->fd > 2) close(f->fd); free(f); }
++static void file_closer(void *o) { hfile *f = (hfile *)o; if (f->fd > 2) gex_file_close(f->fd); free(f); }
+ 
+ /* The standard handles (kernel32_crt.c's GetStdHandle) are 0x11..0x13. */
+ static int fd_of(uint32_t h) {
+@@ -74,7 +62,7 @@ static uint32_t new_file(int fd) {
+     hfile *f = (hfile *)malloc(sizeof *f);
+     f->fd = fd;
+     uint32_t h = hle_handle_alloc(HLE_H_FILE, f);
+-    if (!h) { close(fd); free(f); return INVALID_HANDLE; }
++    if (!h) { gex_file_close(fd); free(f); return INVALID_HANDLE; }
+     return h;
+ }
+ 
+@@ -85,14 +73,14 @@ static uint32_t new_file(int fd) {
+  * Pacific's Commonwealth advisor (commonwealth_all.pcx), which it then
+  * used without checking. */
+ static int is_port(const char *b) {
+-    return (!strncasecmp(b, "COM", 3) || !strncasecmp(b, "LPT", 3)) && b[3] >= '1' && b[3] <= '9' && (!b[4] || b[4] == '.');
++    return (!gex_string_compare_case_n(b, "COM", 3) || !gex_string_compare_case_n(b, "LPT", 3)) && b[3] >= '1' && b[3] <= '9' && (!b[4] || b[4] == '.');
+ }
+ static int is_device(const char *p, char *host, size_t n) {
+     const char *b = p + strlen(p);
+     while (b > p && b[-1] != '\\' && b[-1] != '/' && b[-1] != ':') b--;
+     if (!strncmp(p, "\\\\.\\", 4) || is_port(b)) { host[0] = 0; return 1; }
+-    if (!strcasecmp(b, "NUL")) { snprintf(host, n, "/dev/null"); return 1; }
+-    if (!strcasecmp(b, "CON")) { snprintf(host, n, "/dev/tty"); return 1; }
++    if (!gex_string_compare_case(b, "NUL")) { snprintf(host, n, "%s", gex_fs_device_path(0)); return 1; }
++    if (!gex_string_compare_case(b, "CON")) { snprintf(host, n, "%s", gex_fs_device_path(1)); return 1; }
+     return 0;
+ }
+ 
+@@ -119,31 +107,31 @@ static void k_CreateFileA(void) {
+         /* a write or a create: under a mod's overlay, into the overlay (a file
+          * opened to change in place is copied there first) */
+         int keep = (access & 0x40000000u) && (disp == 3 || disp == 4);
+-        struct stat there;
++        gex_file_info there;
+         hle_host_path_for_write(name, path, sizeof path, keep);
+-        exists = stat(path, &there) == 0;
++        exists = gex_path_stat(path, &there) == 0;
+     } else {
+         exists = hle_host_path(name, path, sizeof path);
+     }
+     int rd = (access & 0x80000000u) || !(access & 0x40000000u), wr = (access & 0x40000000u) != 0;
+-    int fl = rd && wr ? O_RDWR : wr ? O_WRONLY : O_RDONLY;
++    int fl = rd && wr ? (GEX_FILE_READ | GEX_FILE_WRITE) : wr ? GEX_FILE_WRITE : GEX_FILE_READ;
+     switch (disp) {
+-    case 1: fl |= O_CREAT | O_EXCL; break;
+-    case 2: fl |= O_CREAT | O_TRUNC; break;
+-    case 4: fl |= O_CREAT; break;
+-    case 5: fl |= O_TRUNC; break;
++    case 1: fl |= GEX_FILE_CREATE | GEX_FILE_EXCLUSIVE; break;
++    case 2: fl |= GEX_FILE_CREATE | GEX_FILE_TRUNCATE; break;
++    case 4: fl |= GEX_FILE_CREATE; break;
++    case 5: fl |= GEX_FILE_TRUNCATE; break;
+     default: break;
+     }
+-    struct stat st;
+-    if (exists && stat(path, &st) == 0 && S_ISDIR(st.st_mode) && !(A32(5) & 0x02000000u)) {
++    gex_file_info st;
++    if (exists && gex_path_stat(path, &st) == 0 && st.directory && !(A32(5) & 0x02000000u)) {
+         hle_set_last_error(ERROR_ACCESS_DENIED);    /* a directory, without FILE_FLAG_BACKUP_SEMANTICS */
+         RET(INVALID_HANDLE, 7);
+     }
+-    int fd = open(path, fl | O_CLOEXEC, 0644);
++    int fd = gex_file_open(path, fl);
+     if (hle_filetrace())
+-        fprintf(stderr, "[file] CreateFileA \"%s\" -> %s %s\n", name, path, fd >= 0 ? "ok" : strerror(errno));
+-    if (fd < 0) { hle_set_last_error(errno_to_win(errno)); RET(INVALID_HANDLE, 7); }
+-    if ((fl & O_CREAT) && !exists) hle_path_changed();
++        fprintf(stderr, "[file] CreateFileA \"%s\" -> %s %s\n", name, path, fd >= 0 ? "ok" : gex_fs_error_text());
++    if (fd < 0) { hle_set_last_error(errno_to_win(gex_fs_error())); RET(INVALID_HANDLE, 7); }
++    if ((fl & GEX_FILE_CREATE) && !exists) hle_path_changed();
+     hle_set_last_error(exists && (disp == 2 || disp == 4) ? ERROR_ALREADY_EXISTS : 0);
+     RET(new_file(fd), 7);
+ }
+@@ -155,8 +143,8 @@ static void k_ReadFile(void) {                           /* (h,buf,n,&read,ovl)
+     if (pr) *pr = 0;
+     if (fd < 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 5); }
+     while (got < n) {
+-        ssize_t r = read(fd, buf + got, n - got);
+-        if (r < 0 && errno == EINTR) continue;
++        int64_t r = gex_file_read(fd, buf + got, n - got);
++        if (r < 0 && gex_fs_error() == GEX_IO_INTERRUPTED) continue;
+         if (r <= 0) break;
+         got += (uint32_t)r;
+     }
+@@ -170,8 +158,8 @@ static void k_WriteFile(void) {                          /* (h,buf,n,&written,ov
+     if (pw) *pw = 0;
+     if (fd < 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 5); }
+     while (put < n) {
+-        ssize_t r = write(fd, buf + put, n - put);
+-        if (r < 0 && errno == EINTR) continue;
++        int64_t r = gex_file_write(fd, buf + put, n - put);
++        if (r < 0 && gex_fs_error() == GEX_IO_INTERRUPTED) continue;
+         if (r <= 0) break;
+         put += (uint32_t)r;
+     }
+@@ -183,7 +171,7 @@ static void k_SetFilePointer(void) {                     /* (h,dist,&distHigh,me
+     int64_t dist = (int32_t)A32(1);
+     uint32_t *hi = (uint32_t *)APTR(2), method = A32(3);
+     if (hi) dist = (int64_t)(((uint64_t)*hi << 32) | A32(1));
+-    off_t r = fd >= 0 ? lseek(fd, (off_t)dist, method == 1 ? SEEK_CUR : method == 2 ? SEEK_END : SEEK_SET) : -1;
++    int64_t r = fd >= 0 ? gex_file_seek(fd, (int64_t)dist, method == 1 ? SEEK_CUR : method == 2 ? SEEK_END : SEEK_SET) : -1;
+     if (r < 0) { hle_set_last_error(fd < 0 ? ERROR_INVALID_HANDLE : 131u /* NEGATIVE_SEEK */); RET(INVALID_HANDLE, 4); }
+     if (hi) *hi = (uint32_t)((uint64_t)r >> 32);
+     hle_set_last_error(0);
+@@ -191,18 +179,18 @@ static void k_SetFilePointer(void) {                     /* (h,dist,&distHigh,me
+ }
+ static void k_SetEndOfFile(void) {
+     int fd = fd_of(A32(0));
+-    off_t pos = fd >= 0 ? lseek(fd, 0, SEEK_CUR) : -1;
+-    RET(pos >= 0 && ftruncate(fd, pos) == 0 ? 1u : 0u, 1);
++    int64_t pos = fd >= 0 ? gex_file_seek(fd, 0, SEEK_CUR) : -1;
++    RET(pos >= 0 && gex_file_truncate(fd, pos) == 0 ? 1u : 0u, 1);
+ }
+ static void k_FlushFileBuffers(void) { int fd = fd_of(A32(0)); RET(fd >= 0 ? 1u : 0u, 1); }
+ static void k_GetFileSize(void) {                        /* (h,&high) -> low */
+     int fd = fd_of(A32(0));
+     uint32_t *hi = (uint32_t *)APTR(1);
+-    struct stat st;
+-    if (fd < 0 || fstat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(INVALID_HANDLE, 2); }
+-    if (hi) *hi = (uint32_t)((uint64_t)st.st_size >> 32);
++    gex_file_info st;
++    if (fd < 0 || gex_file_stat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(INVALID_HANDLE, 2); }
++    if (hi) *hi = (uint32_t)((uint64_t)st.size >> 32);
+     hle_set_last_error(0);
+-    RET((uint32_t)st.st_size, 2);
++    RET((uint32_t)st.size, 2);
+ }
+ /* CloseHandle: any kernel object (its type's closer runs); pseudo-handles and
+  * the std handles are not objects and close successfully. */
+@@ -214,13 +202,13 @@ static void k_CloseHandle(void) {
+ }
+ static void k_GetFileType(void) {
+     uint32_t h = A32(0);
+-    if (h >= 0x11u && h <= 0x13u) RET(isatty(fd_of(h)) ? 2u : 1u, 1);   /* CHAR / DISK */
++    if (h >= 0x11u && h <= 0x13u) RET(gex_file_is_terminal(fd_of(h)) ? 2u : 1u, 1);   /* CHAR / DISK */
+     RET(hle_handle_obj(h, HLE_H_FILE) ? 1u : 0u, 1);
+ }
+ 
+ /* ---- FILETIME (100 ns since 1601) and SYSTEMTIME ---- */
+ #define EPOCH_DIFF 11644473600ull
+-static uint64_t unix_to_ft(time_t s, long ns) { return ((uint64_t)s + EPOCH_DIFF) * 10000000ull + (uint64_t)ns / 100u; }
++static uint64_t unix_to_ft(int64_t s, long ns) { return ((uint64_t)s + EPOCH_DIFF) * 10000000ull + (uint64_t)ns / 100u; }
+ static void put_ft(uint32_t at, uint64_t ft) { if (at) MEM32(at) = (uint32_t)ft, MEM32(at + 4) = (uint32_t)(ft >> 32); }
+ static uint64_t get_ft(uint32_t at) { return at ? (uint64_t)MEM32(at) | (uint64_t)MEM32(at + 4) << 32 : 0; }
+ 
+@@ -232,28 +220,28 @@ static void put_systemtime(uint32_t st, const struct tm *t, int ms) {
+ }
+ 
+ static void k_GetSystemTime(void) {
+-    struct timespec ts; struct tm t;
+-    clock_gettime(CLOCK_REALTIME, &ts);
+-    gmtime_r(&ts.tv_sec, &t);
+-    put_systemtime(A32(0), &t, (int)(ts.tv_nsec / 1000000));
++    int64_t seconds; long nanoseconds; struct tm t;
++    gex_runtime_realtime(&seconds, &nanoseconds);
++    gex_runtime_calendar(seconds, 0, &t);
++    put_systemtime(A32(0), &t, (int)(nanoseconds / 1000000));
+     RETV(1);
+ }
+ static void k_GetLocalTime(void) {
+-    struct timespec ts; struct tm t;
+-    clock_gettime(CLOCK_REALTIME, &ts);
+-    localtime_r(&ts.tv_sec, &t);
+-    put_systemtime(A32(0), &t, (int)(ts.tv_nsec / 1000000));
++    int64_t seconds; long nanoseconds; struct tm t;
++    gex_runtime_realtime(&seconds, &nanoseconds);
++    gex_runtime_calendar(seconds, 1, &t);
++    put_systemtime(A32(0), &t, (int)(nanoseconds / 1000000));
+     RETV(1);
+ }
+ static void k_GetSystemTimeAsFileTime(void) {
+-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+-    put_ft(A32(0), unix_to_ft(ts.tv_sec, ts.tv_nsec));
++    int64_t seconds; long nanoseconds; gex_runtime_realtime(&seconds, &nanoseconds);
++    put_ft(A32(0), unix_to_ft(seconds, nanoseconds));
+     RETV(1);
+ }
+ static void k_FileTimeToSystemTime(void) {               /* (&ft, &st) */
+     uint64_t ft = get_ft(A32(0));
+-    time_t s = (time_t)(ft / 10000000ull - EPOCH_DIFF);
+-    struct tm t; gmtime_r(&s, &t);
++    int64_t s = (int64_t)(ft / 10000000ull) - (int64_t)EPOCH_DIFF;
++    struct tm t; gex_runtime_calendar(s, 0, &t);
+     put_systemtime(A32(1), &t, (int)(ft % 10000000ull / 10000u));
+     RET(1, 2);
+ }
+@@ -262,13 +250,12 @@ static void k_SystemTimeToFileTime(void) {               /* (&st, &ft) */
+     struct tm t = { 0 };
+     t.tm_year = w[0] - 1900, t.tm_mon = w[1] - 1, t.tm_mday = w[3];
+     t.tm_hour = w[4], t.tm_min = w[5], t.tm_sec = w[6];
+-    time_t s = timegm(&t);
++    int64_t s = gex_runtime_utc_seconds(&t);
+     put_ft(A32(1), unix_to_ft(s, (long)w[7] * 1000000L));
+     RET(1, 2);
+ }
+ static int32_t tz_bias_s(void) {                         /* local - UTC, seconds */
+-    time_t now = time(NULL); struct tm t; localtime_r(&now, &t);
+-    return (int32_t)t.tm_gmtoff;
++    return gex_runtime_timezone_bias();
+ }
+ static void k_FileTimeToLocalFileTime(void) { put_ft(A32(1), get_ft(A32(0)) + (int64_t)tz_bias_s() * 10000000); RET(1, 2); }
+ static void k_LocalFileTimeToFileTime(void) { put_ft(A32(1), get_ft(A32(0)) - (int64_t)tz_bias_s() * 10000000); RET(1, 2); }
+@@ -281,13 +268,13 @@ static void k_DosDateTimeToFileTime(void) {              /* (date, time, &ft) */
+     struct tm t = { 0 };
+     t.tm_year = (int)(d >> 9) + 80, t.tm_mon = (int)((d >> 5) & 15) - 1, t.tm_mday = (int)(d & 31);
+     t.tm_hour = (int)(tm_ >> 11), t.tm_min = (int)((tm_ >> 5) & 63), t.tm_sec = (int)(tm_ & 31) * 2;
+-    put_ft(A32(2), unix_to_ft(timegm(&t), 0));
++    put_ft(A32(2), unix_to_ft(gex_runtime_utc_seconds(&t), 0));
+     RET(1, 3);
+ }
+ static void k_FileTimeToDosDateTime(void) {              /* (&ft, &date, &time) */
+     uint64_t ft = get_ft(A32(0));
+-    time_t s = (time_t)(ft / 10000000ull - EPOCH_DIFF);
+-    struct tm t; gmtime_r(&s, &t);
++    int64_t s = (int64_t)(ft / 10000000ull) - (int64_t)EPOCH_DIFF;
++    struct tm t; gex_runtime_calendar(s, 0, &t);
+     if (A32(1)) MEM16(A32(1)) = (uint16_t)(((t.tm_year - 80) << 9) | ((t.tm_mon + 1) << 5) | t.tm_mday);
+     if (A32(2)) MEM16(A32(2)) = (uint16_t)((t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec / 2));
+     RET(1, 3);
+@@ -300,51 +287,52 @@ static void k_GetTimeZoneInformation(void) {             /* (&TIME_ZONE_INFORMAT
+ 
+ static void k_GetFileTime(void) {                        /* (h, &create, &access, &write) */
+     int fd = fd_of(A32(0));
+-    struct stat st;
+-    if (fd < 0 || fstat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 4); }
+-    put_ft(A32(1), unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
+-    put_ft(A32(2), unix_to_ft(st.st_atim.tv_sec, st.st_atim.tv_nsec));
+-    put_ft(A32(3), unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
++    gex_file_info st;
++    if (fd < 0 || gex_file_stat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 4); }
++    put_ft(A32(1), unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
++    put_ft(A32(2), unix_to_ft(st.accessed.seconds, st.accessed.nanoseconds));
++    put_ft(A32(3), unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
+     RET(1, 4);
+ }
+ static void k_SetFileTime(void) {                        /* (h, &create, &access, &write) */
+     int fd = fd_of(A32(0));
+-    struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
++    gex_file_time ts[2] = { { 0, -1 }, { 0, -1 } };
+     for (int i = 0; i < 2; i++) {
+         uint32_t at = A32(2 + i);
+         if (!at) continue;
+         uint64_t ft = get_ft(at);
+-        ts[i].tv_sec = (time_t)(ft / 10000000ull - EPOCH_DIFF), ts[i].tv_nsec = (long)(ft % 10000000ull) * 100;
++        ts[i].seconds = (int64_t)(ft / 10000000ull) - (int64_t)EPOCH_DIFF;
++        ts[i].nanoseconds = (long)(ft % 10000000ull) * 100;
+     }
+-    RET(fd >= 0 && futimens(fd, ts) == 0 ? 1u : 0u, 4);
++    RET(fd >= 0 && gex_file_set_times(fd, ts) == 0 ? 1u : 0u, 4);
+ }
+ 
+-static uint32_t attrs_of(const struct stat *st) {
+-    uint32_t a = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+-    if (!(st->st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
++static uint32_t attrs_of(const gex_file_info *st) {
++    uint32_t a = st->directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
++    if (!st->writable) a |= FILE_ATTRIBUTE_READONLY;
+     return a;
+ }
+ static void k_GetFileInformationByHandle(void) {         /* (h, &BY_HANDLE_FILE_INFORMATION) 52 bytes */
+     int fd = fd_of(A32(0));
+     uint32_t o = A32(1);
+-    struct stat st;
+-    if (fd < 0 || fstat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 2); }
++    gex_file_info st;
++    if (fd < 0 || gex_file_stat(fd, &st) != 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 2); }
+     memset(hle_ptr(o), 0, 52);
+     MEM32(o) = attrs_of(&st);
+-    put_ft(o + 4, unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
+-    put_ft(o + 12, unix_to_ft(st.st_atim.tv_sec, st.st_atim.tv_nsec));
+-    put_ft(o + 20, unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
+-    MEM32(o + 28) = (uint32_t)st.st_dev;
+-    MEM32(o + 32) = (uint32_t)((uint64_t)st.st_size >> 32), MEM32(o + 36) = (uint32_t)st.st_size;
+-    MEM32(o + 40) = (uint32_t)st.st_nlink;
+-    MEM32(o + 44) = (uint32_t)((uint64_t)st.st_ino >> 32), MEM32(o + 48) = (uint32_t)st.st_ino;
++    put_ft(o + 4, unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
++    put_ft(o + 12, unix_to_ft(st.accessed.seconds, st.accessed.nanoseconds));
++    put_ft(o + 20, unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
++    MEM32(o + 28) = (uint32_t)st.device;
++    MEM32(o + 32) = (uint32_t)((uint64_t)st.size >> 32), MEM32(o + 36) = (uint32_t)st.size;
++    MEM32(o + 40) = (uint32_t)st.links;
++    MEM32(o + 44) = (uint32_t)((uint64_t)st.inode >> 32), MEM32(o + 48) = (uint32_t)st.inode;
+     RET(1, 2);
+ }
+ 
+ static void k_GetFileAttributesA(void) {
+     char path[1024];
+-    struct stat st;
+-    if (!hle_host_path(ASTR(0), path, sizeof path) || stat(path, &st) != 0) {
++    gex_file_info st;
++    if (!hle_host_path(ASTR(0), path, sizeof path) || gex_path_stat(path, &st) != 0) {
+         hle_set_last_error(ERROR_FILE_NOT_FOUND);
+         RET(0xFFFFFFFFu, 1);
+     }
+@@ -354,20 +342,20 @@ static void k_SetFileAttributesA(void) { char path[1024]; RET(hle_host_path(ASTR
+ static void k_CreateDirectoryA(void) {
+     char path[1024];
+     hle_host_path_for_write(ASTR(0), path, sizeof path, 0);
+-    if (mkdir(path, 0755) == 0) { hle_path_changed(); RET(1, 2); }
+-    hle_set_last_error(errno == EEXIST ? ERROR_ALREADY_EXISTS : errno_to_win(errno));
++    if (gex_directory_create(path) == 0) { hle_path_changed(); RET(1, 2); }
++    hle_set_last_error(gex_fs_error() == GEX_IO_EXISTS ? ERROR_ALREADY_EXISTS : errno_to_win(gex_fs_error()));
+     RET(0, 2);
+ }
+ static void k_RemoveDirectoryA(void) {
+     char path[1024];
+     hle_host_path(ASTR(0), path, sizeof path);
+-    if (rmdir(path) == 0) { hle_path_changed(); RET(1, 1); }
+-    hle_set_last_error(errno_to_win(errno));
++    if (gex_directory_remove(path) == 0) { hle_path_changed(); RET(1, 1); }
++    hle_set_last_error(errno_to_win(gex_fs_error()));
+     RET(0, 1);
+ }
+ static void k_DeleteFileA(void) {
+     char path[1024];
+-    if (hle_host_path(ASTR(0), path, sizeof path) && unlink(path) == 0) { hle_path_changed(); RET(1, 1); }
++    if (hle_host_path(ASTR(0), path, sizeof path) && gex_file_remove(path) == 0) { hle_path_changed(); RET(1, 1); }
+     hle_set_last_error(ERROR_FILE_NOT_FOUND);
+     RET(0, 1);
+ }
+@@ -375,8 +363,8 @@ static void k_MoveFileA(void) {
+     char a[1024], b[1024];
+     hle_host_path(ASTR(0), a, sizeof a);
+     hle_host_path(ASTR(1), b, sizeof b);
+-    if (rename(a, b) == 0) { hle_path_changed(); RET(1, 2); }
+-    hle_set_last_error(errno_to_win(errno));
++    if (gex_file_rename(a, b) == 0) { hle_path_changed(); RET(1, 2); }
++    hle_set_last_error(errno_to_win(gex_fs_error()));
+     RET(0, 2);
+ }
+ static void k_CopyFileA(void) {                          /* (src, dst, failIfExists) */
+@@ -386,17 +374,17 @@ static void k_CopyFileA(void) {                          /* (src, dst, failIfExi
+     int dst_exists = hle_host_path(ASTR(1), b, sizeof b);
+     hle_host_path_for_write(ASTR(1), b, sizeof b, 0);
+     if (A32(2) && dst_exists) { hle_set_last_error(ERROR_FILE_EXISTS); RET(0, 3); }
+-    int in = open(a, O_RDONLY | O_CLOEXEC), out = in >= 0 ? open(b, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
++    int in = gex_file_open(a, GEX_FILE_READ), out = in >= 0 ? gex_file_open(b, GEX_FILE_WRITE | GEX_FILE_CREATE | GEX_FILE_TRUNCATE) : -1;
+     if (out >= 0) hle_path_changed();
+     if (in >= 0 && out >= 0) {
+         char buf[65536];
+-        ssize_t r;
++        int64_t r;
+         ok = 1;
+-        while ((r = read(in, buf, sizeof buf)) > 0)
+-            if (write(out, buf, (size_t)r) != r) { ok = 0; break; }
++        while ((r = gex_file_read(in, buf, sizeof buf)) > 0)
++            if (gex_file_write(out, buf, (size_t)r) != r) { ok = 0; break; }
+     }
+-    if (in >= 0) close(in);
+-    if (out >= 0) close(out);
++    if (in >= 0) gex_file_close(in);
++    if (out >= 0) gex_file_close(out);
+     if (!ok) hle_set_last_error(ERROR_FILE_NOT_FOUND);
+     RET((uint32_t)ok, 3);
+ }
+@@ -409,7 +397,7 @@ static void k_CopyFileA(void) {                          /* (src, dst, failIfExi
+  * name winning. */
+ typedef struct { char name[260]; int base; } found_t;
+ typedef struct {
+-    DIR *d, *base;
++    gex_directory *d, *base;
+     char dir[1024], base_dir[1024], mask[260];
+     int dots;
+     found_t *names;
+@@ -417,15 +405,15 @@ typedef struct {
+ } hfind;
+ static void find_closer(void *o) {
+     hfind *f = (hfind *)o;
+-    if (f->d) closedir(f->d);
+-    if (f->base) closedir(f->base);
++    if (f->d) gex_directory_close(f->d);
++    if (f->base) gex_directory_close(f->base);
+     free(f->names);
+     free(f);
+ }
+ static int by_name(const void *a, const void *b) {
+     const char *x = ((const found_t *)a)->name, *y = ((const found_t *)b)->name;
+     int dx = !strcmp(x, ".") ? 0 : !strcmp(x, "..") ? 1 : 2, dy = !strcmp(y, ".") ? 0 : !strcmp(y, "..") ? 1 : 2;
+-    return dx != dy ? dx - dy : strcasecmp(x, y);
++    return dx != dy ? dx - dy : gex_string_compare_case(x, y);
+ }
+ 
+ /* Windows wildcard match, without case: * any run, ? one character; "*.*"
+@@ -449,31 +437,31 @@ static int wild(const char *m, const char *s) {
+  * cFileName[260], cAlternateFileName[14]: 320 bytes. */
+ static void fill_find(uint32_t o, const char *dir, const char *name) {
+     char full[1300];
+-    struct stat st;
++    gex_file_info st;
+     snprintf(full, sizeof full, "%s/%s", dir, name);
+     memset(hle_ptr(o), 0, 320);
+-    if (stat(full, &st) == 0) {
++    if (gex_path_stat(full, &st) == 0) {
+         MEM32(o) = attrs_of(&st);
+-        put_ft(o + 4, unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
+-        put_ft(o + 12, unix_to_ft(st.st_atim.tv_sec, st.st_atim.tv_nsec));
+-        put_ft(o + 20, unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
+-        MEM32(o + 28) = (uint32_t)((uint64_t)st.st_size >> 32), MEM32(o + 32) = (uint32_t)st.st_size;
++        put_ft(o + 4, unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
++        put_ft(o + 12, unix_to_ft(st.accessed.seconds, st.accessed.nanoseconds));
++        put_ft(o + 20, unix_to_ft(st.modified.seconds, st.modified.nanoseconds));
++        MEM32(o + 28) = (uint32_t)((uint64_t)st.size >> 32), MEM32(o + 32) = (uint32_t)st.size;
+     }
+     strncpy((char *)hle_ptr(o + 44), name, 259);
+ }
+ 
+ static int listed(const hfind *f, const char *name) {
+     for (int i = 0; i < f->n; i++)
+-        if (!strcasecmp(f->names[i].name, name)) return 1;
++        if (!gex_string_compare_case(f->names[i].name, name)) return 1;
+     return 0;
+ }
+-static void list_dir(hfind *f, DIR *d, int base) {
+-    struct dirent *e;
+-    while (d && (e = readdir(d))) {
+-        int dot = !strcmp(e->d_name, ".") || !strcmp(e->d_name, "..");
+-        if ((dot && (!f->dots || base)) || !wild(f->mask, e->d_name) || (base && listed(f, e->d_name))) continue;
++static void list_dir(hfind *f, gex_directory *d, int base) {
++    const gex_directory_entry *e;
++    while (d && (e = gex_directory_next(d))) {
++        int dot = !strcmp(e->name, ".") || !strcmp(e->name, "..");
++        if ((dot && (!f->dots || base)) || !wild(f->mask, e->name) || (base && listed(f, e->name))) continue;
+         if (f->n % 64 == 0) f->names = (found_t *)realloc(f->names, sizeof *f->names * (size_t)(f->n + 64));
+-        snprintf(f->names[f->n].name, sizeof f->names[0].name, "%s", e->d_name);
++        snprintf(f->names[f->n].name, sizeof f->names[0].name, "%s", e->name);
+         f->names[f->n++].base = base;
+     }
+ }
+@@ -497,7 +485,7 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
+     if (!gdir[0]) snprintf(gdir, sizeof gdir, ".");
+     hle_host_path_base(gdir, f->dir, sizeof f->dir);
+     char overlay_dir[1024];
+-    if (hle_overlay_of(f->dir, overlay_dir, sizeof overlay_dir) == 1 && (f->base = opendir(f->dir))) {
++    if (hle_overlay_of(f->dir, overlay_dir, sizeof overlay_dir) == 1 && (f->base = gex_directory_open(f->dir))) {
+         snprintf(f->base_dir, sizeof f->base_dir, "%s", f->dir);
+         snprintf(f->dir, sizeof f->dir, "%s", overlay_dir);
+     }
+@@ -506,8 +494,8 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
+     /* no wildcard: the one name, found without case */
+     if (!f->dots) {
+         char one[1024];
+-        struct stat st;
+-        if (hle_host_path(pat, one, sizeof one) && stat(one, &st) == 0) {
++        gex_file_info st;
++        if (hle_host_path(pat, one, sizeof one) && gex_path_stat(one, &st) == 0) {
+             char *b = strrchr(one, '/');                 /* the overlay's or the game's, wherever it is */
+             if (b) *b = 0;
+             fill_find(A32(1), b ? (one[0] ? one : "/") : ".", b ? b + 1 : one);
+@@ -519,7 +507,7 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
+         hle_set_last_error(ERROR_FILE_NOT_FOUND);
+         RET(INVALID_HANDLE, 2);
+     }
+-    f->d = opendir(f->dir);
++    f->d = gex_directory_open(f->dir);
+     list_dir(f, f->d, 0);
+     list_dir(f, f->base, 1);
+     if (f->n) qsort(f->names, (size_t)f->n, sizeof *f->names, by_name);
+@@ -565,7 +553,7 @@ static void k_GetDiskFreeSpaceExA(void) {
+             hle_set_last_error(87u); RET(0, 4);
+         }
+     if (!guest) {
+-        if (!getcwd(current, sizeof current)) { hle_set_last_error(errno_to_win(errno)); RET(0, 4); }
++        if (!gex_fs_current_directory(current, sizeof current)) { hle_set_last_error(errno_to_win(gex_fs_error())); RET(0, 4); }
+         hle_guest_path(current, guest_current, sizeof guest_current);
+         if (!guest_current[0] || guest_current[1] != ':') { hle_set_last_error(120u); RET(0, 4); }
+         root[0] = guest_current[0]; root[1] = ':'; root[2] = '\\'; root[3] = 0; guest = root;
+@@ -578,16 +566,16 @@ static void k_GetDiskFreeSpaceExA(void) {
+     if (!hle_host_path_base(guest, host, sizeof host)) {
+         hle_set_last_error(ERROR_PATH_NOT_FOUND); RET(0, 4);
+     }
+-    struct stat st;
+-    if (stat(host, &st) != 0) { hle_set_last_error(errno_to_win(errno)); RET(0, 4); }
+-    if (!S_ISDIR(st.st_mode)) { hle_set_last_error(267u); RET(0, 4); }
+-    struct statvfs info;
+-    if (statvfs(host, &info) != 0) { hle_set_last_error(errno_to_win(errno)); RET(0, 4); }
+-    uint64_t unit = info.f_frsize ? info.f_frsize : info.f_bsize;
++    gex_file_info st;
++    if (gex_path_stat(host, &st) != 0) { hle_set_last_error(errno_to_win(gex_fs_error())); RET(0, 4); }
++    if (!st.directory) { hle_set_last_error(267u); RET(0, 4); }
++    gex_disk_info info;
++    if (gex_fs_disk_info(host, &info) != 0) { hle_set_last_error(errno_to_win(gex_fs_error())); RET(0, 4); }
++    uint64_t unit = info.unit;
+     uint64_t values[3];
+-    if (!unit || !disk_mul_u64(unit, info.f_bavail, &values[0]) ||
+-        !disk_mul_u64(unit, info.f_blocks, &values[1]) ||
+-        !disk_mul_u64(unit, info.f_bfree, &values[2])) {
++    if (!unit || !disk_mul_u64(unit, info.available, &values[0]) ||
++        !disk_mul_u64(unit, info.total, &values[1]) ||
++        !disk_mul_u64(unit, info.free, &values[2])) {
+         hle_set_last_error(534u); RET(0, 4);
+     }
+     for (int i = 0; i < 3; ++i) if (outputs[i]) memcpy(hle_ptr(outputs[i]), &values[i], 8);
+@@ -627,7 +615,7 @@ static int ini_find_section(FILE *f, const char *section) {
+     snprintf(want, sizeof want, "[%s]", section);
+     rewind(f);
+     while (fgets(line, sizeof line, f))
+-        if (line[0] == '[' && !strncasecmp(line, want, strlen(want))) return 1;
++        if (line[0] == '[' && !gex_string_compare_case_n(line, want, strlen(want))) return 1;
+     return 0;
+ }
+ static void k_GetPrivateProfileStringA(void) {           /* (sec,key,def,buf,size,file) */
+@@ -640,7 +628,7 @@ static void k_GetPrivateProfileStringA(void) {           /* (sec,key,def,buf,siz
+         size_t kl = strlen(key);
+         while (fgets(line, sizeof line, f)) {
+             if (line[0] == '[') break;                   /* next section */
+-            if (!strncasecmp(line, key, kl) && line[kl] == '=') {
++            if (!gex_string_compare_case_n(line, key, kl) && line[kl] == '=') {
+                 char *v = line + kl + 1, *nl = strpbrk(v, "\r\n"); if (nl) *nl = 0;
+                 static char out[512]; strncpy(out, v, sizeof out - 1); val = out; break;
+             }
+@@ -659,7 +647,7 @@ static void k_GetPrivateProfileIntA(void) {              /* (sec,key,def,file) *
+         size_t kl = strlen(key);
+         while (fgets(line, sizeof line, f)) {
+             if (line[0] == '[') break;
+-            if (!strncasecmp(line, key, kl) && line[kl] == '=') { strncpy(buf, line + kl + 1, 63); got = 1; break; }
++            if (!gex_string_compare_case_n(line, key, kl) && line[kl] == '=') { strncpy(buf, line + kl + 1, 63); got = 1; break; }
+         }
+     }
+     if (f) fclose(f);
+@@ -681,34 +669,34 @@ static void k_WritePrivateProfileStringA(void) {         /* (sec,key,val,file) *
+ static uint32_t lopen_common(const char *name, int fl, int create) {
+     char path[1024];
+     /* a write goes to a mod's overlay, as CreateFileA's does */
+-    if (create || fl != O_RDONLY) hle_host_path_for_write(name, path, sizeof path, !create);
++    if (create || fl != GEX_FILE_READ) hle_host_path_for_write(name, path, sizeof path, !create);
+     else hle_host_path(name, path, sizeof path);
+-    int fd = open(path, fl | O_CLOEXEC | (create ? (O_CREAT | O_TRUNC) : 0), 0644);
++    int fd = gex_file_open(path, fl | (create ? (GEX_FILE_CREATE | GEX_FILE_TRUNCATE) : 0));
+     if (create && fd >= 0) hle_path_changed();
+-    if (hle_filetrace()) fprintf(stderr, "[file] _lopen \"%s\" -> %s %s\n", name, path, fd >= 0 ? "ok" : strerror(errno));
+-    if (fd < 0) { hle_set_last_error(errno_to_win(errno)); return INVALID_HANDLE; }
++    if (hle_filetrace()) fprintf(stderr, "[file] _lopen \"%s\" -> %s %s\n", name, path, fd >= 0 ? "ok" : gex_fs_error_text());
++    if (fd < 0) { hle_set_last_error(errno_to_win(gex_fs_error())); return INVALID_HANDLE; }
+     return new_file(fd);
+ }
+ static void k__lopen(void) {                             /* (path, mode) OF_READ 0 / OF_WRITE 1 / OF_READWRITE 2 */
+     uint32_t m = A32(1);
+-    RET(lopen_common(ASTR(0), m == 1 ? O_WRONLY : m == 2 ? O_RDWR : O_RDONLY, 0), 2);
++    RET(lopen_common(ASTR(0), m == 1 ? GEX_FILE_WRITE : m == 2 ? (GEX_FILE_READ | GEX_FILE_WRITE) : GEX_FILE_READ, 0), 2);
+ }
+-static void k__lcreat(void) { RET(lopen_common(ASTR(0), O_RDWR, 1), 2); }   /* (path, attr) */
++static void k__lcreat(void) { RET(lopen_common(ASTR(0), (GEX_FILE_READ | GEX_FILE_WRITE), 1), 2); }   /* (path, attr) */
+ static void k__lread(void) {
+     int fd = fd_of(A32(0)); if (fd < 0) RET(INVALID_HANDLE, 3);
+-    ssize_t r = read(fd, APTR(1), A32(2));
++    int64_t r = gex_file_read(fd, APTR(1), A32(2));
+     RET(r < 0 ? INVALID_HANDLE : (uint32_t)r, 3);
+ }
+ static void k__lwrite(void) {
+     int fd = fd_of(A32(0)); if (fd < 0) RET(INVALID_HANDLE, 3);
+-    ssize_t w = write(fd, APTR(1), A32(2));
++    int64_t w = gex_file_write(fd, APTR(1), A32(2));
+     RET(w < 0 ? INVALID_HANDLE : (uint32_t)w, 3);
+ }
+ static void k__lclose(void) { hle_handle_close(A32(0)); RET(0, 1); }
+ static void k__llseek(void) {                            /* (hf, off, origin) */
+     int fd = fd_of(A32(0)); if (fd < 0) RET(INVALID_HANDLE, 3);
+     int o = (int)A32(2);
+-    off_t p = lseek(fd, (int32_t)A32(1), o == 1 ? SEEK_CUR : o == 2 ? SEEK_END : SEEK_SET);
++    int64_t p = gex_file_seek(fd, (int32_t)A32(1), o == 1 ? SEEK_CUR : o == 2 ? SEEK_END : SEEK_SET);
+     RET(p < 0 ? INVALID_HANDLE : (uint32_t)p, 3);
+ }
+ 
+@@ -734,9 +722,9 @@ static void k_OpenFile(void) {
+     if (style & OF_PARSE) RET(0, 3);
+     if (style & OF_DELETE) {
+         hle_host_path(name, path, sizeof path);
+-        RET(unlink(path) == 0 ? 1u : INVALID_HANDLE, 3);
++        RET(gex_file_remove(path) == 0 ? 1u : INVALID_HANDLE, 3);
+     }
+-    h = lopen_common(name, (style & OF_CREATE) ? O_RDWR : m == 1 ? O_WRONLY : m == 2 ? O_RDWR : O_RDONLY,
++    h = lopen_common(name, (style & OF_CREATE) ? (GEX_FILE_READ | GEX_FILE_WRITE) : m == 1 ? GEX_FILE_WRITE : m == 2 ? (GEX_FILE_READ | GEX_FILE_WRITE) : GEX_FILE_READ,
+                      (style & OF_CREATE) != 0);
+     if (h == INVALID_HANDLE) {
+         if (of) { uint16_t e = (uint16_t)hle_get_last_error(); memcpy(of + 2, &e, 2); }
+@@ -754,7 +742,7 @@ static void k_GetFullPathNameA(void) {
+     char abs[1024];
+     if (name && (name[0] == '/' || name[0] == '\\' || (name[0] && name[1] == ':')))
+         snprintf(abs, sizeof abs, "%s", name);
+-    else { char cwd[768]; if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0; snprintf(abs, sizeof abs, "%s/%s", cwd, name ? name : ""); }
++    else { char cwd[768]; if (!gex_fs_current_directory(cwd, sizeof cwd)) cwd[0] = 0; snprintf(abs, sizeof abs, "%s/%s", cwd, name ? name : ""); }
+     char *buf = ASTR(2); uint32_t n = A32(1);
+     if (buf && n) { strncpy(buf, abs, n - 1); buf[n - 1] = 0; }
+     if (A32(3) && buf) {
+@@ -769,8 +757,33 @@ static void k_GetFullPathNameA(void) {
+  * INVALID_HANDLE_VALUE, only a size: anonymous shared memory. MapViewOfFile
+  * mmaps it; a 32-bit host's address is the guest's. The views are
+  * remembered so UnmapViewOfFile knows their length. */
+-typedef struct { int fd; uint64_t size; int writable; } hmapping;
+-static void mapping_closer(void *p) { hmapping *m = (hmapping *)p; if (m->fd >= 0) close(m->fd); free(m); }
++typedef struct { int fd; uint64_t size; int writable, refs; uint8_t *pixels; } hmapping;
++void hle_mapping_release(void *p) {
++    hmapping *m = p;
++    if (--m->refs) return;
++    if (m->fd >= 0) gex_file_close(m->fd);
++    hle_free(m->pixels);
++    free(m);
++}
++static void mapping_closer(void *p) { hle_mapping_release(p); }
++void *hle_mapping_acquire(uint32_t handle, uint32_t offset, uint32_t bytes, uint8_t **pixels) {
++    hmapping *m = hle_handle_obj(handle, HLE_H_MAPPING);
++    if (!m || (offset & 3) || offset > m->size || bytes > m->size - offset) {
++        hle_set_last_error(87);
++        return NULL;
++    }
++    if (m->fd >= 0) {
++        fprintf(stderr, "[gdi] file-backed DIB sections are not implemented\n");
++        hle_set_last_error(50);
++        return NULL;
++    }
++    if (m->size > UINT32_MAX) { hle_set_last_error(8); return NULL; }
++    if (!m->pixels) m->pixels = hle_alloc((uint32_t)m->size);
++    if (!m->pixels) { hle_set_last_error(8); return NULL; }
++    ++m->refs;
++    *pixels = m->pixels + offset;
++    return m;
++}
+ static void k_CreateFileMappingA(void) {                 /* (hFile, sa, protect, sizeHigh, sizeLow, name) */
+     static int closer_set;
+     if (!closer_set) hle_handle_set_closer(HLE_H_MAPPING, mapping_closer), closer_set = 1;
+@@ -779,13 +792,16 @@ static void k_CreateFileMappingA(void) {                 /* (hFile, sa, protect,
+     int fd = -1;
+     if (file != INVALID_HANDLE) {
+         int f = fd_of(file);
+-        struct stat st;
+-        if (f < 0 || fstat(f, &st) != 0) { hle_set_last_error(6); RET(0, 6); }   /* ERROR_INVALID_HANDLE */
+-        if (!size) size = (uint64_t)st.st_size;
+-        fd = dup(f);
++        gex_file_info st;
++        if (f < 0 || gex_file_stat(f, &st) != 0) { hle_set_last_error(6); RET(0, 6); }   /* ERROR_INVALID_HANDLE */
++        if (!size) size = (uint64_t)st.size;
++        fd = gex_file_duplicate(f);
++        if (fd < 0) { hle_set_last_error(errno_to_win(gex_fs_error())); RET(0, 6); }
+     }
+     if (!size) { hle_set_last_error(1006); RET(0, 6); }    /* ERROR_FILE_INVALID: an empty file */
+-    hmapping *m = (hmapping *)malloc(sizeof *m);
++    hmapping *m = (hmapping *)calloc(1, sizeof *m);
++    if (!m) { if (fd >= 0) gex_file_close(fd); hle_set_last_error(8); RET(0, 6); }
++    m->refs = 1;
+     m->fd = fd, m->size = size, m->writable = (protect & 0x0C) != 0;   /* PAGE_READWRITE | PAGE_WRITECOPY */
+     uint32_t h = hle_handle_alloc(HLE_H_MAPPING, m);
+     if (!h) { mapping_closer(m); RET(0, 6); }
+@@ -799,26 +815,18 @@ static void k_MapViewOfFile(void) {                      /* (hMap, access, offHi
+     uint64_t off = (uint64_t)A32(2) << 32 | A32(3);
+     if (!m || off >= m->size) { hle_set_last_error(6); RET(0, 5); }
+     uint64_t len = A32(4) ? A32(4) : m->size - off;
++    if (!len || len > UINT32_MAX || len > m->size - off) {
++        hle_set_last_error(87); RET(0, 5);
++    }
+     int copy = A32(1) == 1;                                /* FILE_MAP_COPY */
+-    int prot = PROT_READ | (m->writable || copy ? PROT_WRITE : 0);
++
+     /* the view lives in guest memory: reserve it there, then put the file over
+      * it (a pagefile mapping is the reservation's own zeroed pages) */
+     uint32_t va = hle_vm_reserve(0, (uint32_t)len);
+     if (!va) { hle_set_last_error(8); RET(0, 5); }       /* ERROR_NOT_ENOUGH_MEMORY */
+-#ifdef __EMSCRIPTEN__
+-    /* no mmap of a file at an address: the view is a copy (writes to it do
+-     * not reach the file) */
+-    (void)prot;
+-    for (size_t done = 0; m->fd >= 0 && done < len;) {
+-        ssize_t r = pread(m->fd, (uint8_t *)hle_ptr(va) + done, len - done, (off_t)(off + done));
+-        if (r <= 0) break;
+-        done += (size_t)r;
+-    }
+-#else
+-    if (m->fd >= 0 && mmap(hle_ptr(va), len, prot, MAP_FIXED | (copy ? MAP_PRIVATE : MAP_SHARED), m->fd, (off_t)off) == MAP_FAILED) {
++    if (m->fd >= 0 && gex_vm_map_file(hle_ptr(va), (size_t)len, m->fd, off, m->writable || copy, copy)) {
+         hle_vm_release(va, (uint32_t)len); hle_set_last_error(8); RET(0, 5);
+     }
+-#endif
+     for (int i = 0; i < MAX_VIEWS; i++) if (!g_views[i].addr) { g_views[i].addr = va, g_views[i].len = (uint32_t)len; break; }
+     RET(va, 5);
+ }
+diff --git a/runtime/win32hle/lz32.c b/runtime/win32hle/lz32.c
+index 80b40f3..773110b 100644
+--- a/runtime/win32hle/lz32.c
++++ b/runtime/win32hle/lz32.c
+@@ -13,7 +13,6 @@
+  * set bit is a literal byte, a clear one a 12-bit window offset and a 4-bit
+  * length less 3. lz32_selftest.c checks the decoder.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+diff --git a/runtime/win32hle/module.c b/runtime/win32hle/module.c
+index 8baf43e..f76f8c5 100644
+--- a/runtime/win32hle/module.c
++++ b/runtime/win32hle/module.c
+@@ -11,14 +11,13 @@
+  *   - a system DLL (kernel32, ddraw, ...), which has no image: its handle is a
+  *     pseudo-module whose GetProcAddress answers from the shim registry.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+-#include <unistd.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
++#include "platform/filesystem.h"
+ #include "pe_loader.h"
+ 
+ #define ERROR_MOD_NOT_FOUND       126u
+@@ -284,7 +283,7 @@ static void k_LoadStringA(void) { RET((uint32_t)hle_load_string(A32(0), A32(1),
+ /* ---- the current directory, as the guest sees it ---- */
+ static void k_GetCurrentDirectoryA(void) {               /* (size, buf) */
+     char cwd[1024], g[1024];
+-    if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
++    if (!gex_fs_current_directory(cwd, sizeof cwd)) cwd[0] = 0;
+     hle_guest_path(cwd, g, sizeof g);
+     uint32_t n = (uint32_t)strlen(g), size = A32(0);
+     char *buf = ASTR(1);
+@@ -294,7 +293,7 @@ static void k_GetCurrentDirectoryA(void) {               /* (size, buf) */
+ }
+ static void k_SetCurrentDirectoryA(void) {
+     char host[1024];
+-    if (hle_host_path(ASTR(0), host, sizeof host) && chdir(host) == 0) RET(1, 1);
++    if (hle_host_path(ASTR(0), host, sizeof host) && gex_fs_enter_directory(host) == 0) RET(1, 1);
+     hle_set_last_error(3u);                               /* ERROR_PATH_NOT_FOUND */
+     RET(0, 1);
+ }
+diff --git a/runtime/win32hle/ole32.c b/runtime/win32hle/ole32.c
+index 93849bb..e810845 100644
+--- a/runtime/win32hle/ole32.c
++++ b/runtime/win32hle/ole32.c
+@@ -12,13 +12,13 @@
+  * Structured storage, OLE embedding and type libraries are not here: they
+  * fail with E_NOTIMPL.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ #define S_OK                 0u
+ #define E_NOTIMPL            0x80004001u
+@@ -146,8 +146,8 @@ static void o_CoRevokeClassObject(void) {
+ }
+ static void o_CoDisconnectObject(void)    { RET(S_OK, 2); }
+ static void o_CoFileTimeNow(void) {
+-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+-    uint64_t ft = ((uint64_t)ts.tv_sec + 11644473600ull) * 10000000ull + (uint64_t)ts.tv_nsec / 100u;
++    int64_t seconds; long nanoseconds; gex_runtime_realtime(&seconds, &nanoseconds);
++    uint64_t ft = ((uint64_t)seconds + 11644473600ull) * 10000000ull + (uint64_t)nanoseconds / 100u;
+     if (A32(0)) MEM32(A32(0)) = (uint32_t)ft, MEM32(A32(0) + 4) = (uint32_t)(ft >> 32);
+     RET(S_OK, 1);
+ }
+diff --git a/runtime/win32hle/pe_loader.c b/runtime/win32hle/pe_loader.c
+index e94ab18..e5099b8 100644
+--- a/runtime/win32hle/pe_loader.c
++++ b/runtime/win32hle/pe_loader.c
+@@ -2,32 +2,41 @@
+  * pe_loader.c - see pe_loader.h. Maps a 32-bit PE into guest memory and binds its IAT
+  * to resolver-provided addresses. No windows.h: that is the point.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <fcntl.h>
+-#include <unistd.h>
+-#include <sys/stat.h>
+ #include "pe_format.h"
+ #include "pe_loader.h"
+ #include "win32hle.h"
++#include "platform/runtime.h"
++#include "platform/filesystem.h"
+ 
+ #define PAGE 0x1000u
+ static uint32_t round_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
+ 
+ /* Read a whole file into a malloc'd buffer; *len gets the size. NULL on error. */
+ static uint8_t *slurp(const char *path, size_t *len) {
+-    int fd = open(path, O_RDONLY);
+-    if (fd < 0) return NULL;
+-    struct stat st;
+-    if (fstat(fd, &st) < 0) { close(fd); return NULL; }
+-    uint8_t *buf = (uint8_t *)malloc((size_t)st.st_size);
+-    ssize_t n = buf ? read(fd, buf, (size_t)st.st_size) : -1;
+-    close(fd);
+-    if (n != (ssize_t)st.st_size) { free(buf); return NULL; }
+-    *len = (size_t)st.st_size;
++    int file = gex_file_open(path, GEX_FILE_READ);
++    if (file < 0) return NULL;
++    int64_t length = gex_file_seek(file, 0, SEEK_END);
++    if (length < 0 || (uint64_t)length > SIZE_MAX || gex_file_seek(file, 0, SEEK_SET) != 0) {
++        gex_file_close(file);
++        return NULL;
++    }
++    size_t size = (size_t)length;
++    uint8_t *buf = (uint8_t *)malloc(size ? size : 1);
++    int failed = !buf;
++    size_t done = 0;
++    while (!failed && done < size) {
++        int64_t count = gex_file_read(file, buf + done, size - done);
++        if (count < 0 && gex_fs_error() == GEX_IO_INTERRUPTED) continue;
++        if (count <= 0) { failed = 1; break; }
++        done += (size_t)count;
++    }
++    if (gex_file_close(file)) failed = 1;
++    if (failed) { free(buf); return NULL; }
++    *len = size;
+     return buf;
+ }
+ 
+@@ -128,7 +137,7 @@ int recomp_pe_bind(const pe_image *img, uint32_t (*resolve)(const char *name)) {
+                 size_t k = 0;
+                 for (; dll[k] && k < 80; k++) nm[k] = (char)(dll[k] >= 'A' && dll[k] <= 'Z' ? dll[k] + 32 : dll[k]);
+                 snprintf(nm + k, sizeof nm - k, "#%u", *ilt & 0xFFFFu);
+-                char *name = strdup(nm);
++                char *name = gex_string_duplicate(nm);
+                 va = resolve(name);
+                 if (!va) fprintf(stderr, "[pe] unresolved import %s\n", name);
+             } else {
+diff --git a/runtime/win32hle/screen.c b/runtime/win32hle/screen.c
+index 87981d6..a1115d8 100644
+--- a/runtime/win32hle/screen.c
++++ b/runtime/win32hle/screen.c
+@@ -46,6 +46,35 @@ static uint32_t g_last_present;
+ static int g_headless, g_fullscreen;
+ static SDL_Rect g_dst;                                   /* where the picture is in the window */
+ static pthread_t g_video_thread;                         /* SDL's video calls stay on the thread that opened it */
++#ifdef GEX_NO_DIRECTDRAW
++static int g_initial_window_sized;
++static void initial_window_size(int w, int h) {
++    if (!g_win || g_initial_window_sized) return;
++    g_initial_window_sized = 1;
++    int width, height;
++    SDL_GetWindowSize(g_win, &width, &height);
++    if ((int64_t)width * h > (int64_t)height * w)
++        width = (int)((int64_t)height * w / h);
++    else
++        height = (int)((int64_t)width * h / w);
++    if (width < 1) width = 1;
++    if (height < 1) height = 1;
++    if (!g_fullscreen) {
++        SDL_SetWindowSize(g_win, width, height);
++        SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++    }
++}
++#endif
++static void screen_mode(int *w, int *h, int *bpp) {
++#ifdef GEX_NO_DIRECTDRAW
++    const uint8_t *pixels;
++    int pitch;
++    if (!hle_gdi_window_frame(&pixels, w, h, &pitch, bpp, NULL))
++        *w = 320, *h = 240, *bpp = 16;
++#else
++    hle_dd_mode(w, h, bpp);
++#endif
++}
+ static SDL_Texture *g_pre, *g_small;                     /* sharp's integer prescale; the bars' blur */
+ static int g_pre_w, g_pre_h;
+ 
+@@ -174,7 +203,7 @@ static uint32_t scan_of(SDL_Scancode s) {
+ static int g_src_w, g_src_h;                            /* the picture last shown: what the window maps to */
+ static void to_game(int x, int y, int *gx, int *gy) {
+     int w = g_src_w, h = g_src_h, bpp, pw, ph, ww, wh;
+-    if (w <= 0 || h <= 0) hle_dd_mode(&w, &h, &bpp);
++    if (w <= 0 || h <= 0) screen_mode(&w, &h, &bpp);
+     if (g_ren && g_win) {                                /* HiDPI: the renderer counts pixels, events points */
+         SDL_GetRendererOutputSize(g_ren, &pw, &ph);
+         SDL_GetWindowSize(g_win, &ww, &wh);
+@@ -202,12 +231,18 @@ static void web_menu(int open) {
+ }
+ #endif
+ static void present(void) {
++    if (g_ren && !pthread_equal(pthread_self(), g_video_thread)) return;
+     const uint8_t *px;
+     const uint32_t *pal;
+     int w, h, pitch, bpp;
+     unsigned seq;
+     pal = NULL;
++#ifdef GEX_NO_DIRECTDRAW
++    if (!hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
++    initial_window_size(w, h);
++#else
+     if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
++#endif
+     uint32_t now = hle_ticks_ms();
+     g_src_w = w, g_src_h = h;
+     if (seq == g_shown_seq && now - g_last_present < 250) return;
+@@ -273,10 +308,12 @@ static void present(void) {
+     if (!g_tex || g_tex_w != tw || g_tex_h != th || g_tex_fmt != fmt) {
+         if (g_tex) SDL_DestroyTexture(g_tex);
+         g_tex = SDL_CreateTexture(g_ren, (Uint32)fmt, SDL_TEXTUREACCESS_STREAMING, tw, th);
++        if (!g_tex) hle_fatal("SDL framebuffer texture: %s", SDL_GetError());
+         g_tex_w = tw, g_tex_h = th, g_tex_fmt = fmt;
+     }
+     if (hd) {
+-        SDL_UpdateTexture(g_tex, NULL, g_hd, tw * 4);
++        if (SDL_UpdateTexture(g_tex, NULL, g_hd, tw * 4))
++            hle_fatal("SDL framebuffer upload: %s", SDL_GetError());
+     } else if (bpp == 8) {
+         if (g_conv_n < (size_t)w * h) { free(g_conv); g_conv_n = (size_t)w * h; g_conv = (uint32_t *)malloc(g_conv_n * 4); }
+         for (int y = 0; y < h; y++)
+@@ -284,9 +321,11 @@ static void present(void) {
+                 uint32_t e = pal ? pal[px[(size_t)y * pitch + x]] : 0;   /* PALETTEENTRY r, g, b */
+                 g_conv[(size_t)y * w + x] = 0xFF000000u | (e & 0xFF) << 16 | (e & 0xFF00) | (e >> 16 & 0xFF);
+             }
+-        SDL_UpdateTexture(g_tex, NULL, g_conv, w * 4);
++        if (SDL_UpdateTexture(g_tex, NULL, g_conv, w * 4))
++            hle_fatal("SDL framebuffer upload: %s", SDL_GetError());
+     } else {
+-        SDL_UpdateTexture(g_tex, NULL, px, pitch);
++        if (SDL_UpdateTexture(g_tex, NULL, px, pitch))
++            hle_fatal("SDL framebuffer upload: %s", SDL_GetError());
+     }
+     int ww, wh;
+     SDL_GetRendererOutputSize(g_ren, &ww, &wh);
+@@ -299,7 +338,7 @@ static void present(void) {
+     }
+     g_dst.x = (ww - g_dst.w) / 2, g_dst.y = (wh - g_dst.h) / 2;
+     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
+-    SDL_RenderClear(g_ren);
++    if (SDL_RenderClear(g_ren)) hle_fatal("SDL framebuffer clear: %s", SDL_GetError());
+     if (g_bars && (g_dst.w < ww || g_dst.h < wh)) {     /* the bars: the picture, tiny then stretched, dark */
+         if (!g_small) g_small = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_TARGET, 24, 15);
+         if (g_small) {
+@@ -327,10 +366,12 @@ static void present(void) {
+         SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
+         SDL_SetRenderTarget(g_ren, NULL);
+         SDL_SetTextureScaleMode(g_pre, SDL_ScaleModeLinear);
+-        SDL_RenderCopy(g_ren, g_pre, NULL, &g_dst);
++        if (SDL_RenderCopy(g_ren, g_pre, NULL, &g_dst))
++            hle_fatal("SDL framebuffer presentation: %s", SDL_GetError());
+     } else {
+         SDL_SetTextureScaleMode(g_tex, g_mode == 1 ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+-        SDL_RenderCopy(g_ren, g_tex, NULL, &g_dst);
++        if (SDL_RenderCopy(g_ren, g_tex, NULL, &g_dst))
++            hle_fatal("SDL framebuffer presentation: %s", SDL_GetError());
+     }
+     if (ov) {                                            /* the Nx HD overlay (ov = N), over the scaled 1x picture */
+         int ow = ov * w, oh = ov * h;
+@@ -672,6 +713,7 @@ void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)
+ #endif
+ int g_input_trace;                                         /* a host's --inputtrace */
+ void hle_screen_pump(void) {
++    if (g_ren && !pthread_equal(pthread_self(), g_video_thread)) return;
+ #ifdef __EMSCRIPTEN__
+     /* the browser's main thread queues this thread's input callbacks */
+     emscripten_current_thread_process_queued_calls();
+@@ -743,7 +785,7 @@ void hle_screen_pump(void) {
+ /* The guest moved the cursor (SetCursorPos): move the real one with it. */
+ static void warp(int x, int y) {
+     int w, h, bpp;
+-    hle_dd_mode(&w, &h, &bpp);
++    screen_mode(&w, &h, &bpp);
+     if (!g_win || g_dst.w <= 0 || w <= 0 || h <= 0) return;
+     SDL_WarpMouseInWindow(g_win, g_dst.x + x * g_dst.w / w, g_dst.y + y * g_dst.h / h);
+ }
+@@ -762,6 +804,9 @@ static void primary_changed(void) {
+ }
+ 
+ int hle_screen_open(const char *title, int fullscreen, int headless) {
++#ifdef GEX_NO_DIRECTDRAW
++    g_initial_window_sized = 0;
++#endif
+     g_headless = headless, g_fullscreen = fullscreen;
+     hle_set_pump_hook(hle_screen_pump);
+     hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
+@@ -789,7 +834,35 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
+     SDL_RendererInfo ri;
+     SDL_GetRendererInfo(g_ren, &ri);
+     g_video_thread = pthread_self();
++#ifndef GEX_NO_DIRECTDRAW
+     hle_dd_primary_hook = primary_changed;
++#endif
+     fprintf(stderr, "[screen] %s, renderer %s, scaling %s (F12), fullscreen F11\n", SDL_GetCurrentVideoDriver(), ri.name, k_modes[g_mode]);
+     return 0;
+ }
++
++void hle_screen_close(void) {
++    if (g_ren && !pthread_equal(pthread_self(), g_video_thread))
++        hle_fatal("SDL screen shutdown on a non-owner thread");
++    hle_gdi_window_hook = NULL;
++    hle_cursor_hook = NULL;
++    hle_set_pump_hook(NULL);
++    SDL_DestroyTexture(g_tex); g_tex = NULL;
++    SDL_DestroyTexture(g_pre); g_pre = NULL;
++    SDL_DestroyTexture(g_small); g_small = NULL;
++    SDL_DestroyTexture(g_ov_tex); g_ov_tex = NULL;
++    SDL_DestroyRenderer(g_ren); g_ren = NULL;
++    SDL_DestroyWindow(g_win); g_win = NULL;
++    free(g_conv); g_conv = NULL; g_conv_n = 0;
++    free(g_hd); g_hd = NULL; g_hd_n = 0;
++    free(g_ov); g_ov = NULL; g_ov_n = 0;
++#ifndef __EMSCRIPTEN__
++    if (g_menu_font) TTF_CloseFont(g_menu_font);
++    g_menu_font = NULL;
++#endif
++    g_shown_seq = ~0u;
++    g_last_present = 0;
++    g_src_w = g_src_h = 0;
++    g_menu_depth = 0;
++    if (!g_headless) SDL_QuitSubSystem(SDL_INIT_VIDEO);
++}
+diff --git a/runtime/win32hle/storage.c b/runtime/win32hle/storage.c
+index cad1bf1..b5f5298 100644
+--- a/runtime/win32hle/storage.c
++++ b/runtime/win32hle/storage.c
+@@ -8,13 +8,13 @@
+  * (MS-CFB version 3: 512-byte sectors, small streams in the mini stream), so
+  * a game's save written here loads on Windows and the other way round.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ #define S_OK              0u
+ #define S_FALSE           1u
+@@ -48,7 +48,7 @@ typedef struct node {
+     int refs;                            /* objects open on it */
+ } node_t;
+ 
+-typedef struct { node_t *root; char path[1024]; int writable, dirty, refs; } file_t;
++typedef struct { node_t *root; char path[1024]; int writable, dirty, refs; } storage_file_t;
+ 
+ static int wlen(const uint16_t *w) { int n = 0; while (w && w[n]) n++; return n; }
+ static int wcmp_upper(const uint16_t *a, const uint16_t *b) {   /* the CFB order: length, then upper case */
+@@ -331,11 +331,11 @@ static int write_cfb(const char *path, node_t *root) {
+ 
+ /* ---- the objects ---- */
+ static uint32_t g_vt_stg, g_vt_stm;
+-typedef struct { file_t *file; node_t *node; uint32_t pos; } obj_t;   /* at +8 of the COM object */
++typedef struct { storage_file_t *file; node_t *node; uint32_t pos; } obj_t;   /* at +8 of the COM object */
+ #define OBJ(self) ((obj_t *)hle_ptr(MEM32((self) + 8)))   /* in guest memory (hle_alloc): the VA fits */
+ 
+ static void vtables(void);
+-static uint32_t new_obj(uint32_t vt, file_t *f, node_t *n) {
++static uint32_t new_obj(uint32_t vt, storage_file_t *f, node_t *n) {
+     obj_t *o = (obj_t *)hle_alloc(sizeof *o);
+     o->file = f, o->node = n;
+     f->refs++, n->refs++;
+@@ -343,7 +343,7 @@ static uint32_t new_obj(uint32_t vt, file_t *f, node_t *n) {
+     MEM32(c + 8) = hle_va(o);
+     return c;
+ }
+-static void commit(file_t *f) {
++static void commit(storage_file_t *f) {
+     if (f->writable && f->dirty) {
+         if (!write_cfb(f->path, f->root)) fprintf(stderr, "[storage] cannot write %s\n", f->path);
+         f->dirty = 0;
+@@ -554,7 +554,7 @@ static void s_StgCreateDocfile(void) {                   /* (name, mode, reserve
+     FILE *t = fopen(path, "rb");
+     if (t && !(A32(1) & STGM_CREATE)) { fclose(t); RET(STG_E_FILEALREADYEXISTS, 4); }
+     if (t) fclose(t);
+-    file_t *f = (file_t *)calloc(1, sizeof *f);
++    storage_file_t *f = (storage_file_t *)calloc(1, sizeof *f);
+     snprintf(f->path, sizeof f->path, "%s", path);
+     f->root = (node_t *)calloc(1, sizeof(node_t));
+     f->root->type = 5, f->writable = 1, f->dirty = 1;
+@@ -579,7 +579,7 @@ static void s_StgOpenStorage(void) {                     /* (name, priority, mod
+     int ok = got == (size_t)n && read_cfb(b, (size_t)n, &root);
+     free(b);
+     if (!ok) RET(STG_E_INVALIDHEADER, 6);
+-    file_t *f = (file_t *)calloc(1, sizeof *f);
++    storage_file_t *f = (storage_file_t *)calloc(1, sizeof *f);
+     snprintf(f->path, sizeof f->path, "%s", path);
+     f->root = root, f->writable = (A32(2) & 3u) != 0;
+     MEM32(A32(5)) = new_obj(g_vt_stg, f, root);
+diff --git a/runtime/win32hle/user32.c b/runtime/win32hle/user32.c
+index 83caa92..2810744 100644
+--- a/runtime/win32hle/user32.c
++++ b/runtime/win32hle/user32.c
+@@ -20,15 +20,13 @@
+  * with the focus, and keep the key and cursor state GetKeyState and
+  * GetCursorPos answer.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <strings.h>
+ #include <stdarg.h>
+-#include <unistd.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ /* ---- messages ---- */
+ #define WM_CREATE          0x0001u
+@@ -125,7 +123,10 @@ static struct { char name[64]; uint32_t proc, style, extra, hinst, cursor; int k
+ static int g_ncls;
+ 
+ /* ---- windows ---- */
+-#define MAX_WIN 2048
++#ifndef HLE_MAX_WINDOWS
++#define HLE_MAX_WINDOWS 2048
++#endif
++#define MAX_WIN HLE_MAX_WINDOWS
+ typedef struct {
+     int used, cls, kind, destroying;
+     uint32_t hwnd, proc, parent, owner, style, exstyle, id, user, hinst, font, menu;
+@@ -151,6 +152,7 @@ static uint32_t g_focus, g_capture, g_active;
+ static int g_screen_w = 640, g_screen_h = 480;
+ static int g_cursor_x, g_cursor_y, g_cursor_shown = 0;
+ static uint8_t g_keys[256];                      /* bit 7: down, bit 0: toggled */
++static uint8_t g_pressed[256];                   /* pressed since GetAsyncKeyState */
+ static void (*g_pump)(void);
+ 
+ void hle_set_pump_hook(void (*fn)(void)) { g_pump = fn; }
+@@ -219,7 +221,7 @@ uint32_t hle_send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+     while (g_sent[i].state != 2) {
+         deliver_sent();                                  /* sends to this thread meanwhile, as Windows does */
+         hle_block_begin();
+-        usleep(200);
++        gex_runtime_sleep_us(200);
+         hle_block_end();
+     }
+     uint32_t r = g_sent[i].result;
+@@ -310,7 +312,7 @@ static int find_class(const char *name) {
+         if (b) return find_class(b);
+         return a >= 0xC000u && a - 0xC000u < (uint32_t)g_ncls ? (int)(a - 0xC000u) : -1;
+     }
+-    for (int i = 0; i < g_ncls; i++) if (!strcasecmp(g_cls[i].name, name)) return i;
++    for (int i = 0; i < g_ncls; i++) if (!gex_string_compare_case(g_cls[i].name, name)) return i;
+     return -1;
+ }
+ static int add_class(const char *name, uint32_t proc, uint32_t style, uint32_t extra, uint32_t hinst, int kind) {
+@@ -555,7 +557,9 @@ static void put_msg(uint32_t lp, const msg_t *m) {
+     MEM32(lp + 16) = m->time, MEM32(lp + 20) = (uint32_t)m->x, MEM32(lp + 24) = (uint32_t)m->y;
+ }
+ static void pump(void) {
++#ifndef GEX_NO_NETWORK
+     hle_ws_poll();
++#endif
+     if (g_pump) g_pump();
+ }
+ /* An empty queue with nothing to pump it is the end of a headless loop (the
+@@ -567,7 +571,7 @@ static int wait_message(msg_t *m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
+         pump();
+         if (next_message(m, hwnd, lo, hi, 1)) return 1;
+         hle_block_begin();
+-        usleep(1000);
++        gex_runtime_sleep_us(1000);
+         hle_block_end();
+     }
+ }
+@@ -593,7 +597,7 @@ static void u_WaitMessage(void) {
+     while (!next_message(&m, 0, 0, 0, 0)) {
+         if (!g_pump) break;
+         pump();
+-        hle_block_begin(); usleep(1000); hle_block_end();
++        hle_block_begin(); gex_runtime_sleep_us(1000); hle_block_end();
+     }
+     RET(1, 0);
+ }
+@@ -618,7 +622,7 @@ static void u_MsgWaitForMultipleObjects(void) {
+         msg_t m;
+         if (next_message(&m, 0, 0, 0, 0)) RET(n, 5);
+         if (timeout != 0xFFFFFFFFu && hle_ticks_ms() - start >= timeout) RET(0x102u, 5);
+-        hle_block_begin(); usleep(1000); hle_block_end();
++        hle_block_begin(); gex_runtime_sleep_us(1000); hle_block_end();
+     }
+ }
+ static void u_PostQuitMessage(void) { g_quit = 1, g_quit_code = A32(0); RETV(1); }
+@@ -712,7 +716,10 @@ void hle_input_mouse(uint32_t message, int sx, int sy) {
+     uint32_t vk = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ? 1 : message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ? 2
+                 : message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ? 4 : 0;
+     int down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
+-    if (vk) g_keys[vk] = down ? (uint8_t)(0x80 | ((g_keys[vk] & 1) ^ 1)) : (uint8_t)(g_keys[vk] & 1);
++    if (vk) {
++        if (down && !(g_keys[vk] & 0x80)) g_pressed[vk] = 1;
++        g_keys[vk] = down ? (uint8_t)(0x80 | ((g_keys[vk] & 1) ^ 1)) : (uint8_t)(g_keys[vk] & 1);
++    }
+     int cx, cy;
+     uint32_t t;
+     if (g_capture && W(g_capture)) {
+@@ -727,18 +734,30 @@ void hle_input_mouse(uint32_t message, int sx, int sy) {
+ }
+ void hle_input_key(int down, uint32_t vk, uint32_t scan) {
+     vk &= 0xFF;
++    if (down && !(g_keys[vk] & 0x80)) g_pressed[vk] = 1;
+     if (down) g_keys[vk] = (uint8_t)(0x80 | ((g_keys[vk] & 1) ^ !(g_keys[vk] & 0x80)));
+     else g_keys[vk] &= 1;
+-    if (vk == 0xA0 || vk == 0xA1) { if (down) g_keys[VK_SHIFT] |= 0x80; else g_keys[VK_SHIFT] &= 1; }
+-    if (vk == 0xA2 || vk == 0xA3) { if (down) g_keys[VK_CONTROL] |= 0x80; else g_keys[VK_CONTROL] &= 1; }
+-    if (vk == 0xA4 || vk == 0xA5) { if (down) g_keys[VK_MENU] |= 0x80; else g_keys[VK_MENU] &= 1; }
++    uint32_t modifier = vk == 0xA0 || vk == 0xA1 ? VK_SHIFT :
++                        vk == 0xA2 || vk == 0xA3 ? VK_CONTROL :
++                        vk == 0xA4 || vk == 0xA5 ? VK_MENU : 0;
++    if (modifier) {
++        if (down && !(g_keys[modifier] & 0x80)) g_pressed[modifier] = 1;
++        uint32_t left = modifier == VK_SHIFT ? 0xA0 : modifier == VK_CONTROL ? 0xA2 : 0xA4;
++        g_keys[modifier] = (uint8_t)((g_keys[modifier] & 1) |
++                                   ((g_keys[left] | g_keys[left + 1]) & 0x80));
++    }
+     uint32_t t = hle_focus_window();
+     int alt = (g_keys[VK_MENU] & 0x80) != 0;
+     uint32_t l = 1u | (scan & 0xFFu) << 16 | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
+     if (t) q_push(t, alt || vk == VK_MENU || vk == 0x79 ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP) : (down ? WM_KEYDOWN : WM_KEYUP), vk, l);
+ }
+ void hle_input_cursor(int sx, int sy) { g_cursor_x = sx, g_cursor_y = sy; }
+-void hle_input_key_state(uint32_t vk, int down) { if (down) g_keys[vk & 0xFF] |= 0x80; else g_keys[vk & 0xFF] &= 1; }
++void hle_input_key_state(uint32_t vk, int down) {
++    vk &= 0xFF;
++    if (down && !(g_keys[vk] & 0x80)) g_pressed[vk] = 1;
++    if (down) g_keys[vk] |= 0x80;
++    else g_keys[vk] &= 1;
++}
+ 
+ /* ---- DefWindowProc ---- */
+ static uint32_t def_proc(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+@@ -960,10 +979,10 @@ static int item_add(win_t *x, int at, const char *s, uint32_t data, int sorted)
+         x->citems = x->citems ? x->citems * 2 : 16;
+         x->items = (struct item *)realloc(x->items, sizeof *x->items * (size_t)x->citems);
+     }
+-    if (sorted && s) { at = 0; while (at < x->nitems && strcasecmp(x->items[at].text ? x->items[at].text : "", s) <= 0) at++; }
++    if (sorted && s) { at = 0; while (at < x->nitems && gex_string_compare_case(x->items[at].text ? x->items[at].text : "", s) <= 0) at++; }
+     if (at < 0 || at > x->nitems) at = x->nitems;
+     memmove(x->items + at + 1, x->items + at, sizeof *x->items * (size_t)(x->nitems - at));
+-    x->items[at].text = strdup(s ? s : "");
++    x->items[at].text = gex_string_duplicate(s ? s : "");
+     x->items[at].data = data;
+     x->nitems++;
+     if (x->cursel >= at) x->cursel++;
+@@ -983,7 +1002,7 @@ static int item_find(win_t *x, int after, const char *s, int exact) {
+     for (int k = 0; k < x->nitems; k++) {
+         int i = (after + 1 + k) % (x->nitems ? x->nitems : 1);
+         const char *t = x->items[i].text ? x->items[i].text : "";
+-        if (exact ? !strcasecmp(t, s) : !strncasecmp(t, s, n)) return i;
++        if (exact ? !gex_string_compare_case(t, s) : !gex_string_compare_case_n(t, s, n)) return i;
+     }
+     return -1;
+ }
+@@ -1886,8 +1905,12 @@ static void u_GetKeyState(void) {
+     RET((k & 0x80 ? 0xFF80u : 0u) | (k & 1u), 1);
+ }
+ static void u_GetAsyncKeyState(void) {
+-    if ((A32(0) & 0xFF) == 1) hle_lbutton_reads++;
+-    RET(g_keys[A32(0) & 0xFF] & 0x80 ? 0x8000u : 0u, 1);
++    uint32_t vk = A32(0);
++    if (vk > 255) RET(0, 1);
++    if (vk == 1) hle_lbutton_reads++;
++    uint32_t state = (g_keys[vk] & 0x80 ? 0x8000u : 0u) | g_pressed[vk];
++    g_pressed[vk] = 0;
++    RET(state, 1);
+ }
+ static void u_GetKeyboardState(void) { memcpy(APTR(0), g_keys, 256); RET(1, 1); }
+ static void u_GetCursorPos(void) { if (A32(0)) MEM32(A32(0)) = (uint32_t)g_cursor_x, MEM32(A32(0) + 4) = (uint32_t)g_cursor_y; RET(1, 1); }
+@@ -2126,7 +2149,10 @@ static void u_LoadAcceleratorsA(void){ RET(0x1C000005u, 2); }  /* nonzero: games
+ #define MF_END        0x0080u
+ typedef struct { uint32_t id, flags, sub; char text[64]; } mitem;
+ typedef struct { int used, n; mitem it[128]; } menu_t;
+-#define MAX_MENU 256
++#ifndef HLE_MAX_MENUS
++#define HLE_MAX_MENUS 256
++#endif
++#define MAX_MENU HLE_MAX_MENUS
+ static menu_t g_menu[MAX_MENU];
+ #define MENU_BASE 0x4D450000u                            /* 'ME' */
+ static menu_t *MENU(uint32_t h) { uint32_t i = h - MENU_BASE; return h >= MENU_BASE && i < MAX_MENU && g_menu[i].used ? &g_menu[i] : NULL; }
+diff --git a/runtime/win32hle/win32hle.h b/runtime/win32hle/win32hle.h
+index 190ded0..ad5ed65 100644
+--- a/runtime/win32hle/win32hle.h
++++ b/runtime/win32hle/win32hle.h
+@@ -286,6 +286,7 @@ extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software
+  * when its pixels or palette may have. */
+ int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
+ void hle_dd_mode(int *w, int *h, int *bpp);
++void hle_dd_primary_touched(void);                   /* host wrote directly into primary pixels */
+ extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
+ int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
+ void hle_dsound_set_master(float gain);              /* 0 mutes */
+@@ -294,16 +295,22 @@ void hle_dsound_register_com(void);                  /* CoCreateInstance(CLSID_D
+  * s16 pushed at its own rate. */
+ int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */
+ void hle_audio_stream_push(int id, const int16_t *pcm, int frames);
++int  hle_audio_stream_write(int id, const int16_t *pcm, int frames); /* returns frames accepted; retry the rest */
+ int  hle_audio_stream_queued(int id);                 /* frames pushed and not yet played */
+ void hle_audio_stream_gain(int id, float gain);
++void hle_audio_stream_pause(int id, int paused);     /* preserve the queued samples and cursor */
+ void hle_audio_stream_close(int id);
+ int  hle_file_fd(uint32_t handle);                    /* a file HANDLE's descriptor, or -1 */
++/* Retained anonymous mapping storage for shared DIB sections. */
++void *hle_mapping_acquire(uint32_t handle, uint32_t offset, uint32_t bytes, uint8_t **pixels);
++void hle_mapping_release(void *mapping);
+ extern const win32hle_shim win32hle_mss[];            /* Miles: file helpers, an MP3 ASI codec on ffmpeg (mss.c) */
+ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
+ /* The SDL2 display and input for a DirectDraw game (screen.c): installs
+  * itself as the pump hook. headless: no window (a script drives input). */
+ int  hle_screen_open(const char *title, int fullscreen, int headless);
+ void hle_screen_pump(void);
++void hle_screen_close(void);
+ extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
+ void hle_screen_title(const char *title);
+ extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
+@@ -346,7 +353,8 @@ extern const win32hle_shim win32hle_advapi32[];       /* the registry; COMCTL32,
+  * to a file on every write. Roots are the HKEY_ values (HKLM 0x80000002). */
+ void hle_reg_set_string(uint32_t root, const char *path, const char *name, const char *value);
+ void hle_reg_set_dword(uint32_t root, const char *path, const char *name, uint32_t value);
+-void hle_reg_load(const char *file);
++int  hle_reg_load(const char *file);                 /* nonzero on read/parse failure */
++uint32_t hle_reg_flush(void);                       /* Win32 error; atomic file replacement */
+ 
+ /* ---- COM objects served by the host (ole32.c) ----
+  * A vtable is built from a shim table (each method a stdcall shim whose arg 0
+diff --git a/runtime/win32hle/winmm.c b/runtime/win32hle/winmm.c
+index 817c448..dc34978 100644
+--- a/runtime/win32hle/winmm.c
++++ b/runtime/win32hle/winmm.c
+@@ -6,15 +6,13 @@
+  * keeps cycling without a real sound card); no joystick; MCI stubbed. Real SDL
+  * audio can replace the waveOut path later without touching callers.
+  */
+-#define _GNU_SOURCE
+ #include <stdint.h>
+-#include <time.h>
+-#include <unistd.h>
+-#include <pthread.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include "win32hle.h"
++#include "platform/runtime.h"
+ 
+ #define MMSYSERR_NOERROR  0u
+ #define MMSYSERR_ERROR    1u
+@@ -24,8 +22,7 @@
+ 
+ /* --- multimedia timer --- */
+ static void m_timeGetTime(void) {
+-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+-    RET((uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u), 0);
++    RET((uint32_t)(gex_runtime_time_us() / 1000u), 0);
+ }
+ static void m_timeBeginPeriod(void) { RET(MMSYSERR_NOERROR, 1); }
+ static void m_timeGetDevCaps(void) {           /* (&TIMECAPS, size) */
+@@ -41,18 +38,20 @@ static void m_timeGetDevCaps(void) {           /* (&TIMECAPS, size) */
+  * waits): a game frees what its callback uses right after the kill
+  * (Tiberian Sun's movie audio, its bring-up log 8). */
+ #define MAX_MMTIMERS 32
+-static struct { volatile int used, killed, inflight; uint32_t id, delay, proc, user, flags; pthread_t thread; } g_mmt[MAX_MMTIMERS];
++static struct { atomic_int used, killed, inflight; uint32_t id, delay, proc, user, flags; } g_mmt[MAX_MMTIMERS];
++static _Thread_local int g_mmt_current = -1;
+ static uint32_t g_mmt_next = 1;
+-volatile unsigned hle_mmt_fired, hle_mmt_started;      /* a host's diagnostics */
++atomic_uint hle_mmt_fired, hle_mmt_started;      /* a host's diagnostics */
+ static void *mmtimer(void *arg) {
+-    __sync_fetch_and_add(&hle_mmt_started, 1);
++    atomic_fetch_add(&hle_mmt_started, 1);
+     int i = (int)(intptr_t)arg;
++    g_mmt_current = i;
+     uint32_t due = hle_ticks_ms() + g_mmt[i].delay;
+     for (;;) {
+         int32_t wait = (int32_t)(due - hle_ticks_ms());
+-        if (wait > 0) usleep((useconds_t)wait * 1000u);
++        if (wait > 0) gex_runtime_sleep_us((uint64_t)wait * 1000u);
+         if (g_mmt[i].killed) break;
+-        __sync_fetch_and_add(&g_mmt[i].inflight, 1);
++        atomic_fetch_add(&g_mmt[i].inflight, 1);
+         if (!g_mmt[i].killed) {
+             if (g_mmt[i].flags & 0x30u) {                /* TIME_CALLBACK_EVENT_SET / _PULSE: proc is an event */
+                 uint32_t h = g_mmt[i].proc;
+@@ -62,10 +61,10 @@ static void *mmtimer(void *arg) {
+             } else {
+                 uint32_t a[5] = { g_mmt[i].id, 0, g_mmt[i].user, 0, 0 };
+                 hle_call_guest(g_mmt[i].proc, 5, a);
+-                __sync_fetch_and_add(&hle_mmt_fired, 1);
++                atomic_fetch_add(&hle_mmt_fired, 1);
+             }
+         }
+-        __sync_fetch_and_sub(&g_mmt[i].inflight, 1);
++        atomic_fetch_sub(&g_mmt[i].inflight, 1);
+         if (!(g_mmt[i].flags & 1u)) break;               /* TIME_ONESHOT */
+         due += g_mmt[i].delay ? g_mmt[i].delay : 1;
+         if ((int32_t)(hle_ticks_ms() - due) > 1000) due = hle_ticks_ms();   /* fell far behind: no catch-up storm */
+@@ -78,8 +77,7 @@ static void m_timeSetEvent(void) {             /* (delay, resolution, proc, user
+         if (!g_mmt[i].used) {
+             g_mmt[i].used = 1, g_mmt[i].killed = 0, g_mmt[i].inflight = 0;
+             g_mmt[i].id = g_mmt_next++, g_mmt[i].delay = A32(0), g_mmt[i].proc = A32(2), g_mmt[i].user = A32(3), g_mmt[i].flags = A32(4);
+-            if (pthread_create(&g_mmt[i].thread, NULL, mmtimer, (void *)(intptr_t)i) != 0) { g_mmt[i].used = 0; RET(0, 5); }
+-            pthread_detach(g_mmt[i].thread);
++            if (gex_runtime_start_thread(mmtimer, (void *)(intptr_t)i) != 0) { g_mmt[i].used = 0; RET(0, 5); }
+             RET(g_mmt[i].id, 5);
+         }
+     RET(0, 5);
+@@ -88,8 +86,8 @@ static void m_timeKillEvent(void) {
+     for (int i = 0; i < MAX_MMTIMERS; i++)
+         if (g_mmt[i].used && g_mmt[i].id == A32(0) && !g_mmt[i].killed) {
+             g_mmt[i].killed = 1;
+-            if (!pthread_equal(g_mmt[i].thread, pthread_self()))
+-                while (g_mmt[i].inflight) { hle_block_begin(); usleep(200); hle_block_end(); }
++            if (g_mmt_current != i)
++                while (g_mmt[i].inflight) { hle_block_begin(); gex_runtime_sleep_us(200); hle_block_end(); }
+             RET(MMSYSERR_NOERROR, 1);
+         }
+     RET(97u /* MMSYSERR_INVALPARAM */, 1);

@@ -1,0 +1,17 @@
+{
+  "binary_sha256": "e1fd63ecb09fca29d63286e22447752dcb120d7e682f8759d1021776f7698b86",
+  "pcrecomp_commit": "12dd9642cd3675024161bfc567b5b42ada0134d2",
+  "functions": 1988,
+  "unsupported_instruction_traps": 12,
+  "entry_va": "0x00449BD0",
+  "image_base": "0x00400000",
+  "graphics_replacements": {
+    "00401000": "gex_graphics_format",
+    "004010A0": "gex_graphics_create",
+    "004010E0": "gex_graphics_destroy",
+    "00401100": "gex_graphics_resolution",
+    "00406C30": "gex_graphics_flush",
+    "00406FBA": "gex_graphics_forbidden",
+    "00409876": "gex_graphics_forbidden"
+  }
+}

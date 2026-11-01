@@ -5,16 +5,19 @@
 ## What is this?
 
 A work-in-progress AI-led static recompilation of the [Windows release of Gex (1995) from GOG](https://www.gog.com/en/game/gex) for Linux, Windows and Dreamcast, using [pcrecomp](https://github.com/sp00nznet/pcrecomp) by sp00nznet and a version of the [Claude Code skill](https://github.com/DohmBoy64Bit/pcrecomp-skill) by DohmBoy64Bit adapted for GitHub Copilot. Huge thanks to the creators of those repositories.
-(Usage of the Dreamcast version is not recommended due to underwhelming performance.)
 
-## Why GOG? Can I use the physical release?
+## Usage
+
+Place the release binary beside the Gex installation folder and launch it.
+
+## Why GOG? Can I use another version?
 
 The GOG version was chosen due to accessibility. The physical PC release is untested; if you have it, I would greatly appreciate it if you could test it and report whether it works.
 The 5th-gen console or Gex Trilogy releases are unsupported.
 
 ## Should I actually use this?
 
-Not for now, as there's a substantial amount of work left to make this a worthwhile version of the game.
+Not right now, as there's a substantial amount of work left to make this a worthwhile version of the game.
 
 ## AI-led?
 
@@ -52,8 +55,8 @@ Run - Right shoulder button
 - In-game settings
 - Remapping
 - Texture pack support
-- Saving (unknown if the original 3DO system can be restored)
-- macOS, Android, UWP (Xbox One/Series) and PSP support (contact if you're able and willing to test on PSP or Xbox One)
+- Proper saving (exact original 3DO behaviour is infeasible, though)
+- macOS, Android, UWP (Xbox One/Series) and PSP support (feel free to contact if you're able to test on PSP or Xbox One)
 
 ## Contributing
 

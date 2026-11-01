@@ -10,6 +10,22 @@ A work-in-progress AI-led static recompilation of the [Windows release of Gex (1
 
 Place the release binary beside the Gex installation folder and launch it.
 
+### Launch options
+
+| Option | Description |
+|--------|-------------|
+| `--help` | Self-explanatory. |
+| `--data PATH` | Specify the game installation folder. Defaults to `Gex` in the current working directory. |
+| `--render-size WIDTHxHEIGHT` | Set the gameplay resolution. `427x240` provides widescreen; higher resolutions are not recommended. |
+| `--skip-movies` | Skip the FMVs on startup. |
+| `--renderer NAME` | Select `software`, `opengl`, `pvr` or `opengl12`, if included in the build. `pvr` is Dreamcast-specific; `opengl12` is the experimental fixed-function OpenGL/GLdc renderer. |
+| `--hardware-renderer` | Forces the relevant GPU renderer. |
+| `--check` | Validate the original executable and initialise the recompilation without starting the game. |
+| `--trace` | Enable Win32 compatibility-call tracing for debugging. |
+
+Windows native32 launcher supports only `--help`,
+`--data` and `--render-size`.
+
 ## Why GOG? Can I use another version?
 
 The GOG version was chosen due to accessibility. The physical PC release is untested; if you have it, I would greatly appreciate it if you could test it and report whether it works.

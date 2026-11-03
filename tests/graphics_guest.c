@@ -18,6 +18,12 @@ static unsigned rgb565(unsigned pixel) {
 
 static void viewport(uint32_t atlas, int width, int height) {
     CHECK(!gex_renderer_resize(width, height));
+    int mx = width / 2, my = height / 2;
+    CHECK(gex_graphics_screen_point(&mx, &my));
+    CHECK(mx == 160 && my == 120);
+    mx = width - 1; my = height - 1;
+    CHECK(gex_graphics_screen_point(&mx, &my));
+    CHECK(mx == (width - 1) * 320 / width && my == (height - 1) * 240 / height);
     memset(hle_ptr(atlas), 0xFF, 0x100000);
     for (unsigned y = 8; y < 232; ++y)
         for (unsigned x = 0; x < 320; ++x)
@@ -736,6 +742,14 @@ static void hud_packets(uint32_t atlas, int results, int hardware) {
         int scale = height / 224;
         if (scale > width / 320) scale = width / 320;
         CHECK(!gex_graphics_set_render_size(width, height));
+        gex_render_rect menu = gex_renderer_fit(width, height, 320, 224);
+        int mx = menu.x, my = menu.y;
+        CHECK(gex_graphics_screen_point(&mx, &my));
+        CHECK(mx == 0 && my == 0);
+        mx = menu.x + menu.width; my = menu.y;
+        CHECK(!gex_graphics_screen_point(&mx, &my));
+        mx = menu.x; my = menu.y + menu.height;
+        CHECK(!gex_graphics_screen_point(&mx, &my));
         gex_graphics_packet_arena();
         uint32_t packet = MEM32(0x4A2AE0);
         prepare_sprite(atlas, packet, 16, 11);
@@ -1353,14 +1367,102 @@ static void hardware_coherence(uint32_t atlas, uint32_t packet) {
     CHECK(g_ebx == 0x12345678 && g_ebp == 0x23456789);
     CHECK(g_esi == 0x3456789A && g_edi == 0x456789AB);
     gex_graphics_end_frame();
+
+    /* A level-name clear must retire exported picture history before new
+     * masked tiles or framebuffer-backed textures trigger synchronization. */
+    gpu_solid(packet, 0, 0, 320, 224, 248);
+    gex_graphics_cpu_access();
+    MEM32(0x4A2958) = 1;
+    MEM32(0x4A2990) = MEM32(0x455B84) = 0x4A2A50;
+    for (int pass = 0; pass < 2; ++pass) {
+        gex_graphics_begin_frame();
+        gpu_solid(packet, 40 + pass * 8, 40, 8, 8, 248u << 16);
+        gex_graphics_cpu_access();
+        CHECK(MEM16(atlas + 0x4000 + 40 * 2048 + (40 + pass * 8) * 2) == 0x7C00);
+        CHECK(MEM16(atlas + 0x4000) == 0);
+        if (pass) CHECK(MEM16(atlas + 0x4000 + 40 * 2048 + 40 * 2) == 0);
+    }
+    MEM32(0x4A2958) = 0;
+    MEM32(0x4A2990) = MEM32(0x455B84) = 0;
     CHECK(!gex_graphics_set_render_size(427, 240));
     gpu_page(packet, 0x90);
     gex_graphics_shutdown();
     gex_renderer_shutdown();
 }
 
+static void screen_fade(void) {
+    const int sizes[][2] = {{3, 2}, {320, 224}, {854, 480}};
+    const unsigned shades[] = {255, 192, 128, 64, 0, 255};
+    for (unsigned size = 0; size < sizeof sizes / sizeof *sizes; ++size) {
+        CHECK(!gex_renderer_resize(sizes[size][0], sizes[size][1]));
+        gex_render_frame frame;
+        CHECK(!gex_renderer_frame(&frame));
+        for (int y = 0; y < frame.height; ++y)
+            for (int x = 0; x < frame.width; ++x) {
+                unsigned value = (x * 199 + y * 1237) & 65535;
+                uint8_t *p = frame.pixels + y * frame.pitch + x * 2;
+                p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8);
+            }
+        gex_graphics_fade_capture();
+        unsigned sequence = frame.sequence;
+        for (unsigned i = 0; i < sizeof shades / sizeof *shades; ++i) {
+            gex_graphics_fade_present(shades[i]);
+            CHECK(!gex_renderer_frame(&frame));
+            CHECK(frame.sequence == ++sequence);
+            for (int y = 0; y < frame.height; ++y)
+                for (int x = 0; x < frame.width; ++x) {
+                    unsigned value = (x * 199 + y * 1237) & 65535;
+                    unsigned expected = ((value >> 11) * shades[i] / 255) << 11 |
+                        (((value >> 5 & 63) * shades[i] / 255) << 5) |
+                        ((value & 31) * shades[i] / 255);
+                    CHECK(frame_pixel(&frame, x, y) == expected);
+                }
+        }
+        gex_graphics_fade_release();
+    }
+}
+
+static void guest_frame_shade(uint32_t atlas) {
+    gex_graphics_shutdown();
+    CHECK(!gex_renderer_resize(427, 240));
+    MEM32(0x451040) = MEM32(0x4A294C) = 0;
+    for (unsigned y = 8; y < 232; ++y)
+        for (unsigned x = 0; x < 320; ++x)
+            MEM16(atlas + y * 2048 + x * 2) = (x * 199 + y * 1237) & 32767;
+    const unsigned shades[] = {255, 128, 0, 64, 255};
+    gex_render_frame frame;
+    CHECK(!gex_renderer_frame(&frame));
+    uint32_t sequence = frame.sequence, stack = g_esp;
+    for (unsigned i = 0; i < sizeof shades / sizeof *shades; ++i) {
+        gex_graphics_frame_shade(shades[i]);
+        gex_graphics_flush();
+        g_esp = stack;
+        CHECK(!gex_renderer_frame(&frame));
+        CHECK(frame.sequence == ++sequence);
+        for (int y = 0; y < frame.height; ++y)
+            for (int x = 0; x < frame.width; ++x) {
+                unsigned sx = x * 320 / frame.width, sy = 8 + y * 224 / frame.height;
+                unsigned value = (sx * 199 + sy * 1237) & 32767;
+                CHECK(MEM16(atlas + sy * 2048 + sx * 2) == value);
+                unsigned expected = rgb565(value);
+                expected = ((expected >> 11) * shades[i] / 255) << 11 |
+                    (((expected >> 5 & 63) * shades[i] / 255) << 5) |
+                    ((expected & 31) * shades[i] / 255);
+                CHECK(frame_pixel(&frame, x, y) == expected);
+            }
+    }
+    gex_graphics_frame_shade(255);
+}
+
 int main(int argc, char **argv) {
     int hardware = argc == 3 && !strcmp(argv[2], "--packet-gpu");
+#if GEX_ENABLE_BGFX_RENDERER
+    int bgfx = argc == 3 && !strcmp(argv[2], "--bgfx");
+    if (bgfx) {
+        if (gex_packet_gpu_select_bgfx()) return 1;
+        hardware = 1;
+    }
+#endif
     if (argc != 2 && !hardware) return 1;
     recomp_host_init();
     if (recomp_host_boot_permissive(argv[1])) return 1;
@@ -1378,6 +1480,9 @@ int main(int argc, char **argv) {
         hud_packets(atlas, 1, 1);
         gex_renderer_shutdown();
         mach_leave();
+#if GEX_ENABLE_BGFX_RENDERER
+        if (bgfx) gex_packet_gpu_shutdown_bgfx();
+#endif
         return failures ? 1 : 0;
     }
     scaled_sprite(atlas, quad, 24, 24);
@@ -1404,6 +1509,8 @@ int main(int argc, char **argv) {
     authored_camera_boundaries();
     camera_motion();
     portal_player_draws();
+    screen_fade();
+    guest_frame_shade(atlas);
     gex_renderer_shutdown();
     mach_leave();
     return failures ? 1 : 0;

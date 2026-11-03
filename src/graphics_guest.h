@@ -9,10 +9,18 @@ int gex_graphics_enable_gpu(void);
 int gex_graphics_gpu_owned(void);
 int gex_graphics_native_operation(uint32_t function);
 void gex_graphics_movie(const uint8_t *pixels, int width, int height, int pitch);
+/* Capture the outgoing frame once; shade is 0 (black) through 255 (unchanged). */
+void gex_graphics_fade_capture(void);
+void gex_graphics_fade_present(unsigned shade);
+void gex_graphics_fade_release(void);
+/* Shade freshly rendered guest frames without changing their source pixels. */
+void gex_graphics_frame_shade(unsigned shade);
 void gex_graphics_cpu_access(void);
 void gex_graphics_atlas_access(uint32_t rectangle);
 int gex_graphics_view_width(void);
 int gex_graphics_view_height(void);
+/* Map a presented authored screen to its 320x240 menu coordinates. */
+int gex_graphics_screen_point(int *x, int *y);
 int gex_graphics_draw_tiles(void);
 void gex_graphics_packet_arena(void);
 void gex_graphics_packet_allocated(uint32_t next);

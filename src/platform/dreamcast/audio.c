@@ -10,6 +10,7 @@
 #include "win32hle.h"
 
 #define WINDOW 32768u
+#define TRANSFER_BYTES 16384u
 struct gex_native_voice {
     struct gex_native_voice *next;
     const uint8_t *pcm;
@@ -61,9 +62,9 @@ static void command(gex_native_voice *v, uint32_t operation) {
     }
     snd_sh4_to_aica_start();
 }
-/* Transfer only sample format/layout: AICA performs all mixing, gain and rate
- * conversion. Four-byte alignment is mandatory for G2 writes. */
-static void upload(gex_native_voice *v, uint32_t at, uint32_t n, uint64_t source) {
+/* AICA performs mixing, gain and rate conversion. G2 copies need four-byte
+ * alignment; store-queue destinations need 32-byte alignment. */
+static void upload_chunk(gex_native_voice *v, uint32_t at, uint32_t n, uint64_t source) {
     uint32_t width = (uint32_t)v->bits / 8;
     uint32_t begin = at * width & ~3u;
     uint32_t end = ((at + n) * width + 3u) & ~3u;
@@ -112,12 +113,28 @@ static void upload(gex_native_voice *v, uint32_t at, uint32_t n, uint64_t source
             }
             frame = 0;
         }
-        spu_memload_sq(v->ram[c] + begin, transfer, end - begin);
+        uint32_t prefix = (32 - ((v->ram[c] + begin) & 31u)) & 31u;
+        if (prefix > end - begin) prefix = end - begin;
+        if (prefix) spu_memload(v->ram[c] + begin, transfer, prefix);
+        if (end - begin > prefix)
+            spu_memload_sq(v->ram[c] + begin + prefix, transfer + prefix,
+                           end - begin - prefix);
+    }
+}
+static void upload(gex_native_voice *v, uint32_t at, uint32_t n, uint64_t source) {
+    uint32_t width = (uint32_t)v->bits / 8;
+    while (n) {
+        uint32_t count = (TRANSFER_BYTES - (at * width & 31u)) / width;
+        if (count > n) count = n;
+        upload_chunk(v, at, count, source);
+        at += count;
+        source += count;
+        n -= count;
     }
 }
 int gex_native_audio_open(void) {
     if (snd_init() < 0) { fprintf(stderr, "[audio] cannot initialize AICA\n"); return 0; }
-    transfer = memalign(32, 65536 * 2 + 32);
+    transfer = memalign(32, TRANSFER_BYTES);
     if (!transfer) { fprintf(stderr, "[audio] cannot allocate AICA transfer buffer\n"); return 0; }
     fprintf(stderr, "[audio] AICA hardware voices, no SH4 sample mixer\n");
     return 1;

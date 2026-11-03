@@ -32,4 +32,10 @@ void gex_host_input_shutdown(void);
 void gex_host_input_key(int down, uint32_t key, uint32_t scan);
 void gex_gamepad_key(enum gex_input_key key, int down);
 
+/* Owner-thread modal UI capture; return nonzero to consume an event.
+ * UINT32_MAX announces a window-close request so a modal loop can unwind. */
+extern int (*gex_input_key_filter)(int down, uint32_t key, uint32_t scan);
+/* Framebuffer coordinates; down is 1/0 for buttons, -1 for motion. */
+extern int (*gex_input_pointer_filter)(int x, int y, int down);
+
 #endif

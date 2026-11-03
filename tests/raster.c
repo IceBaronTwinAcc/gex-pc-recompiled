@@ -303,6 +303,33 @@ static void fitted_pixel_grid(void) {
     }
 }
 
+static void shaded_copy(void) {
+    gex_raster *source = gex_raster_create(320, 224);
+    gex_raster *destination = gex_raster_create(320, 224);
+    CHECK(source && destination);
+    if (source && destination) {
+        for (unsigned i = 0; i < 320 * 224; ++i)
+            set_word(picture + i * 2, (int)(i & 65535));
+        gex_raster_sync(source, picture, 640);
+        const unsigned shades[] = {255, 192, 128, 64, 0, 255};
+        for (unsigned i = 0; i < sizeof shades / sizeof *shades; ++i) {
+            unsigned shade = shades[i];
+            gex_raster_copy_shaded(destination, source, shade);
+            for (unsigned at = 0; at < 320 * 224; ++at) {
+                unsigned value = at & 65535;
+                unsigned expected = (value & 0x8000) | ((value & 31) * shade / 255) |
+                    (((value >> 5 & 31) * shade / 255) << 5) |
+                    (((value >> 10 & 31) * shade / 255) << 10);
+                CHECK(pixel(destination, 320, at % 320, at / 320) == expected);
+                CHECK(pixel(source, 320, at % 320, at / 320) == value);
+            }
+        }
+        memset(picture, 0, sizeof picture);
+    }
+    gex_raster_destroy(destination);
+    gex_raster_destroy(source);
+}
+
 int main(void) {
     for (int factor = 0; factor < 32; ++factor)
         for (int value = 0; value < 32; ++value)
@@ -317,5 +344,6 @@ int main(void) {
     hud_pixel_grid();
     tiled_backdrop();
     fitted_pixel_grid();
+    shaded_copy();
     return failures ? 1 : 0;
 }

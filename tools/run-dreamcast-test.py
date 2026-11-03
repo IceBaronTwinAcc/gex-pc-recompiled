@@ -35,6 +35,7 @@ def main():
               "config:Debug.GDBPort=3263,config:Debug.GDBWaitForConnection=no,"
               f"config:Debug.SerialConsoleEnabled=yes,config:Debug.FastForward={fast_forward},"
               f"rend:vsync={vsync},config:rend.vsync={vsync},config:pvr.rend=4,"
+              "config:aica.Volume=0,"
               f"config:rend.RenderToTextureBuffer={readback}")
     with Path(log).open("wb") as output:
         process = subprocess.Popen([flycast, "-headless", *capture, "-config", config, disc],

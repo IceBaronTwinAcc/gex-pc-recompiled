@@ -5,11 +5,18 @@
 const recomp_dispatch_entry_t recomp_dispatch_table[] = {{0, NULL}};
 const uint32_t recomp_dispatch_count = 0;
 static unsigned recorded;
+static unsigned consumed_keys;
 static int failures;
 
 #define CHECK(expression) do { \
     if (!(expression)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expression); ++failures; } \
 } while (0)
+
+static int consume_key(int scancode, int down) {
+    (void)scancode;
+    if (down) ++consumed_keys;
+    return 1;
+}
 
 static void record(const uint8_t *px, int w, int h, int pitch, int bpp) {
     CHECK(pthread_equal(pthread_self(), g_video_thread));
@@ -28,6 +35,14 @@ static void *worker(void *unused) {
 }
 
 int main(void) {
+#ifdef __ANDROID__
+    SDL_SetMainReady();
+    CHECK(vk_of(SDL_SCANCODE_AC_BACK) == vk_of(SDL_SCANCODE_ESCAPE));
+    CHECK(scan_of(SDL_SCANCODE_AC_BACK) == scan_of(SDL_SCANCODE_ESCAPE));
+#else
+    CHECK(vk_of(SDL_SCANCODE_AC_BACK) == 0);
+    CHECK(scan_of(SDL_SCANCODE_AC_BACK) == 0);
+#endif
     recomp_host_init();
     if (gex_renderer_init(gex_renderer_backend_get(), 1) ||
         gex_renderer_resize(2, 2)) return 1;
@@ -125,12 +140,36 @@ int main(void) {
     if (native) {
         gex_renderer_device_window(native);
         CHECK(g_win == native && !g_ren && g_external_window);
+        hle_screen_key_hook = consume_key;
+        SDL_Event event = {.type = SDL_KEYDOWN};
+        event.key.keysym.scancode = SDL_SCANCODE_RETURN;
+        event.key.keysym.mod = KMOD_ALT;
+        CHECK(SDL_PushEvent(&event) == 1);
+        hle_screen_pump();
+        CHECK(g_fullscreen && consumed_keys == 0);
+        event.key.keysym.mod = KMOD_NONE;
+        CHECK(SDL_PushEvent(&event) == 1);
+        hle_screen_pump();
+        CHECK(g_fullscreen && consumed_keys == 1);
+        event.key.keysym.mod = KMOD_ALT;
+        CHECK(SDL_PushEvent(&event) == 1);
+        hle_screen_pump();
+        CHECK(!g_fullscreen && consumed_keys == 1);
+        hle_screen_key_hook = NULL;
+        SDL_SetWindowSize(native, 600, 600);
         int x, y;
         to_game(300, 300, &x, &y);
         CHECK(x == 160 && y == 120 && g_dst.y == 75);
         SDL_SetWindowSize(native, 800, 600);
         to_game(400, 300, &x, &y);
         CHECK(x == 160 && y == 120 && g_dst.y == 0);
+        CHECK(!gex_renderer_resize(427, 240));
+        to_game(400, 300, &x, &y);
+        CHECK(x == 213 && y == 120 && g_dst.y == 75);
+        CHECK(!gex_renderer_commit());
+        int width, height;
+        SDL_GetWindowSize(native, &width, &height);
+        CHECK(width == 800 && height == 600);
         gex_renderer_shutdown();
         CHECK(SDL_GetWindowID(native) != 0);
         SDL_DestroyWindow(native);

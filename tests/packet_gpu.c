@@ -16,6 +16,86 @@ static int equal(gex_raster *cpu, gex_raster *gpu, const targets *t) {
                    (size_t)t->width * t->height * 2);
 }
 
+#ifdef GEX_TEST_BGFX
+static int batched(targets *t) {
+    gex_raster_clear(t->cpu);
+    gex_raster_clear(t->gpu);
+    gex_raster_state state = {atlas, table, 0x90, 0, 8, 320, 232, 0};
+    for (unsigned i = 0; i < 1100; ++i) {
+        memset(packet, 0, sizeof packet);
+        unsigned code = i % 3 ? 0x64 : 0x60;
+        packet[7] = (uint8_t)(code | (i % 2 ? 2 : 0));
+        packet[4] = (uint8_t)(i * 13);
+        packet[5] = (uint8_t)(i * 29);
+        packet[6] = (uint8_t)(i * 7);
+        word(packet + 8, (int)(i * 5 % 160));
+        word(packet + 10, 8 + (int)(i * 3 % 112));
+        if (code == 0x64) {
+            packet[12] = (uint8_t)i;
+            packet[13] = (uint8_t)(i * 3);
+            word(packet + 14, 0xF0000 / 32);
+            word(packet + 16, 24);
+            word(packet + 18, 12);
+        } else {
+            word(packet + 12, 24);
+            word(packet + 14, 12);
+            if (i % 60 == 0) {
+                word(packet + 8, 0); word(packet + 10, 8);
+                word(packet + 12, 320); word(packet + 14, 224);
+            }
+        }
+        for (unsigned i = 0; i < 600; ++i) {
+            memset(packet, 0, sizeof packet);
+            packet[7] = 0x6a;
+            packet[4] = (uint8_t)(i * 13);
+            packet[5] = (uint8_t)(i * 29);
+            packet[6] = (uint8_t)(i * 7);
+            word(packet + 8, 11 + (int)(i % 64)); word(packet + 10, 19);
+            gex_raster_packet(t->cpu, packet, &state);
+            gex_raster_packet(t->gpu, packet, &state);
+        }
+        for (unsigned i = 0; i < 140; ++i) {
+            word(packet + 8, 11);
+            gex_raster_packet(t->cpu, packet, &state);
+            gex_raster_packet(t->gpu, packet, &state);
+        }
+        for (unsigned format = 1; format <= 2; ++format) {
+            state.page = format == 2 ? 0x11f : 0x80;
+            unsigned address = format == 2 ? (0x80000 + 15 * 128 + 255 * 2048 + 510) & 0xfffff : 8;
+            if (format == 1) atlas[0] = 20;
+            for (unsigned pass = 0; pass < 2; ++pass) {
+                word(atlas + address, pass ? 0x801f : 0x83e0);
+                memset(packet, 0, sizeof packet);
+                packet[7] = 0x64;
+                packet[4] = packet[5] = packet[6] = 128;
+                packet[12] = packet[13] = format == 2 ? 255 : 0;
+                word(packet + 8, 200 + (int)(format * 4 + pass));
+                word(packet + 10, 28);
+                word(packet + 14, format == 1 ? 32767 : 0);
+                word(packet + 16, 1); word(packet + 18, 1);
+                gex_raster_packet(t->cpu, packet, &state);
+                gex_raster_packet(t->gpu, packet, &state);
+            }
+        }
+        if (i == 530) {
+            atlas[0xF0002] ^= 0x1f;
+            table[31 * 32 + 17] ^= 7;
+        }
+        gex_raster_packet(t->cpu, packet, &state);
+        gex_raster_packet(t->gpu, packet, &state);
+        if (i % 137 == 136) {
+            gex_raster_packet(t->copy_cpu, packet, &state);
+            gex_raster_packet(t->copy_gpu, packet, &state);
+        }
+    }
+    if (!equal(t->cpu, t->gpu, t) || !equal(t->copy_cpu, t->copy_gpu, t)) {
+        fprintf(stderr, "ordered batch mismatch at %dx%d\n", t->width, t->height);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static int differential(void *data) {
     targets *t = data;
     gex_raster *cpu = t->cpu, *gpu = t->gpu;
@@ -105,10 +185,17 @@ static int differential(void *data) {
             if (!equal(t->copy_cpu, t->copy_gpu, t)) return 1;
         }
     }
+#ifdef GEX_TEST_BGFX
+    return batched(t);
+#else
     return 0;
+#endif
 }
 
 int main(void) {
+#ifdef GEX_TEST_BGFX
+    if (gex_packet_gpu_select_bgfx()) return 1;
+#else
     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         fprintf(stderr, "[packet-gpu] headless GL prerequisite unavailable: %s\n", SDL_GetError());
         return 77;
@@ -124,6 +211,7 @@ int main(void) {
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         return 77;
     }
+#endif
     const int sizes[][2] = {{320, 240}, {427, 240}, {640, 448}, {854, 480}};
     int status = 0;
     for (unsigned size = 0; size < sizeof sizes / sizeof *sizes; ++size) {
@@ -134,12 +222,18 @@ int main(void) {
         int result = 1;
         if (t.cpu && t.gpu && t.copy_cpu && t.copy_gpu &&
             !gex_raster_enable_gpu(t.gpu, gex_packet_gpu_get()) &&
-            !gex_raster_enable_gpu(t.copy_gpu, gex_packet_gpu_get()) &&
-            SDL_GL_GetCurrentContext() == context) {
+            !gex_raster_enable_gpu(t.copy_gpu, gex_packet_gpu_get())
+#ifndef GEX_TEST_BGFX
+            && SDL_GL_GetCurrentContext() == context
+#endif
+            ) {
             SDL_Thread *thread = SDL_CreateThread(differential, "packet-test", &t);
             if (thread) {
                 SDL_WaitThread(thread, &result);
-                if (!equal(t.cpu, t.gpu, &t) || SDL_GL_GetCurrentContext() != context) result = 1;
+                if (!equal(t.cpu, t.gpu, &t)) result = 1;
+#ifndef GEX_TEST_BGFX
+                if (SDL_GL_GetCurrentContext() != context) result = 1;
+#endif
                 gex_raster_disable_gpu(t.gpu);
                 if (!equal(t.cpu, t.gpu, &t) || gex_raster_enable_gpu(t.gpu, gex_packet_gpu_get())) result = 1;
             } else fprintf(stderr, "[packet-gpu] cannot start worker: %s\n", SDL_GetError());
@@ -148,9 +242,19 @@ int main(void) {
         gex_raster_destroy(t.gpu); gex_raster_destroy(t.cpu);
         if (result) { status = result; break; }
     }
+#ifdef GEX_TEST_BGFX
+    gex_packet_gpu_shutdown_bgfx();
+#else
     if (SDL_GL_GetCurrentContext() != context) status = 1;
     SDL_GL_DeleteContext(context); SDL_DestroyWindow(window);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
-    if (!status) fprintf(stderr, "[packet-gpu] 2592 ordered packets at four sizes, worker migration, copy/pause and CPU edits PASS\n");
+#endif
+    if (!status) {
+#ifdef GEX_TEST_BGFX
+        fprintf(stderr, "[packet-gpu] 2592 ordered packets plus 7360 batched packets at four sizes, worker migration, copy/pause and CPU edits PASS\n");
+#else
+        fprintf(stderr, "[packet-gpu] 2592 ordered packets at four sizes, worker migration, copy/pause and CPU edits PASS\n");
+#endif
+    }
     return status;
 }

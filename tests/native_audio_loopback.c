@@ -1,6 +1,28 @@
 #define AL_ALEXT_PROTOTYPES
 #include <AL/alext.h>
+#define gex_native_audio_open gex_native_audio_open_device
 #include "../src/platform/linux/audio.c"
+#undef gex_native_audio_open
+
+static int stream_loopback;
+int gex_native_audio_open(void) {
+    if (!stream_loopback) return gex_native_audio_open_device();
+    device = alcLoopbackOpenDeviceSOFT(NULL);
+    if (!device) return 0;
+    const ALCint attributes[] = {
+        ALC_FORMAT_CHANNELS_SOFT, ALC_STEREO_SOFT,
+        ALC_FORMAT_TYPE_SOFT, ALC_SHORT_SOFT, ALC_FREQUENCY, 44100, 0
+    };
+    context = alcCreateContext(device, attributes);
+    if (!context || !alcMakeContextCurrent(context)) {
+        if (context) alcDestroyContext(context);
+        alcCloseDevice(device);
+        context = NULL; device = NULL;
+        return 0;
+    }
+    alDistanceModel(AL_NONE);
+    return 1;
+}
 
 const recomp_dispatch_entry_t recomp_dispatch_table[] = {{0, NULL}};
 const uint32_t recomp_dispatch_count = 0;
@@ -23,6 +45,84 @@ static uint64_t energy(int channel, int begin, int end) {
         value += (uint64_t)(sample < 0 ? -sample : sample);
     }
     return value;
+}
+
+static void movie_stream(int rate, int channels) {
+    const int steps = 120, step_frames = 44100 / 15;
+    int total = rate * 9;
+    size_t count = (size_t)steps * step_frames * 2;
+    int16_t *pcm = malloc((size_t)total * channels * sizeof *pcm);
+    int16_t *reference = malloc(count * sizeof *reference);
+    int16_t *streamed = malloc(count * sizeof *streamed);
+    EXPECT(pcm && reference && streamed);
+    if (!pcm || !reference || !streamed) {
+        free(pcm); free(reference); free(streamed);
+        return;
+    }
+    for (int i = 0; i < total; ++i)
+        for (int c = 0; c < channels; ++c)
+            pcm[i * channels + c] = (int16_t)(c ? (i % 311 - 155) * 40 : (i % 200 - 100) * 100);
+    stream_loopback = 1;
+    for (int pass = 0; pass < 2; ++pass) {
+        EXPECT(gex_audio_open());
+        int stream = -1, written = 0;
+        ALuint sources[2] = {0}, buffers[2] = {0};
+        if (pass) {
+            stream = gex_audio_stream_open(rate, channels);
+            EXPECT(stream >= 0);
+            written = rate * 11 / 15;
+            EXPECT(gex_audio_stream_write(stream, pcm, written) == written);
+        } else {
+            int16_t *mono = malloc((size_t)total * sizeof *mono);
+            EXPECT(mono);
+            if (!mono) { gex_audio_close(); break; }
+            alGenSources(2, sources);
+            alGenBuffers(2, buffers);
+            for (int c = 0; c < 2; ++c) {
+                for (int i = 0; i < total; ++i)
+                    mono[i] = pcm[i * channels + (channels > 1 ? c : 0)];
+                alBufferData(buffers[c], AL_FORMAT_MONO16, mono,
+                             (ALsizei)((size_t)total * sizeof *mono), rate);
+                alSourcei(sources[c], AL_SOURCE_RELATIVE, AL_TRUE);
+                alSource3f(sources[c], AL_POSITION, c ? 1 : -1, 0, 0);
+                alSourcef(sources[c], AL_ROLLOFF_FACTOR, 0);
+                alSourcei(sources[c], AL_BUFFER, (ALint)buffers[c]);
+            }
+            free(mono);
+            alSourcePlayv(2, sources);
+            EXPECT(alGetError() == AL_NO_ERROR);
+        }
+        for (int step = 0; step < steps; ++step) {
+            if (pass && step) {
+                int next = rate * (step + 11) / 15;
+                int frames = next - written;
+                EXPECT(gex_audio_stream_write(stream, pcm + written * channels, frames) == frames);
+                written = next;
+            }
+            int16_t *destination = (pass ? streamed : reference) + step * step_frames * 2;
+            for (int at = 0; at < step_frames;) {
+                if (pass) gex_audio_stream_queued(stream);
+                int n = step_frames - at;
+                if (n > 64) n = 64;
+                alcRenderSamplesSOFT(device, destination + at * 2, n);
+                at += n;
+            }
+        }
+        if (!pass) {
+            alDeleteSources(2, sources);
+            alDeleteBuffers(2, buffers);
+            EXPECT(alGetError() == AL_NO_ERROR);
+        }
+        gex_audio_close();
+    }
+    unsigned mismatches = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (abs((int)reference[i] - streamed[i]) > 5) ++mismatches;
+    fprintf(stderr, "[audio-test] movie stream %d Hz/%d channels: %u differing samples\n",
+            rate, channels, mismatches);
+    EXPECT(mismatches == 0);
+    free(pcm); free(reference); free(streamed);
+    stream_loopback = 0;
 }
 static float overlap_peak(int limiter) {
     device = alcLoopbackOpenDeviceSOFT(NULL);
@@ -168,5 +268,7 @@ int main(void) {
         EXPECT(limiter == ALC_TRUE);
         gex_native_audio_close();
     }
+    movie_stream(11025, 2);
+    movie_stream(22050, 1);
     return failures ? 1 : 0;
 }

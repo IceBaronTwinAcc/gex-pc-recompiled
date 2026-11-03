@@ -1340,6 +1340,16 @@ int main(void) {
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
     EXPECT(!gpu->download(copy, pixels, error, sizeof error));
     EXPECT((pixels[206 * 320 + 20] >> 10 & 31) >= 14);
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned i = 0; i < 320 * 240; ++i) other[i] = pass ? 0x001f : 0xf800;
+        other[239 * 320 + 319] = 0x07e0;
+        EXPECT(!native->movie(t, (const uint8_t *)other, 320, 240, 640, error, sizeof error));
+        EXPECT(!native->copy(copy, t, 255, error, sizeof error));
+        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(pixels[0] == (pass ? 0x7c00 : 31));
+        EXPECT(pixels[239 * 320 + 318] == (pass ? 0x7c00 : 31));
+        EXPECT(pixels[239 * 320 + 319] == 0x3e0);
+    }
     for (unsigned i = 0; i < 160 * 120; ++i) other[i] = 0xf800;
     EXPECT(!native->movie(t, (const uint8_t *)other, 160, 120, 320, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));

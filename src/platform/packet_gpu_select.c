@@ -9,8 +9,13 @@
 
 const gex_packet_gpu *gex_packet_gpu_platform_get(void);
 static int use_gldc;
+static int use_bgfx;
 
 const gex_packet_gpu *gex_packet_gpu_get(void) {
+#if GEX_ENABLE_BGFX_RENDERER
+    if (use_bgfx)
+        return gex_packet_gpu_bgfx();
+#endif
 #if GEX_ENABLE_GLDC_RENDERER
     if (use_gldc)
         return gex_packet_gpu_gldc();
@@ -18,10 +23,21 @@ const gex_packet_gpu *gex_packet_gpu_get(void) {
     return gex_packet_gpu_platform_get();
 }
 
+int gex_packet_gpu_select_bgfx(void) {
+#if GEX_ENABLE_BGFX_RENDERER
+    use_bgfx = 1;
+    use_gldc = 0;
+    return 0;
+#else
+    return -1;
+#endif
+}
+
 int gex_packet_gpu_select_gldc(int headless) {
 #if GEX_ENABLE_GLDC_RENDERER
     gex_gl_set_headless(headless);
     use_gldc = 1;
+    use_bgfx = 0;
     return 0;
 #else
     (void)headless;

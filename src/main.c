@@ -15,6 +15,13 @@
 #include "packet_gpu.h"
 #include "platform/host.h"
 #include "platform/filesystem.h"
+#ifdef GEX_DESKTOP_SETUP
+#include "game_install.h"
+#endif
+#if GEX_ENABLE_PASSWORD_SAVES
+#include "save_menu.h"
+#include "platform/input.h"
+#endif
 
 static uint32_t started;
 static unsigned smoke_seconds, frames, changes;
@@ -26,6 +33,7 @@ static gex_autoplay_state autoplay_state;
 static uint64_t last_hash;
 static char screenshot[4096];
 static char settings_file[4096];
+static const char *const renderer_names[] = {"software", "opengl", "pvr", "opengl12", "bgfx"};
 
 static void record_frame(const uint8_t *px, int w, int h, int pitch, int bpp) {
     uint64_t hash = 1469598103934665603ull;
@@ -73,11 +81,32 @@ static void monitor(void) {
     gex_gamepad_pump();
     unsigned elapsed_ms = gex_host_ticks_ms() - started;
     unsigned elapsed = elapsed_ms / 1000;
+#if GEX_ENABLE_PASSWORD_SAVES
+    static int deck_autoplay;
+    static uint32_t deck_started;
+    int choosing_deck = gex_save_menu_open();
+    if (autoplay && choosing_deck) {
+        if (!deck_autoplay) { deck_started = elapsed_ms; deck_autoplay = 1; }
+        if (elapsed_ms - deck_started >= 100) gex_save_key(0, 'X', 0x2D);
+        if (elapsed_ms - deck_started >= 300) {
+            gex_save_key(1, 'X', 0x2D);
+            deck_autoplay = 2;
+        }
+    } else if (deck_autoplay) {
+        gex_save_key(0, 'X', 0x2D);
+        deck_autoplay = 0;
+    }
+#else
+    int choosing_deck = 0;
+#endif
     gex_autoplay_event event;
-    if (autoplay && gex_autoplay_next(&autoplay_state, elapsed_ms, MEM32(0x4A2964),
+    if (autoplay && !choosing_deck && gex_autoplay_next(&autoplay_state, elapsed_ms, MEM32(0x4A2964),
                                      frame_level == MEM32(0x4A2964) ? scene_frames : 0, &event) &&
         (!verify_gameplay || event.key != 0x1B)) {
-        hle_input_key(event.down, event.key, event.scan);
+#if GEX_ENABLE_PASSWORD_SAVES
+        if (!gex_save_key(event.down, event.key, event.scan))
+#endif
+            hle_input_key(event.down, event.key, event.scan);
         fprintf(stderr, "[smoke] %u ms level=%u key 0x%X %s\n", elapsed_ms,
                 MEM32(0x4A2964), event.key, event.down ? "down" : "up");
     }
@@ -118,25 +147,29 @@ static void early_gameplay_exit(int code) {
 
 int main(int argc, char **argv) {
     const char *data = "Gex";
-    int headless = 0, trace = 0, check = 0, skip_movies = 0;
-    int hardware_renderer = GEX_ENABLE_SOFTWARE_RENDERER ? 0 : GEX_ENABLE_PVR_RENDERER ? 2 :
-                            GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
+    int headless = 0, trace = 0, check = 0, skip_movies = 0, explicit_data = 0;
+    const int default_renderer = GEX_ENABLE_PVR_RENDERER ? 2 : GEX_ENABLE_BGFX_RENDERER ? 4 :
+                                 GEX_ENABLE_SOFTWARE_RENDERER ? 0 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
+    int hardware_renderer = default_renderer;
     int render_width = 0, render_height = 0;
 #ifdef GEX_NATIVE_GAMEPLAY_WIDTH
     render_width = GEX_NATIVE_GAMEPLAY_WIDTH;
     render_height = GEX_NATIVE_GAMEPLAY_HEIGHT;
 #endif
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--data") && i + 1 < argc) data = argv[++i];
+        if (!strcmp(argv[i], "--data") && i + 1 < argc) {
+            data = argv[++i];
+            explicit_data = 1;
+        }
         else if (!strcmp(argv[i], "--headless")) headless = 1;
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--skip-movies")) skip_movies = 1;
         else if (!strcmp(argv[i], "--hardware-renderer")) hardware_renderer = GEX_ENABLE_PVR_RENDERER ? 2 :
-                                                                                GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
+            GEX_ENABLE_BGFX_RENDERER ? 4 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
         else if (!strcmp(argv[i], "--renderer")) {
             if (i + 1 == argc) {
-                fprintf(stderr, "[gex] --renderer requires software, opengl, pvr or opengl12\n");
+                fprintf(stderr, "[gex] --renderer requires software, opengl, pvr, opengl12 or bgfx\n");
                 return 64;
             }
             const char *name = argv[++i];
@@ -144,8 +177,9 @@ int main(int argc, char **argv) {
             else if (!strcmp(name, "opengl")) hardware_renderer = 1;
             else if (!strcmp(name, "pvr")) hardware_renderer = 2;
             else if (!strcmp(name, "opengl12")) hardware_renderer = 3;
+            else if (!strcmp(name, "bgfx")) hardware_renderer = 4;
             else {
-                fprintf(stderr, "[gex] --renderer requires software, opengl, pvr or opengl12\n");
+                fprintf(stderr, "[gex] --renderer requires software, opengl, pvr, opengl12 or bgfx\n");
                 return 64;
             }
         }
@@ -184,29 +218,43 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr, "Usage: %s [--data GOG-directory] [--headless] [--trace] [--check]\n"
                 "       [--skip-movies] [--smoke-seconds 1..3600] [--screenshot file.bmp] [--autoplay]\n"
-                "       [--verify-gameplay] [--render-size WIDTHxHEIGHT] [--renderer software|opengl|pvr|opengl12]\n"
+                "       [--verify-gameplay] [--render-size WIDTHxHEIGHT] [--renderer software|opengl|pvr|opengl12|bgfx]\n"
                 "       [--hardware-renderer (alias for this platform's packet GPU)]\n"
-                "       Built packet renderers: %s%s%s%s\n", argv[0],
+                "       Built packet renderers: %s%s%s%s%s\n"
+                "       Default packet renderer: %s\n", argv[0],
                 GEX_ENABLE_SOFTWARE_RENDERER ? "software " : "",
                 GEX_ENABLE_OPENGL_RENDERER ? "opengl " : "",
                 GEX_ENABLE_PVR_RENDERER ? "pvr " : "",
-                GEX_ENABLE_GLDC_RENDERER ? "opengl12" : "");
+                GEX_ENABLE_GLDC_RENDERER ? "opengl12 " : "",
+                GEX_ENABLE_BGFX_RENDERER ? "bgfx" : "", renderer_names[default_renderer]);
             return !strcmp(argv[i], "--help") ? 0 : 64;
         }
     }
     if ((hardware_renderer == 1 && !GEX_ENABLE_OPENGL_RENDERER) ||
         (hardware_renderer == 2 && !GEX_ENABLE_PVR_RENDERER) ||
         (hardware_renderer == 3 && !GEX_ENABLE_GLDC_RENDERER) ||
+        (hardware_renderer == 4 && !GEX_ENABLE_BGFX_RENDERER) ||
         (!hardware_renderer && !GEX_ENABLE_SOFTWARE_RENDERER)) {
         fprintf(stderr, "[gex] %s renderer was excluded at build time\n",
-                hardware_renderer == 3 ? "opengl12" : hardware_renderer == 2 ? "pvr" :
-                hardware_renderer ? "opengl" : "software");
+                renderer_names[hardware_renderer]);
         return 64;
     }
 #ifdef GEX_NATIVE_GAMEPLAY_WIDTH
     if (render_width != GEX_NATIVE_GAMEPLAY_WIDTH || render_height != GEX_NATIVE_GAMEPLAY_HEIGHT) {
         fprintf(stderr, "[gex] this platform requires native %dx%d gameplay\n",
                 GEX_NATIVE_GAMEPLAY_WIDTH, GEX_NATIVE_GAMEPLAY_HEIGHT);
+        return 64;
+    }
+#endif
+#ifdef GEX_DREAMCAST_PVR_MOVIES
+    if (!check && hardware_renderer != 2) {
+        fprintf(stderr, "[gex] Dreamcast FFmpeg builds require --renderer pvr; other renderers need a separate movie_metadata.c build with --skip-movies\n");
+        return 64;
+    }
+#endif
+#ifdef GEX_DREAMCAST_SKIP_MOVIES
+    if (!skip_movies && !check) {
+        fprintf(stderr, "[gex] metadata-only Dreamcast build requires --skip-movies; use the PVR/FFmpeg build for playback\n");
         return 64;
     }
 #endif
@@ -222,6 +270,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[gex] --verify-gameplay requires --headless, --autoplay and a smoke deadline, without --check\n");
         return 64;
     }
+#ifdef GEX_DESKTOP_SETUP
+    if (!explicit_data) {
+        static char default_data[4096];
+        if (gex_default_game_folder(default_data, sizeof default_data)) {
+            fprintf(stderr, "[setup] cannot resolve the default game folder\n");
+            return 1;
+        }
+        data = default_data;
+        const char *video = getenv("SDL_VIDEODRIVER");
+        int setup = gex_prepare_game(data, !headless && !check && !smoke_seconds &&
+                                    (!video || strcmp(video, "dummy")));
+        if (setup) return setup == 1 ? 0 : 1;
+    }
+#else
+    (void)explicit_data;
+#endif
     if (gex_host_enter_directory(data)) return 1;
     if (gex_verify_executable("GEX.exe")) return 1;
     gex_host_install_diagnostics();
@@ -240,15 +304,23 @@ int main(int argc, char **argv) {
     int settings_mode = gex_host_settings_path(settings_file, sizeof settings_file);
     if (settings_mode < 0) return 1;
     if (!settings_mode && hle_reg_load(settings_file)) return 1;
-    if (gex_renderer_init(gex_renderer_backend_get(), headless) || gex_renderer_resize(320, 240))
+#if GEX_ENABLE_PASSWORD_SAVES
+    if (gex_save_init(settings_file, monitor)) return 1;
+#endif
+    const gex_renderer_backend *renderer = gex_renderer_backend_get();
+#if GEX_ENABLE_BGFX_RENDERER
+    if (hardware_renderer == 4) renderer = gex_bgfx_renderer();
+#endif
+    if (gex_renderer_init(renderer, headless) || gex_renderer_resize(320, 240))
         hle_fatal("renderer initialization failed: %s", gex_renderer_error());
     if (render_width) {
-        if (gex_graphics_set_render_size(render_width, render_height)) return 1;
+        if (gex_graphics_set_render_size(render_width, render_height)) goto renderer_failed;
         fprintf(stderr, "[renderer] level viewport %dx%d (one logical pixel per render pixel)\n",
                 render_width, render_height);
     }
-    if (hardware_renderer == 3 && gex_packet_gpu_select_gldc(headless)) return 1;
-    if (hardware_renderer && gex_graphics_enable_gpu()) return 1;
+    if (hardware_renderer == 3 && gex_packet_gpu_select_gldc(headless)) goto renderer_failed;
+    if (hardware_renderer == 4 && gex_packet_gpu_select_bgfx()) goto renderer_failed;
+    if (hardware_renderer && gex_graphics_enable_gpu()) goto renderer_failed;
     if (gex_graphics_gpu_owned() && (screenshot[0] || verify_gameplay)) {
         fprintf(stderr, "[gex] GPU-owned output cannot provide CPU screenshots or pixel-based "
                         "--verify-gameplay; capture and verify emulator scanout externally\n");
@@ -256,19 +328,25 @@ int main(int argc, char **argv) {
         gex_renderer_shutdown();
         return 64;
     }
-    fprintf(stderr, "[renderer] selected %s packet backend\n",
-            hardware_renderer == 3 ? "opengl12" : hardware_renderer == 2 ? "pvr" :
-            hardware_renderer ? "opengl" : "software");
-    if (!headless && gex_gamepad_init(0)) return 1;
+    fprintf(stderr, "[renderer] selected %s packet backend\n", renderer_names[hardware_renderer]);
+    if (!headless && gex_gamepad_init(0)) goto renderer_failed;
     started = gex_host_ticks_ms();
     if (smoke_seconds) gex_renderer_observe(observe_frame);
     hle_set_pump_hook(monitor);
     monitor();
     if (verify_gameplay) hle_on_exit = early_gameplay_exit;
     rc = (int)recomp_host_run();
+#if GEX_ENABLE_PASSWORD_SAVES
+    gex_save_shutdown();
+#endif
     if (!headless) gex_gamepad_shutdown();
     gex_graphics_shutdown();
     gex_renderer_shutdown();
     if (verify_gameplay) early_gameplay_exit(rc);
     return rc;
+
+renderer_failed:
+    gex_graphics_shutdown();
+    gex_renderer_shutdown();
+    return 1;
 }

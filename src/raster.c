@@ -274,9 +274,14 @@ void gex_raster_clear(gex_raster *r) {
 }
 
 void gex_raster_copy(gex_raster *destination, const gex_raster *source) {
+    gex_raster_copy_shaded(destination, source, 255);
+}
+
+void gex_raster_copy_shaded(gex_raster *destination, const gex_raster *source, unsigned shade) {
+    if (shade > 255) gpu_fail("invalid picture copy shade");
     if (gex_raster_gpu_owned(destination) && gex_raster_gpu_owned(source)) {
         char error[512] = {0};
-        if (destination->gpu->native->copy(destination->device, source->device, 255,
+        if (destination->gpu->native->copy(destination->device, source->device, shade,
                                             error, sizeof error)) gpu_fail(error);
         return;
     }
@@ -284,6 +289,14 @@ void gex_raster_copy(gex_raster *destination, const gex_raster *source) {
     destination->previous_pixels = 0;
     memcpy(destination->pixels, source->pixels,
            (size_t)destination->width * destination->height * sizeof *destination->pixels);
+    if (shade < 255)
+        for (int i = 0; i < destination->width * destination->height; ++i) {
+            unsigned value = destination->pixels[i];
+            destination->pixels[i] = (uint16_t)((value & 0x8000) |
+                ((value & 31) * shade / 255) |
+                (((value >> 5 & 31) * shade / 255) << 5) |
+                (((value >> 10 & 31) * shade / 255) << 10));
+        }
     destination->gpu_newer = 0;
     destination->cpu_newer = 1;
     destination->guest_newer = 1;

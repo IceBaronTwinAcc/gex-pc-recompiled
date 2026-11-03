@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(gex_recomp VERSION 0.1.0 LANGUAGES C)
 
+if(ANDROID)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    add_compile_definitions(SDL_MAIN_HANDLED)
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(PCRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/pcrecomp" CACHE PATH "pcrecomp checkout")
@@ -49,6 +53,7 @@ endif()
 option(GEX_ENABLE_OPENGL_RENDERER "Build OpenGL packet rasterization" ${GEX_OPENGL_DEFAULT})
 option(GEX_ENABLE_PVR_RENDERER "Build Dreamcast PVR packet rasterization" ${GEX_PVR_AVAILABLE})
 option(GEX_ENABLE_GLDC_RENDERER "Build portable fixed-function GLdc packet rasterization" OFF)
+option(GEX_ENABLE_BGFX_RENDERER "Build portable bgfx packet rasterization" "${GEX_PLATFORM_DESKTOP_TESTS}")
 option(GEX_PROFILE_RENDERER "Log packet GPU presentation timing (diagnostic builds only)" OFF)
 if(GEX_ENABLE_GLDC_RENDERER AND GEX_PVR_AVAILABLE)
     target_compile_options(gex_game PRIVATE -Os)
@@ -56,7 +61,10 @@ endif()
 if(GEX_ENABLE_GLDC_RENDERER AND NOT (GEX_PVR_AVAILABLE OR GEX_PLATFORM_DESKTOP_TESTS))
     message(FATAL_ERROR "GLdc requires the Dreamcast or SDL desktop platform.")
 endif()
-if(NOT GEX_ENABLE_SOFTWARE_RENDERER AND NOT GEX_ENABLE_OPENGL_RENDERER AND NOT GEX_ENABLE_PVR_RENDERER AND NOT GEX_ENABLE_GLDC_RENDERER)
+if(GEX_ENABLE_BGFX_RENDERER AND NOT GEX_PLATFORM_DESKTOP_TESTS)
+    message(FATAL_ERROR "bgfx currently requires the SDL desktop platform.")
+endif()
+if(NOT GEX_ENABLE_SOFTWARE_RENDERER AND NOT GEX_ENABLE_OPENGL_RENDERER AND NOT GEX_ENABLE_PVR_RENDERER AND NOT GEX_ENABLE_GLDC_RENDERER AND NOT GEX_ENABLE_BGFX_RENDERER)
     message(FATAL_ERROR "At least one packet renderer must be enabled.")
 endif()
 if(GEX_ENABLE_OPENGL_RENDERER AND NOT GEX_PACKET_GPU_SOURCE)
@@ -72,6 +80,7 @@ target_compile_definitions(gex_renderer PUBLIC
     GEX_ENABLE_SOFTWARE_RENDERER=$<BOOL:${GEX_ENABLE_SOFTWARE_RENDERER}>
     GEX_ENABLE_PVR_RENDERER=$<BOOL:${GEX_ENABLE_PVR_RENDERER}>
     GEX_ENABLE_GLDC_RENDERER=$<BOOL:${GEX_ENABLE_GLDC_RENDERER}>
+    GEX_ENABLE_BGFX_RENDERER=$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>
     GEX_ENABLE_OPENGL_RENDERER=$<BOOL:${GEX_ENABLE_OPENGL_RENDERER}>)
 if(GEX_ENABLE_PVR_RENDERER)
     set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/packet_gpu.c")
@@ -84,6 +93,7 @@ set_source_files_properties("${GEX_PACKET_GPU_SOURCE}" PROPERTIES
 target_include_directories(gex_packet_gpu PUBLIC src)
 target_compile_definitions(gex_packet_gpu PRIVATE
     GEX_ENABLE_GLDC_RENDERER=$<BOOL:${GEX_ENABLE_GLDC_RENDERER}>
+    GEX_ENABLE_BGFX_RENDERER=$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>
     GEX_PROFILE_RENDERER=$<BOOL:${GEX_PROFILE_RENDERER}>)
 if(GEX_PROFILE_RENDERER)
     if(GEX_PVR_AVAILABLE)
@@ -110,6 +120,9 @@ if(GEX_ENABLE_GLDC_RENDERER)
     endif()
 endif()
 target_link_libraries(gex_packet_gpu PRIVATE ${GEX_PLATFORM_LIBRARIES})
+if(GEX_ENABLE_BGFX_RENDERER)
+    include(cmake/bgfx.cmake)
+endif()
 if(BUILD_TESTING AND GEX_ENABLE_PVR_RENDERER)
     add_executable(gex_pvr_test tests/dreamcast_pvr.c)
     target_link_libraries(gex_pvr_test PRIVATE gex_renderer gex_packet_gpu)
@@ -258,15 +271,26 @@ else()
     target_link_libraries(gex_hle PUBLIC gex_runtime_platform)
     target_link_libraries(gex_host PUBLIC gex_hle)
     add_library(gex_renderer_backend STATIC "${GEX_RENDERER_BACKEND_SOURCE}")
+    if(GEX_ENABLE_BGFX_RENDERER)
+        target_sources(gex_renderer_backend PRIVATE src/platform/bgfx/present.c)
+        target_link_libraries(gex_renderer_backend PRIVATE gex_packet_gpu)
+    endif()
     target_link_libraries(gex_renderer_backend PUBLIC gex_renderer gex_hle)
     target_link_libraries(gex_renderer_backend PRIVATE ${GEX_PLATFORM_LIBRARIES})
-    add_executable(gex_recomp ${GEX_LAUNCHER_SOURCES})
+    if(ANDROID)
+        add_library(gex_recomp SHARED ${GEX_LAUNCHER_SOURCES} src/platform/android/entry.c)
+        target_compile_definitions(gex_recomp PRIVATE main=gex_android_main)
+        target_link_options(gex_recomp PRIVATE "-Wl,-z,max-page-size=16384")
+        target_link_libraries(gex_recomp PRIVATE ${GEX_PLATFORM_LIBRARIES} log android)
+    else()
+        add_executable(gex_recomp ${GEX_LAUNCHER_SOURCES})
+    endif()
     target_include_directories(gex_recomp PRIVATE "${PCRECOMP_DIR}/runtime/win32hle")
     target_link_libraries(gex_recomp PRIVATE gex_hle gex_movie_decoder gex_renderer_backend)
     target_compile_options(gex_recomp PRIVATE -fno-strict-aliasing -fwrapv)
     if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
         add_executable(gex_audio_device_test tests/native_audio.c)
-        target_link_libraries(gex_audio_device_test PRIVATE gex_hle)
+        target_link_libraries(gex_audio_device_test PRIVATE gex_hle ${GEX_PLATFORM_LIBRARIES})
         add_test(NAME native-audio-device COMMAND gex_audio_device_test)
         set_tests_properties(native-audio-device PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10
             ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
@@ -285,6 +309,11 @@ else()
             endif()
             set_tests_properties(guest-packet-gpu PROPERTIES TIMEOUT 60 LABELS gpu
                 ENVIRONMENT "SDL_VIDEODRIVER=${GEX_GPU_TEST_VIDEO_DRIVER};SDL_AUDIODRIVER=dummy")
+        endif()
+        if(GEX_ENABLE_BGFX_RENDERER)
+            add_test(NAME guest-bgfx COMMAND gex_graphics_guest_test "${GEX_EXECUTABLE}" --bgfx)
+            set_tests_properties(guest-bgfx PROPERTIES TIMEOUT 60 LABELS gpu
+                ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
         endif()
         add_executable(gex_frame_timing_test tests/frame_timing.c src/guest_runtime.c
             src/graphics_guest.c src/renderer_headless.c)
@@ -383,6 +412,7 @@ else()
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/launcher.py" "$<TARGET_FILE:gex_recomp>"
             "${GEX_EXECUTABLE}" "$<BOOL:${GEX_ENABLE_SOFTWARE_RENDERER}>"
             "$<BOOL:${GEX_ENABLE_OPENGL_RENDERER}>" "$<BOOL:${GEX_ENABLE_GLDC_RENDERER}>"
+            "$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>"
             ${CMAKE_CROSSCOMPILING_EMULATOR})
         if(CMAKE_NM)
             add_test(NAME renderer-linkage COMMAND "${Python3_EXECUTABLE}"
@@ -395,6 +425,79 @@ target_include_directories(gex_recomp PRIVATE "${PCRECOMP_DIR}/runtime/recomp32"
 target_sources(gex_recomp PRIVATE src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
 target_link_libraries(gex_recomp PRIVATE gex_game gex_renderer gex_host)
 target_link_libraries(gex_recomp PRIVATE gex_packet_gpu)
+if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_RUNTIME STREQUAL "native32") AND NOT ANDROID)
+    set(GEX_ASSET_TABLE "${CMAKE_CURRENT_BINARY_DIR}/game_assets.h")
+    add_custom_command(OUTPUT "${GEX_ASSET_TABLE}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/game_asset_manifest.py"
+            c "${GEX_ASSET_TABLE}"
+        DEPENDS tools/game_asset_manifest.py config/game-assets.sha256 VERBATIM)
+    target_sources(gex_recomp PRIVATE src/platform/desktop/game_install.c "${GEX_ASSET_TABLE}")
+    target_include_directories(gex_recomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    if(APPLE)
+        enable_language(OBJC)
+        target_sources(gex_recomp PRIVATE src/platform/desktop/folder_picker_macos.m)
+        target_link_libraries(gex_recomp PRIVATE PkgConfig::SDL2 "-framework AppKit")
+        set_target_properties(gex_recomp PROPERTIES MACOSX_BUNDLE TRUE
+            OUTPUT_NAME "Gex Recompiled"
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/Info.plist.in")
+        add_custom_command(TARGET gex_recomp POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "$<TARGET_BUNDLE_DIR:gex_recomp>/Contents/Resources")
+    else()
+        target_sources(gex_recomp PRIVATE src/platform/desktop/folder_picker.c)
+    endif()
+    target_compile_definitions(gex_recomp PRIVATE GEX_DESKTOP_SETUP=1)
+    if(WIN32)
+        target_link_libraries(gex_recomp PRIVATE ole32 shell32 uuid user32)
+    endif()
+    if(BUILD_TESTING AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
+        add_executable(gex_game_install_test tests/game_install.c src/platform/desktop/game_install.c
+            src/identity.c src/sha256.c "${GEX_ASSET_TABLE}")
+        target_include_directories(gex_game_install_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_link_libraries(gex_game_install_test PRIVATE gex_hle)
+        add_test(NAME game-install COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/game_install.py" "$<TARGET_FILE:gex_game_install_test>"
+            "${GEX_EXECUTABLE}" ${CMAKE_CROSSCOMPILING_EMULATOR})
+        set_tests_properties(game-install PROPERTIES TIMEOUT 90)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+            add_executable(gex_folder_picker_test tests/folder_picker.c
+                src/platform/desktop/folder_picker.c)
+            target_include_directories(gex_folder_picker_test PRIVATE src)
+            add_test(NAME folder-picker COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/folder_picker.py" "$<TARGET_FILE:gex_folder_picker_test>")
+            set_tests_properties(folder-picker PROPERTIES TIMEOUT 10)
+        endif()
+    endif()
+endif()
+if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
+    target_compile_definitions(gex_game PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
+    target_compile_definitions(gex_recomp PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/save_menu_assets.py"
+            embed "${CMAKE_CURRENT_SOURCE_DIR}/assets/save-menu.bin"
+            "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h"
+        DEPENDS tools/save_menu_assets.py assets/save-menu.bin VERBATIM)
+    add_library(gex_saves STATIC src/save_store.c src/save_menu.c src/options_menu.c
+        "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h")
+    target_include_directories(gex_saves PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(gex_saves PUBLIC gex_host gex_renderer)
+    target_link_libraries(gex_recomp PRIVATE gex_saves)
+    if(TARGET gex_graphics_guest_test)
+        target_link_libraries(gex_graphics_guest_test PRIVATE gex_saves)
+        target_link_libraries(gex_frame_timing_test PRIVATE gex_saves)
+    endif()
+    if(BUILD_TESTING)
+        add_executable(gex_password_saves_test tests/password_saves.c src/guest_runtime.c
+            src/graphics_guest.c src/renderer_headless.c)
+        target_link_libraries(gex_password_saves_test PRIVATE
+            gex_game gex_saves gex_packet_gpu ${GEX_PLATFORM_LIBRARIES})
+        add_test(NAME password-decks COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/password_saves.py"
+            "$<TARGET_FILE:gex_password_saves_test>" "${GEX_EXECUTABLE}"
+            ${CMAKE_CROSSCOMPILING_EMULATOR})
+        set_tests_properties(password-decks PROPERTIES TIMEOUT 60)
+    endif()
+endif()
 if(TARGET gex_graphics_guest_test)
     target_link_libraries(gex_graphics_guest_test PRIVATE gex_packet_gpu)
     target_link_libraries(gex_frame_timing_test PRIVATE gex_packet_gpu)

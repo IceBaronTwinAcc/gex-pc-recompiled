@@ -4,20 +4,35 @@
 #include <string.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#ifdef GEX_MOVIE_CUSTOM_PIXELS
+#include "platform/ffmpeg_pixels.h"
+#else
 #include <libswscale/swscale.h>
+#endif
 #include "movie_decoder.h"
+#ifdef GEX_MOVIE_CUSTOM_IO
+#include "platform/ffmpeg_io.h"
+#endif
 
 struct gex_movie_decoder {
     AVFormatContext *format;
     AVCodecContext *video;
     AVPacket *packet;
     AVFrame *frame;
+#ifdef GEX_MOVIE_CUSTOM_PIXELS
+    gex_ffmpeg_pixels pixels;
+#else
     struct SwsContext *scale;
+    AVFrame *converted;
+#endif
     int video_index, audio_index, channels;
     int draining, outstanding, audio_offset;
     gex_movie_event event;
     int16_t pcm[GEX_MOVIE_AUDIO_CHUNK_FRAMES * 2];
     char error[256];
+#ifdef GEX_MOVIE_CUSTOM_IO
+    gex_ffmpeg_io *io;
+#endif
 };
 
 static int fail(gex_movie_decoder *d, const char *operation, int code) {
@@ -29,11 +44,17 @@ static int fail(gex_movie_decoder *d, const char *operation, int code) {
 
 void gex_movie_decoder_close(gex_movie_decoder *d) {
     if (!d) return;
+#ifndef GEX_MOVIE_CUSTOM_PIXELS
     sws_freeContext(d->scale);
+    av_frame_free(&d->converted);
+#endif
     av_packet_free(&d->packet);
     av_frame_free(&d->frame);
     avcodec_free_context(&d->video);
     avformat_close_input(&d->format);
+#ifdef GEX_MOVIE_CUSTOM_IO
+    gex_ffmpeg_io_close(d->io);
+#endif
     free(d);
 }
 
@@ -44,6 +65,12 @@ gex_movie_decoder *gex_movie_decoder_open(const char *path, gex_movie_info *info
         if (error_size) snprintf(error, error_size, "cannot allocate movie decoder");
         return NULL;
     }
+#ifdef GEX_MOVIE_CUSTOM_IO
+    d->format = avformat_alloc_context();
+    if (!d->format) { fail(d, "allocate movie demuxer", AVERROR(ENOMEM)); goto failed; }
+    d->io = gex_ffmpeg_io_open(path, d->format, d->error, sizeof d->error);
+    if (!d->io) goto failed;
+#endif
     int rc = avformat_open_input(&d->format, path, NULL, NULL);
     if (rc < 0) { fail(d, "open movie", rc); goto failed; }
     rc = avformat_find_stream_info(d->format, NULL);
@@ -175,14 +202,34 @@ int gex_movie_decoder_render(gex_movie_decoder *d, uint8_t *pixels,
     if (!d->outstanding || d->event.type != GEX_MOVIE_VIDEO || !pixels || !bytes ||
         width <= 0 || width > INT_MAX / bytes || height <= 0 || pitch < width * bytes)
         return fail(d, "invalid movie render target or event", AVERROR(EINVAL));
+#ifdef GEX_MOVIE_CUSTOM_PIXELS
+    int rc = gex_ffmpeg_convert(&d->pixels, d->frame, pixels, width, height, pitch, format);
+    if (rc) return fail(d, "convert native Indeo pixels", rc);
+#else
     enum AVPixelFormat pixel_format = format == GEX_MOVIE_RGB565_LE ? AV_PIX_FMT_RGB565LE : AV_PIX_FMT_BGRA;
+    if (!d->converted) d->converted = av_frame_alloc();
+    if (!d->converted) return fail(d, "allocate movie conversion frame", AVERROR(ENOMEM));
+    if (!d->converted->data[0] || d->converted->width != width || d->converted->height != height ||
+        d->converted->format != pixel_format) {
+        av_frame_unref(d->converted);
+        d->converted->width = width;
+        d->converted->height = height;
+        d->converted->format = pixel_format;
+        int rc = av_frame_get_buffer(d->converted, 32);
+        if (rc < 0) return fail(d, "allocate padded movie pixels", rc);
+    }
     d->scale = sws_getCachedContext(d->scale, d->frame->width, d->frame->height,
         d->frame->format, width, height, pixel_format, SWS_BILINEAR, NULL, NULL, NULL);
     if (!d->scale) return fail(d, "allocate movie pixel converter", AVERROR(ENOMEM));
-    uint8_t *destination[] = {pixels};
-    int strides[] = {pitch};
     int rc = sws_scale(d->scale, (const uint8_t *const *)d->frame->data,
-                       d->frame->linesize, 0, d->frame->height, destination, strides);
+                       d->frame->linesize, 0, d->frame->height,
+                       d->converted->data, d->converted->linesize);
     if (rc != height) return fail(d, "convert movie pixels", rc < 0 ? rc : AVERROR_INVALIDDATA);
+    /* SIMD conversion may write row padding; the caller owns only the exact picture rectangle. */
+    for (int y = 0; y < height; ++y)
+        memcpy(pixels + (size_t)y * pitch,
+               d->converted->data[0] + (size_t)y * d->converted->linesize[0],
+               (size_t)width * bytes);
+#endif
     return 0;
 }

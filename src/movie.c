@@ -20,8 +20,14 @@ static uint32_t pause_started;
 static int paused;
 static int audio_offset;
 static uint8_t *movie_pixels;
+static unsigned video_frames;
+static uint64_t audio_frames;
 
 static void cancel_playback(void) {
+    if (playing)
+        fprintf(stderr, "[movie] playback cancelled: video=%u audio=%llu elapsed-ms=%u queued=%d\n",
+                video_frames, (unsigned long long)audio_frames, hle_ticks_ms() - movie_start,
+                audio_stream >= 0 ? hle_audio_stream_queued(audio_stream) : 0);
     if (playing && callback) hle_post_message(callback, 0x3B9, 4, 1);
     playing = paused = pending = audio_offset = 0;
     if (decoder) gex_movie_decoder_discard(decoder);
@@ -86,6 +92,8 @@ static void play_movie(void) {
         if (audio_stream < 0) hle_fatal("cannot open AVI audio stream");
     }
     movie_start = hle_ticks_ms();
+    video_frames = 0;
+    audio_frames = 0;
     playing = 1;
     RET(0, 4);
 }
@@ -98,6 +106,7 @@ void gex_movie_pump(void) {
             int written = hle_audio_stream_write(audio_stream,
                 event.samples + audio_offset * info.audio_channels, count);
             audio_offset += written;
+            audio_frames += written;
             if (audio_offset == event.audio_frames) {
                 pending = audio_offset = 0;
                 gex_movie_decoder_release(decoder);
@@ -114,6 +123,7 @@ void gex_movie_pump(void) {
                                               info.width * 2, GEX_MOVIE_RGB565_LE))
                     hle_fatal("movie decode failed: %s", gex_movie_decoder_error(decoder));
                 gex_graphics_movie(movie_pixels, info.width, info.height, info.width * 2);
+                ++video_frames;
                 pending = 0;
                 gex_movie_decoder_release(decoder);
                 return;
@@ -129,6 +139,7 @@ void gex_movie_pump(void) {
                 frame.pitch, GEX_MOVIE_RGB565_LE))
                 hle_fatal("movie render failed: %s", gex_movie_decoder_error(decoder));
             if (gex_renderer_commit()) hle_fatal("movie presentation failed: %s", gex_renderer_error());
+            ++video_frames;
             pending = 0;
             gex_movie_decoder_release(decoder);
             return;
@@ -143,7 +154,8 @@ void gex_movie_pump(void) {
             playing = 0;
             if (audio_stream >= 0) hle_audio_stream_close(audio_stream);
             audio_stream = -1;
-            fprintf(stderr, "[movie] playback completed\n");
+            fprintf(stderr, "[movie] playback completed: video=%u audio=%llu\n",
+                    video_frames, (unsigned long long)audio_frames);
             if (callback) hle_post_message(callback, 0x3B9, 1, 1);
             return;
         }

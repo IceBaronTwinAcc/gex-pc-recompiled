@@ -7,6 +7,7 @@
 #include "identity.h"
 #include "renderer.h"
 #include "graphics_guest.h"
+#include "game_install.h"
 
 static char command[128];
 static int render_width, render_height;
@@ -75,8 +76,12 @@ static DWORD WINAPI run_game(void *unused) {
 
 int main(int argc, char **argv) {
     const char *data = "Gex";
+    int explicit_data = 0;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--data") && i + 1 < argc) data = argv[++i];
+        if (!strcmp(argv[i], "--data") && i + 1 < argc) {
+            data = argv[++i];
+            explicit_data = 1;
+        }
         else if (!strcmp(argv[i], "--render-size")) {
             if (i + 1 == argc || gex_renderer_parse_size(argv[++i], &render_width, &render_height)) {
                 fprintf(stderr, "--render-size requires WIDTHxHEIGHT: 1..8192 per axis, at most 16777216 pixels\n");
@@ -87,6 +92,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Usage: %s [--data GOG-directory] [--render-size WIDTHxHEIGHT]\n", argv[0]);
             return !strcmp(argv[i], "--help") ? 0 : 64;
         }
+    }
+    if (!explicit_data) {
+        int setup = gex_prepare_game(data, 1);
+        if (setup) return setup == 1 ? 0 : 1;
     }
     char path[MAX_PATH];
     DWORD length = GetFullPathNameA(data, sizeof path, path, NULL);

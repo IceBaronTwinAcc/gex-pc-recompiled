@@ -6,10 +6,15 @@ if [[ -z "${KOS_BASE:-}" ]]; then
     exit 1
 fi
 build=build/dreamcast
-cmake -S . -B "$build" -G Ninja \
+bash tools/build-dreamcast-ffmpeg.sh
+generator=()
+if [[ ! -f "$build/CMakeCache.txt" ]]; then generator=(-G Ninja); fi
+cmake -S . -B "$build" "${generator[@]}" \
     -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/dreamcast.cmake" \
     -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG="-Os -g" \
     -DPython3_EXECUTABLE="$PWD/.venv/bin/python" -DBUILD_TESTING=OFF
 cmake --build "$build" --parallel "${JOBS:-3}"
 "${KOS_OBJCOPY}" -O binary "$build/gex_recomp.elf" "$build/gex_recomp.bin"
 "${KOS_CC_BASE}/bin/sh-elf-size" "$build/gex_recomp.elf"
+mkdir -p "$build/licenses"
+cp .deps/dreamcast-ffmpeg/licenses/FFmpeg.txt "$build/licenses/"

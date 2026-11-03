@@ -52,7 +52,7 @@ static pthread_t g_video_thread;                         /* SDL's video calls st
 #ifdef GEX_NO_DIRECTDRAW
 static int g_initial_window_sized;
 static void initial_window_size(int w, int h) {
-    if (!g_win || g_initial_window_sized) return;
+    if (!g_win || g_external_window || g_initial_window_sized) return;
     g_initial_window_sized = 1;
     int width, height;
     SDL_GetWindowSize(g_win, &width, &height);
@@ -141,6 +141,9 @@ static int vk_of(SDL_Scancode s) {
     case SDL_SCANCODE_0: return '0';
     case SDL_SCANCODE_KP_0: return 0x60;
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: return 0x0D;
+#ifdef __ANDROID__
+    case SDL_SCANCODE_AC_BACK:
+#endif
     case SDL_SCANCODE_ESCAPE: return 0x1B;
     case SDL_SCANCODE_BACKSPACE: return 0x08;
     case SDL_SCANCODE_TAB: return 0x09;
@@ -198,7 +201,11 @@ static uint32_t scan_of(SDL_Scancode s) {
         [SDL_SCANCODE_F5] = 63, [SDL_SCANCODE_F6] = 64, [SDL_SCANCODE_F7] = 65, [SDL_SCANCODE_F8] = 66, [SDL_SCANCODE_F9] = 67,
         [SDL_SCANCODE_F10] = 68, [SDL_SCANCODE_F11] = 87, [SDL_SCANCODE_F12] = 88, [SDL_SCANCODE_HOME] = 71, [SDL_SCANCODE_UP] = 72,
         [SDL_SCANCODE_PAGEUP] = 73, [SDL_SCANCODE_LEFT] = 75, [SDL_SCANCODE_RIGHT] = 77, [SDL_SCANCODE_END] = 79,
-        [SDL_SCANCODE_DOWN] = 80, [SDL_SCANCODE_PAGEDOWN] = 81, [SDL_SCANCODE_INSERT] = 82, [SDL_SCANCODE_DELETE] = 83 };
+        [SDL_SCANCODE_DOWN] = 80, [SDL_SCANCODE_PAGEDOWN] = 81, [SDL_SCANCODE_INSERT] = 82, [SDL_SCANCODE_DELETE] = 83,
+#ifdef __ANDROID__
+        [SDL_SCANCODE_AC_BACK] = 0x01,
+#endif
+    };
     return (unsigned)s < SDL_NUM_SCANCODES ? t[s] : 0;
 }
 
@@ -241,7 +248,7 @@ static void web_menu(int open) {
 }
 #endif
 static void present(void) {
-    if (g_ren && !pthread_equal(pthread_self(), g_video_thread)) return;
+    if ((g_win || g_ren) && !pthread_equal(pthread_self(), g_video_thread)) return;
     const uint8_t *px;
     const uint32_t *pal;
     int w, h, pitch, bpp;
@@ -421,6 +428,8 @@ static void present(void) {
  * window shows the cursor the game set, built from its resources. */
 int (*hle_screen_cursor_hook)(void);
 int (*hle_screen_key_hook)(int sdl_scancode, int down);
+int (*gex_input_key_filter)(int down, uint32_t key, uint32_t scan);
+int (*gex_input_pointer_filter)(int x, int y, int down);
 
 /* The window's title, for a host that shows what is playing (a mod). */
 void hle_screen_title(const char *title) { if (g_win) SDL_SetWindowTitle(g_win, title); }
@@ -699,7 +708,7 @@ static void web_menu_poll(void) {
 void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)) {
     int pw, ph, ww, wh, mx, my;
     if (g_external_window) {
-        fprintf(stderr, "[opengl12] CPU popup-menu overlays are unavailable\n");
+        fprintf(stderr, "[screen] CPU popup-menu overlays are unavailable with an external GPU presenter\n");
         return;
     }
     if (!g_ren || !items || n <= 0) return;
@@ -746,23 +755,24 @@ void hle_screen_pump(void) {
         if (g_menu_eat_up && e.type == SDL_MOUSEBUTTONUP) { g_menu_eat_up = 0; continue; }
         switch (e.type) {
         case SDL_QUIT: {
+            if (gex_input_key_filter) gex_input_key_filter(1, UINT32_MAX, 0);
             uint32_t h = hle_first_hwnd();
             if (h) hle_post_message(h, WM_CLOSE, 0, 0); else hle_exit(0);
             break;
         }
         case SDL_KEYDOWN: case SDL_KEYUP: {
             SDL_Scancode sc = e.key.keysym.scancode;
-            /* a key the host keeps for itself (a mod switch): the game never sees it */
-            if (hle_screen_key_hook && hle_screen_key_hook((int)sc, e.type == SDL_KEYDOWN)) break;
             /* the presenter's keys, the Windows build's: they do not reach the game */
             if ((sc == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT)) || sc == SDL_SCANCODE_F11) {
                 if (e.type == SDL_KEYDOWN) set_fullscreen(!g_fullscreen);
                 break;
             }
+            /* a key the host keeps for itself (a mod switch): the game never sees it */
+            if (hle_screen_key_hook && hle_screen_key_hook((int)sc, e.type == SDL_KEYDOWN)) break;
             if (sc == SDL_SCANCODE_F12) {
                 if (g_external_window) {
                     if (e.type == SDL_KEYDOWN)
-                        fprintf(stderr, "[opengl12] presentation uses nearest sampling and black borders\n");
+                        fprintf(stderr, "[screen] external GPU presentation uses nearest sampling and black borders\n");
                     break;
                 }
                 if (e.type == SDL_KEYDOWN) {
@@ -779,12 +789,14 @@ void hle_screen_pump(void) {
         case SDL_MOUSEMOTION: {
             int gx, gy;
             to_game(e.motion.x, e.motion.y, &gx, &gy);
+            if (gex_input_pointer_filter && gex_input_pointer_filter(gx, gy, -1)) break;
             hle_input_mouse(WM_MOUSEMOVE, gx, gy);
             break;
         }
         case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
             int gx, gy, down = e.type == SDL_MOUSEBUTTONDOWN;
             to_game(e.button.x, e.button.y, &gx, &gy);
+            if (gex_input_pointer_filter && gex_input_pointer_filter(gx, gy, down)) break;
             uint32_t m = e.button.button == SDL_BUTTON_RIGHT ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
                        : e.button.button == SDL_BUTTON_MIDDLE ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);

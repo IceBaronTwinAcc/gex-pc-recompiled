@@ -96,6 +96,64 @@ static void check_uploads(void) {
         }
     }
 }
+static void check_large_uploads(void) {
+    const uint32_t frames = 65535, capacity = ((frames * 2 + 31) & ~31u) + 32;
+    uint8_t *pcm = malloc(frames * 4);
+    uint8_t *actual = memalign(32, capacity);
+    if (!pcm || !actual) abort();
+    for (uint32_t i = 0; i < frames * 4; ++i) pcm[i] = (uint8_t)(i * 37 + 11);
+    for (int channels = 1; channels <= 2; ++channels) {
+        for (int bits = 8; bits <= 16; bits += 8) {
+            uint32_t width = (uint32_t)bits / 8;
+            gex_native_voice v = {.pcm = pcm, .frames = frames,
+                                  .channels = channels, .bits = bits};
+            for (int c = 0; c < channels; ++c) {
+                v.ram[c] = snd_mem_malloc(capacity);
+                if (!v.ram[c]) abort();
+            }
+            for (v.looping = 0; v.looping <= 1; ++v.looping) {
+                for (uint32_t at = 0; at <= 3; at += 3) {
+                    memset(actual, 0x5A, capacity);
+                    for (int c = 0; c < channels; ++c)
+                        spu_memload_sq(v.ram[c], actual, capacity);
+                    uint64_t source = v.looping ? frames - 3 : 0;
+                    uint32_t begin = at * width & ~3u;
+                    uint32_t end = (frames * width + 3u) & ~3u;
+                    upload(&v, at, frames - at, source);
+                    for (int c = 0; c < channels; ++c) {
+                        spu_memread(actual, v.ram[c], capacity);
+                        for (uint32_t pos = 0; pos < capacity; ++pos) {
+                            uint8_t expected = 0x5A;
+                            if (pos >= begin && pos < end) {
+                                int64_t frame = (int64_t)source + pos / width - at;
+                                expected = 0;
+                                if (v.looping || (frame >= 0 && (uint64_t)frame < frames)) {
+                                    uint32_t index = (uint32_t)((frame % frames + frames) % frames);
+                                    expected = pcm[(index * channels + c) * width + pos % width];
+                                    if (bits == 8) expected ^= 128;
+                                }
+                            }
+                            if (actual[pos] != expected) {
+                                printf("AICA large upload: channels=%d bits=%d loop=%d at=%lu channel=%d byte=%lu actual=%u expected=%u\n",
+                                       channels, bits, v.looping, at, c, pos,
+                                       actual[pos], expected);
+                                EXPECT(actual[pos] == expected);
+                                for (int channel = 0; channel < channels; ++channel)
+                                    snd_mem_free(v.ram[channel]);
+                                free(actual);
+                                free(pcm);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            for (int c = 0; c < channels; ++c) snd_mem_free(v.ram[c]);
+        }
+    }
+    free(actual);
+    free(pcm);
+}
 static void benchmark_uploads(void) {
     uint8_t *pcm = malloc(100000 * 4);
     if (!pcm) abort();
@@ -119,9 +177,41 @@ static void benchmark_uploads(void) {
     }
     free(pcm);
 }
+static void check_pending_starts(void) {
+    uint8_t pcm[2205];
+    memset(pcm, 192, sizeof pcm);
+    gex_native_voice *v = gex_native_voice_create(pcm, sizeof pcm, 22050, 1, 8);
+    if (!v) abort();
+    unsigned missed = 0;
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        gex_native_voice_seek(v, 0);
+        thd_sleep(attempt % 11 + 1);
+        gex_native_voice_play(v, 0);
+        uint64_t deadline = timer_us_gettime64() + 40000;
+        while (v->playing && timer_us_gettime64() < deadline) {
+            thd_sleep(2);
+            gex_native_audio_poll();
+        }
+        if (!v->playing) {
+            printf("AICA missed start: attempt=%u elapsed-us=%llu played=%llu\n",
+                   attempt, timer_us_gettime64() - v->started, v->played);
+            ++missed;
+        } else {
+            EXPECT(snd_is_playing((unsigned)v->channel[0]));
+            EXPECT(v->played > 0);
+        }
+        gex_native_voice_stop(v);
+    }
+    printf("AICA pending starts: %u/32 missed\n", missed);
+    EXPECT(missed == 0);
+    gex_native_voice_destroy(v);
+}
 int main(void) {
     if (!gex_native_audio_open()) return 1;
+    check_pending_starts();
     check_uploads();
+    check_large_uploads();
+    if (failures) return 1;
     benchmark_uploads();
     uint32_t frames = 100000;
     int16_t *pcm = malloc((size_t)frames * 4);

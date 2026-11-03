@@ -5,6 +5,10 @@
 #include "recomp_types.h"
 #include "recomp_funcs.h"
 #include "graphics_guest.h"
+#if GEX_ENABLE_PASSWORD_SAVES
+#include "save_menu.h"
+#include "options_menu.h"
+#endif
 
 recomp_func_t gex_lookup_import(uint32_t va);
 void gex_guest_wait(void);

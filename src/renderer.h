@@ -13,6 +13,9 @@
 #ifndef GEX_ENABLE_GLDC_RENDERER
 #define GEX_ENABLE_GLDC_RENDERER 0
 #endif
+#ifndef GEX_ENABLE_BGFX_RENDERER
+#define GEX_ENABLE_BGFX_RENDERER 0
+#endif
 
 #include <stddef.h>
 #include <stdint.h>
@@ -47,6 +50,7 @@ typedef struct {
 } gex_renderer_backend;
 
 const gex_renderer_backend *gex_renderer_backend_get(void);
+const gex_renderer_backend *gex_bgfx_renderer(void);
 /* Bound memory use without requiring a particular aspect or integer scale. */
 int gex_renderer_valid_size(int width, int height);
 int gex_renderer_parse_size(const char *text, int *width, int *height);
@@ -62,6 +66,8 @@ int gex_renderer_device_mode(int enabled);
 void gex_renderer_device_window(void *window);
 int gex_renderer_pump(void);
 int gex_renderer_upload_bgr555(const uint8_t *pixels, int width, int height, int pitch);
+int gex_renderer_upload_bgr555_shaded(const uint8_t *pixels, int width, int height, int pitch,
+                                     unsigned shade);
 void gex_renderer_observe(void (*observer)(const gex_render_frame *frame));
 void gex_renderer_shutdown(void);
 const char *gex_renderer_error(void);

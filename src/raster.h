@@ -32,6 +32,7 @@ const uint8_t *gex_raster_pixels(const gex_raster *raster);
 void gex_raster_clear(gex_raster *raster);
 /* Both targets must have the same dimensions. */
 void gex_raster_copy(gex_raster *destination, const gex_raster *source);
+void gex_raster_copy_shaded(gex_raster *destination, const gex_raster *source, unsigned shade);
 void gex_raster_pause(gex_raster *destination, const gex_raster *source,
                       const uint8_t *banner);
 /* Import only writes made outside the packet renderer; remember records the

@@ -13,7 +13,33 @@ set(GEX_LAUNCHER_SOURCES src/main.c src/platform/dreamcast/main.c
     src/platform_shims.c src/movie.c src/autoplay.c src/gameplay.c src/gamepad.c)
 set_source_files_properties(src/main.c PROPERTIES COMPILE_DEFINITIONS main=gex_portable_main)
 set(GEX_DEFAULT_RENDERER "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/renderer.c")
-set(GEX_DEFAULT_MOVIE_DECODER "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/movie_decoder.c")
+if(GEX_MOVIE_DECODER_SOURCE STREQUAL "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/movie_decoder.c")
+    unset(GEX_MOVIE_DECODER_SOURCE CACHE)
+endif()
+set(GEX_DEFAULT_MOVIE_DECODER "${PROJECT_SOURCE_DIR}/src/platform/desktop/movie_decoder.c")
+set(GEX_DREAMCAST_FFMPEG_ROOT "${PROJECT_SOURCE_DIR}/.deps/dreamcast-ffmpeg"
+    CACHE PATH "Minimal KallistiOS FFmpeg installation")
+function(gex_configure_movie_decoder target source)
+    if(source STREQUAL GEX_DEFAULT_MOVIE_DECODER)
+        set_property(SOURCE src/main.c APPEND PROPERTY COMPILE_DEFINITIONS GEX_DREAMCAST_PVR_MOVIES)
+        target_sources(${target} PRIVATE src/platform/dreamcast/movie_io.c
+            src/platform/dreamcast/movie_pixels.c)
+        target_compile_definitions(${target} PRIVATE GEX_MOVIE_CUSTOM_IO GEX_MOVIE_CUSTOM_PIXELS)
+        target_compile_options(${target} PRIVATE -O2)
+        target_include_directories(${target} PRIVATE "${GEX_DREAMCAST_FFMPEG_ROOT}/include")
+        foreach(component avformat avcodec avutil)
+            find_library(GEX_DC_${component}_LIBRARY NAMES ${component}
+                PATHS "${GEX_DREAMCAST_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
+            target_link_libraries(${target} PRIVATE "${GEX_DC_${component}_LIBRARY}")
+        endforeach()
+        target_link_libraries(${target} PRIVATE m)
+    elseif(source STREQUAL "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/movie_metadata.c")
+        set_property(SOURCE src/main.c APPEND PROPERTY COMPILE_DEFINITIONS GEX_DREAMCAST_SKIP_MOVIES)
+        if(NOT GEX_ENABLE_GLDC_RENDERER)
+            target_compile_options(gex_game PRIVATE -O2)
+        endif()
+    endif()
+endfunction()
 include("${PROJECT_SOURCE_DIR}/cmake/runtime-core.cmake")
 set(GEX_RUNTIME_PLATFORM_SOURCES src/platform/dreamcast/runtime.c
     src/platform/dreamcast/filesystem.c src/platform/dreamcast/memory.c
@@ -24,16 +50,23 @@ add_compile_definitions(RECOMP_FLAT_MEMORY RECOMP_UNALIGNED_MEMORY HLE_GUEST_STA
     HLE_MAX_FONTS=16 HLE_MAX_GOBJ=128 HLE_MAX_DIBS=64)
 add_compile_options(-Os -g -fno-lto -fno-fast-math -ffp-contract=off
     -ffunction-sections -fdata-sections)
-foreach(target gex_game gex_renderer)
-    target_compile_options(${target} PRIVATE -O2 -g -fomit-frame-pointer -fno-lto -fno-fast-math
-        -ffp-contract=off -ffunction-sections -fdata-sections)
-endforeach()
-set_source_files_properties(src/platform/dreamcast/renderer.c
+target_compile_options(gex_game PRIVATE -Os -g -fomit-frame-pointer -fno-lto
+    -fno-fast-math -ffp-contract=off -ffunction-sections -fdata-sections)
+target_compile_options(gex_renderer PRIVATE -O2 -g -fomit-frame-pointer -fno-lto -fno-fast-math
+    -ffp-contract=off -ffunction-sections -fdata-sections)
+set_source_files_properties(src/main.c src/platform/dreamcast/renderer.c
     src/platform/dreamcast/packet_gpu.c src/platform/gl/packet_gpu.c src/sha256.c
     "${PCRECOMP_DIR}/runtime/win32hle/dsound.c"
     PROPERTIES COMPILE_OPTIONS -O2)
 add_link_options(-fno-lto "-Wl,--gc-sections" "-Wl,-Map=${CMAKE_BINARY_DIR}/gex_recomp.map")
 if(BUILD_TESTING)
+    add_executable(gex_dc_movie_test tests/dreamcast_movie.c)
+    target_include_directories(gex_dc_movie_test PRIVATE src)
+    target_link_libraries(gex_dc_movie_test PRIVATE gex_movie_decoder)
+    if(GEX_MOVIE_DECODER_SOURCE STREQUAL GEX_DEFAULT_MOVIE_DECODER)
+        target_compile_definitions(gex_dc_movie_test PRIVATE GEX_MOVIE_CUSTOM_IO)
+        target_include_directories(gex_dc_movie_test PRIVATE "${GEX_DREAMCAST_FFMPEG_ROOT}/include")
+    endif()
     add_executable(gex_fs_test tests/dreamcast_filesystem.c
         src/platform/dreamcast/filesystem.c)
     target_include_directories(gex_fs_test PRIVATE src

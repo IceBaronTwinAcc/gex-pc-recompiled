@@ -59,6 +59,7 @@ class MovieBuildTests(unittest.TestCase):
             configure = subprocess.run([
                 "cmake", "-S", str(ROOT), "-B", str(build),
                 "-DBUILD_TESTING=OFF",
+                "-DGEX_ENABLE_BGFX_RENDERER=OFF",
                 f"-DPCRECOMP_DIR={os.environ.get('GEX_PCRECOMP_DIR', ROOT / 'pcrecomp')}",
                 f"-DPKG_CONFIG_EXECUTABLE={wrapper}",
                 f"-DGEX_MOVIE_DECODER_SOURCE={backend}",

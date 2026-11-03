@@ -38,6 +38,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[dreamcast] cannot read test arguments: %s\n", strerror(errno));
         return 1;
     }
-    char *defaults[] = {"gex", "--data", "/cd/Gex", "--skip-movies", NULL};
-    return gex_portable_main(4, defaults);
+    char *defaults[] = {"gex", "--data", "/cd/Gex", NULL};
+    return gex_portable_main(3, defaults);
 }

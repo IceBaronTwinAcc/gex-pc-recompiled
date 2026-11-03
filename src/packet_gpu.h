@@ -67,6 +67,9 @@ typedef struct {
 const gex_packet_gpu *gex_packet_gpu_get(void);
 const gex_packet_gpu *gex_packet_gpu_gldc(void);
 int gex_packet_gpu_select_gldc(int headless);
+const gex_packet_gpu *gex_packet_gpu_bgfx(void);
+int gex_packet_gpu_select_bgfx(void);
+void gex_packet_gpu_shutdown_bgfx(void);
 #if GEX_PROFILE_RENDERER
 uint64_t gex_packet_gpu_profile_clock(uint64_t *cpu);
 void gex_packet_gpu_profile(const char *name, unsigned draws, unsigned uploads,

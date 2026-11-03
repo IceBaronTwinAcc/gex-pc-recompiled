@@ -1,3 +1,7 @@
+#ifdef __ANDROID__
+#define AL_ALEXT_PROTOTYPES
+#include <SDL2/SDL.h>
+#endif
 #include <al.h>
 #include <alc.h>
 #if defined(__has_include)
@@ -25,6 +29,20 @@ struct gex_native_voice {
 static ALCdevice *device;
 static ALCcontext *context;
 static gex_native_voice *voices;
+#ifdef __ANDROID__
+static int lifecycle_audio(void *unused, SDL_Event *event) {
+    (void)unused;
+    if (event->type == SDL_APP_DIDENTERBACKGROUND)
+        alcDevicePauseSOFT(device);
+    else if (event->type == SDL_APP_WILLENTERFOREGROUND)
+        alcDeviceResumeSOFT(device);
+    else return 1;
+    ALCenum error = alcGetError(device);
+    if (error != ALC_NO_ERROR)
+        fprintf(stderr, "[audio] Android pause/resume failed (0x%x)\n", error);
+    return 1;
+}
+#endif
 static void check(const char *operation) {
     ALenum error = alGetError();
     if (error != AL_NO_ERROR) hle_fatal("OpenAL %s failed (0x%x)", operation, error);
@@ -77,9 +95,23 @@ int gex_native_audio_open(void) {
     }
 #endif
     fprintf(stderr, "[audio] OpenAL native voices (%s)\n", alcGetString(device, ALC_DEVICE_SPECIFIER));
+#ifdef __ANDROID__
+    if (SDL_InitSubSystem(SDL_INIT_EVENTS)) {
+        fprintf(stderr, "[audio] cannot initialise Android lifecycle events: %s\n", SDL_GetError());
+        alcMakeContextCurrent(NULL);
+        alcDestroyContext(context); alcCloseDevice(device);
+        context = NULL; device = NULL;
+        return 0;
+    }
+    SDL_AddEventWatch(lifecycle_audio, NULL);
+#endif
     return 1;
 }
 void gex_native_audio_close(void) {
+#ifdef __ANDROID__
+    SDL_DelEventWatch(lifecycle_audio, NULL);
+    SDL_QuitSubSystem(SDL_INIT_EVENTS);
+#endif
     alcMakeContextCurrent(NULL);
     alcDestroyContext(context);
     alcCloseDevice(device);

@@ -10,6 +10,10 @@
 #include "platform/host.h"
 
 static gex_raster *targets[2];
+static gex_raster *fade_picture;
+static gex_raster *shaded_picture;
+static gex_render_frame fade_frame;
+static unsigned frame_shade = 255;
 static int render_width, render_height;
 static int exclusive_gpu;
 static int pictures_bound;
@@ -64,6 +68,22 @@ static int fixed_screen(void) {
 
 int gex_graphics_view_width(void) { return render_width && !fixed_screen() ? render_width : 320; }
 int gex_graphics_view_height(void) { return render_height && !fixed_screen() ? render_height + 16 : 240; }
+
+int gex_graphics_screen_point(int *x, int *y) {
+    gex_render_frame frame;
+    if (gex_renderer_frame(&frame)) {
+        fprintf(stderr, "[renderer] menu pointer target unavailable\n");
+        abort();
+    }
+    gex_render_rect rect = render_width ?
+        gex_renderer_fit(frame.width, frame.height, 320, 224) :
+        (gex_render_rect){0, 0, frame.width, frame.height};
+    if (*x < rect.x || *y < rect.y || *x >= rect.x + rect.width || *y >= rect.y + rect.height)
+        return 0;
+    *x = (*x - rect.x) * 320 / rect.width;
+    *y = (*y - rect.y) * 240 / rect.height;
+    return 1;
+}
 
 void gex_graphics_backdrop_begin(void) {
     backdrop_active = 0;
@@ -511,6 +531,62 @@ void gex_graphics_movie(const uint8_t *pixels, int width, int height, int pitch)
     gex_raster_movie(targets[0], pixels, width, height, pitch);
 }
 
+void gex_graphics_fade_capture(void) {
+    if (fade_picture || fade_frame.pixels) hle_fatal("screen fade already captured");
+    gex_render_frame frame;
+    if (gex_renderer_frame(&frame)) hle_fatal("screen fade framebuffer unavailable");
+    if (gex_graphics_gpu_owned()) {
+        fade_picture = gex_raster_create(render_width, render_height);
+        if (!fade_picture || gex_raster_enable_gpu(fade_picture, gex_packet_gpu_get()))
+            hle_fatal("cannot allocate screen fade picture");
+        gex_raster_copy(fade_picture, targets[0]);
+    } else {
+        fade_frame = frame;
+        fade_frame.pixels = malloc((size_t)frame.pitch * frame.height);
+        if (!fade_frame.pixels) hle_fatal("cannot allocate screen fade framebuffer");
+        memcpy(fade_frame.pixels, frame.pixels, (size_t)frame.pitch * frame.height);
+    }
+}
+
+void gex_graphics_fade_present(unsigned shade) {
+    if (shade > 255) hle_fatal("invalid screen fade shade");
+    if (fade_picture) {
+        gex_raster_copy_shaded(targets[0], fade_picture, shade);
+        gex_raster_present(targets[0]);
+    } else {
+        gex_render_frame frame;
+        if (!fade_frame.pixels || gex_renderer_frame(&frame) || !frame.pixels ||
+            frame.width != fade_frame.width || frame.height != fade_frame.height)
+            hle_fatal("screen fade framebuffer changed");
+        for (int y = 0; y < frame.height; ++y)
+            for (int x = 0; x < frame.width; ++x) {
+                const uint8_t *source = fade_frame.pixels + y * fade_frame.pitch + x * 2;
+                unsigned value = source[0] | (unsigned)source[1] << 8;
+                unsigned shaded = ((value >> 11) * shade / 255) << 11 |
+                    (((value >> 5 & 63) * shade / 255) << 5) |
+                    ((value & 31) * shade / 255);
+                uint8_t *destination = frame.pixels + y * frame.pitch + x * 2;
+                destination[0] = (uint8_t)shaded;
+                destination[1] = (uint8_t)(shaded >> 8);
+            }
+        if (gex_renderer_commit()) hle_fatal("screen fade presentation: %s", gex_renderer_error());
+    }
+}
+
+void gex_graphics_fade_release(void) {
+    gex_raster_destroy(fade_picture);
+    fade_picture = NULL;
+    gex_raster_destroy(shaded_picture);
+    shaded_picture = NULL;
+    free(fade_frame.pixels);
+    memset(&fade_frame, 0, sizeof fade_frame);
+}
+
+void gex_graphics_frame_shade(unsigned shade) {
+    if (shade > 255) hle_fatal("invalid guest frame shade");
+    frame_shade = shade;
+}
+
 void gex_graphics_cpu_access(void) {
     if (gex_graphics_gpu_owned()) { bind_pictures(); return; }
     if (!exclusive_gpu || !MEM32(0x4A33AC)) return;
@@ -521,6 +597,8 @@ void gex_graphics_cpu_access(void) {
 }
 
 void gex_graphics_shutdown(void) {
+    gex_graphics_fade_release();
+    frame_shade = 255;
     pictures_bound = 0;
     bound_atlas = NULL;
     for (int i = 0; i < 2; ++i) {
@@ -884,9 +962,11 @@ void gex_graphics_begin_frame(void) {
     uint32_t address = MEM32(0x4A33AC);
     if (address) {
         uint8_t *pixels = (uint8_t *)ADDR(address);
-        if (!gex_graphics_gpu_owned())
+        if (!gex_graphics_gpu_owned()) {
             for (unsigned y = 8; y < 232; ++y)
                 memset(pixels + y * 0x800, 0, 640);
+            if (targets[0]) gex_raster_remember(targets[0], pixels + 0x4000, 0x800);
+        }
         if (targets[0]) gex_raster_clear(targets[0]);
     }
 }
@@ -901,7 +981,18 @@ void gex_graphics_flush(void) {
                 if (gex_graphics_gpu_owned()) {
                     int plane = MEM32(0x4A294C) == 2 ? 1 : 0;
                     if (plane) gex_raster_copy(targets[0], targets[1]);
-                    gex_raster_present(targets[plane]);
+                    gex_raster *picture = targets[plane];
+                    if (frame_shade < 255) {
+                        if (!shaded_picture) {
+                            shaded_picture = gex_raster_create(render_width, render_height);
+                            if (!shaded_picture ||
+                                gex_raster_enable_gpu(shaded_picture, gex_packet_gpu_get()))
+                                hle_fatal("cannot allocate shaded guest picture");
+                        }
+                        gex_raster_copy_shaded(shaded_picture, picture, frame_shade);
+                        picture = shaded_picture;
+                    }
+                    gex_raster_present(picture);
                     g_esp += 4;
                     return;
                 }
@@ -915,8 +1006,8 @@ void gex_graphics_flush(void) {
                                pixels + 0x7C000 + y * 0x800, 640);
                     gex_raster_remember(targets[0], pixels + 0x4000, 0x800);
                 }
-                if (gex_renderer_upload_bgr555(gex_raster_pixels(targets[plane]),
-                        render_width, render_height, render_width * 2)) fatal();
+                if (gex_renderer_upload_bgr555_shaded(gex_raster_pixels(targets[plane]),
+                        render_width, render_height, render_width * 2, frame_shade)) fatal();
                 g_esp += 4;
                 return;
             }
@@ -926,7 +1017,8 @@ void gex_graphics_flush(void) {
                     memcpy(pixels + 0x4000 + y * 0x800,
                            pixels + 0x7C000 + y * 0x800, 640);
             /* Present the active picture, not the eight padding rows on each side. */
-            if (gex_renderer_upload_bgr555(pixels + 0x4000, 320, 224, 0x800)) fatal();
+            if (gex_renderer_upload_bgr555_shaded(pixels + 0x4000, 320, 224, 0x800,
+                                                  frame_shade)) fatal();
         }
     }
     g_esp += 4;

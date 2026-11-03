@@ -13,6 +13,10 @@ static const SDL_Scancode scancodes[GEX_KEY_COUNT] = {
 };
 
 static int keyboard_event(int scancode, int down) {
+    if (gex_input_key_filter &&
+        (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE) &&
+        gex_input_key_filter(down, scancode == SDL_SCANCODE_RETURN ? 0x0D : 0x20, 0))
+        return 1;
     for (unsigned i = 0; i < GEX_KEY_COUNT; ++i)
         if (scancode == scancodes[i]) {
             gex_gamepad_key((enum gex_input_key)i, down);
@@ -82,6 +86,7 @@ int gex_host_input_poll(gex_input_state *state) {
 }
 
 void gex_host_input_key(int down, uint32_t key, uint32_t scan) {
+    if (gex_input_key_filter && gex_input_key_filter(down, key, scan)) return;
     hle_input_key(down, key, scan);
 }
 

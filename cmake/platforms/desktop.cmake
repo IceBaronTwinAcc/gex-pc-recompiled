@@ -15,7 +15,9 @@ set(GEX_HOST_SOURCES
 set(GEX_LAUNCHER_SOURCES src/main.c src/platform_shims.c src/movie.c
     src/autoplay.c src/gameplay.c src/gamepad.c)
 set(GEX_DEFAULT_RENDERER "${PROJECT_SOURCE_DIR}/src/platform/desktop/renderer.c")
-set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/desktop/packet_gpu.c")
+if(NOT APPLE AND NOT ANDROID)
+    set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/desktop/packet_gpu.c")
+endif()
 set(GEX_DEFAULT_MOVIE_DECODER "${PROJECT_SOURCE_DIR}/src/platform/desktop/movie_decoder.c")
 
 include("${PROJECT_SOURCE_DIR}/cmake/runtime-core.cmake")
@@ -25,11 +27,23 @@ set(GEX_RUNTIME_PLATFORM_SOURCES
     src/platform/hle/flat_memory.c
     src/platform/linux/audio.c src/platform/desktop/font.c
     src/platform/desktop/screen.c src/platform/desktop/present.c)
+if(ANDROID)
+    list(REMOVE_ITEM GEX_RUNTIME_PLATFORM_SOURCES src/platform/linux/font_path.c)
+    list(APPEND GEX_RUNTIME_PLATFORM_SOURCES src/platform/android/font_path.c)
+endif()
 
 function(gex_configure_movie_decoder target source)
     if(source STREQUAL GEX_DEFAULT_MOVIE_DECODER)
         pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
         target_link_libraries(${target} PRIVATE PkgConfig::FFMPEG)
+        if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+            add_executable(gex_movie_pixels_test tests/dreamcast_movie_pixels.c
+                src/platform/dreamcast/movie_pixels.c)
+            target_include_directories(gex_movie_pixels_test PRIVATE src)
+            target_link_libraries(gex_movie_pixels_test PRIVATE PkgConfig::FFMPEG)
+            add_test(NAME movie-native-pixels COMMAND gex_movie_pixels_test)
+            set_tests_properties(movie-native-pixels PROPERTIES TIMEOUT 10)
+        endif()
     endif()
 endfunction()
 

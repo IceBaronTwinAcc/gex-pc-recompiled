@@ -15,6 +15,33 @@ static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size) {
     return hash;
 }
 
+static void render_guards(gex_movie_decoder *decoder) {
+    const int sizes[][2] = {{298, 224}, {319, 239}, {427, 241}};
+    const gex_movie_pixel_format formats[] = {GEX_MOVIE_RGB565_LE, GEX_MOVIE_BGRA32};
+    for (unsigned f = 0; f < sizeof formats / sizeof *formats; ++f)
+        for (unsigned s = 0; s < sizeof sizes / sizeof *sizes; ++s) {
+            int width = sizes[s][0], height = sizes[s][1];
+            int bytes = formats[f] == GEX_MOVIE_RGB565_LE ? 2 : 4;
+            int row = width * bytes, pitch = row + 46;
+            size_t size = (size_t)pitch * height + 32;
+            uint8_t *pixels = malloc(size);
+            if (!pixels) { CHECK(pixels); return; }
+            memset(pixels, 0xA5, size);
+            CHECK(!gex_movie_decoder_render(decoder, pixels + 23, width, height, pitch, formats[f]));
+            int guards_intact = 1;
+            for (size_t i = 0; i < size; ++i) {
+                size_t y = i / (size_t)pitch, x = i % (size_t)pitch;
+                if ((y >= (size_t)height || x < 23 || x >= (size_t)(23 + row)) &&
+                    pixels[i] != 0xA5) guards_intact = 0;
+            }
+            if (!guards_intact)
+                fprintf(stderr, "movie conversion overwrote padding: %dx%d format=%d\n",
+                        width, height, formats[f]);
+            CHECK(guards_intact);
+            free(pixels);
+        }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 && (argc != 3 || strcmp(argv[2], "--second-movie"))) return 1;
     int second_movie = argc == 3;
@@ -51,6 +78,7 @@ int main(int argc, char **argv) {
                     (size_t)event.audio_frames * info.audio_channels * sizeof(int16_t));
             } else {
                 CHECK(event.type == GEX_MOVIE_VIDEO);
+                if (!video_frames) render_guards(decoder);
                 CHECK(event.timestamp_ms >= last_timestamp);
                 last_timestamp = event.timestamp_ms;
                 gex_movie_pixel_format format = video_frames % 2 ? GEX_MOVIE_BGRA32 : GEX_MOVIE_RGB565_LE;

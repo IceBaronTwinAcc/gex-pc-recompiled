@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${FLYCAST:?Set FLYCAST to a headless, GDB-enabled Flycast executable}"
 : "${MKDCDISC:?Set MKDCDISC to the mkdcdisc executable}"
+: "${RENDERER:=pvr}"
 build=build/dreamcast
 [[ -f "$build/gex_recomp.elf" ]]
 renderer=()
@@ -10,7 +11,15 @@ if [[ -n "${RENDERER:-}" ]]; then
     case "$RENDERER" in software|pvr|opengl12) ;; *) echo "Unsupported Dreamcast renderer: $RENDERER" >&2; exit 64 ;; esac
     renderer=(--renderer "$RENDERER")
 fi
-if [[ "${AUTOPLAY:-0}" == 1 ]]; then
+if [[ "${MOVIES:-0}" == 1 ]]; then
+    if [[ "${AUTOPLAY:-0}" == 1 ]]; then
+        echo "MOVIES=1 cannot be combined with AUTOPLAY=1." >&2
+        exit 64
+    fi
+    printf '%s\n' "--data /cd/Gex --headless --smoke-seconds ${SMOKE_SECONDS:-95} ${renderer[*]}" \
+        > "$build/gex-test.cfg"
+    extra=(-f "$build/gex-test.cfg")
+elif [[ "${AUTOPLAY:-0}" == 1 ]]; then
     verification=(--verify-gameplay)
     if [[ "${RENDERER:-software}" != software ]]; then verification=(); fi
     printf '%s\n' "--data /cd/Gex --skip-movies --headless --autoplay ${verification[*]} --smoke-seconds ${SMOKE_SECONDS:-180} ${renderer[*]}" \
@@ -52,5 +61,17 @@ if [[ "${AUTOPLAY:-0}" == 1 ]]; then
     else
         grep -q 'first-graveyard=PASS' "$build/test.log"
     fi
+fi
+if [[ "${MOVIES:-0}" == 1 ]]; then
+    if [[ "$result" != 0 ]]; then
+        echo "Movie validation requires a normal guest exit, not a timeout." >&2
+        tail -60 "$build/test.log"
+        exit 1
+    fi
+    [[ "$(grep -c '^\[movie\] playback completed' "$build/test.log")" == 2 ]]
+    grep -q '^\[movie\] playback completed: video=457 audio=335899' "$build/test.log"
+    grep -q '^\[movie\] playback completed: video=867 audio=1274490' "$build/test.log"
+    grep -q '^\[smoke\] scene=63 ' "$build/test.log"
+    echo "Both original intro movies completed and returned to the title menu."
 fi
 tail -25 "$build/test.log"

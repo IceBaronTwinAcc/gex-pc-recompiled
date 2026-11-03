@@ -6,7 +6,6 @@
 #include "platform/filesystem.h"
 
 int gex_verify_executable(const char *path) {
-    static const char expected[] = "e1fd63ecb09fca29d63286e22447752dcb120d7e682f8759d1021776f7698b86";
     int file = gex_file_open(path, GEX_FILE_READ);
     if (file < 0) {
         fprintf(stderr, "[gex] cannot read executable %s\n", path);
@@ -33,8 +32,13 @@ int gex_verify_executable(const char *path) {
     }
     unsigned char digest[32];
     gex_sha256_final(&hash, digest);
+    return gex_verify_executable_digest(digest);
+}
+
+int gex_verify_executable_digest(const unsigned char digest[32]) {
+    static const char expected[] = "e1fd63ecb09fca29d63286e22447752dcb120d7e682f8759d1021776f7698b86";
     char actual[65];
-    for (unsigned i = 0; i < sizeof digest; ++i)
+    for (unsigned i = 0; i < 32; ++i)
         snprintf(actual + 2 * i, 3, "%02x", digest[i]);
     if (strcmp(actual, expected)) {
         fprintf(stderr, "[gex] unsupported executable SHA-256 %s; expected %s\n", actual, expected);

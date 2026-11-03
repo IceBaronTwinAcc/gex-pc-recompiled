@@ -75,9 +75,9 @@ int main(int argc, char **argv) {
     mach_enter();
     uint32_t params = hle_va(hle_alloc(28));
     uint32_t path = hle_guest_strdup(argv[1]);
-    const int sizes[][2] = {{427, 240}, {854, 480}, {1920, 1080},
+    const int sizes[][2] = {{320, 224}, {427, 240}, {854, 480}, {1920, 1080},
                             {2560, 1080}, {240, 427}, {3440, 1440}};
-    for (int i = 0; i < 6; ++i) {
+    for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; ++i) {
         if (resize && gex_renderer_resize(sizes[i][0], sizes[i][1])) return 1;
         memset(hle_ptr(params), 0, 28);
         MEM32(params + 12) = path;

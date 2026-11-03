@@ -14,6 +14,7 @@ from tools.graphics_rewrite import (
     FUNCTIONS as GRAPHICS_FUNCTIONS, FRAME_BEGIN, FRAME_END, PACKET_BEGIN,
     ARENA_HOOK, VIEW_HOOKS, SCREEN_HOOKS, HUD_DRAWS, PLAYER_DRAWS, rewrite_graphics,
 )
+from tools.save_rewrite import rewrite_saves, TITLE_HOOK, TITLE_INIT_HOOK, CHECKPOINT_HOOK, MANUAL_HOOK
 
 ROOT = Path(__file__).resolve().parents[1]
 GEX_SHA256 = "e1fd63ecb09fca29d63286e22447752dcb120d7e682f8759d1021776f7698b86"
@@ -153,8 +154,11 @@ def main():
             text = replace_frame_wait(text)
             text = replace_audio_waits(text)
             text = rewrite_graphics(text)
+            text = rewrite_saves(text)
             path.write_text(text)
         rewritten = "\n".join(path.read_text() for path in generated.glob("*.c"))
+        if any(hook not in rewritten for hook in (TITLE_HOOK, TITLE_INIT_HOOK, CHECKPOINT_HOOK, MANUAL_HOOK)):
+            raise RuntimeError("missing password save hooks")
         if FRAME_WAIT not in rewritten:
             raise RuntimeError("missing blocking frame deadline wait")
         for address, replacement in GRAPHICS_FUNCTIONS.items():

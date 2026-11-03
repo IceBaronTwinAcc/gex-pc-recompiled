@@ -48,11 +48,12 @@ static int native_upload(const gex_render_frame *frame, const uint8_t *pixels,
     return upload_result;
 }
 
-static void check_upload(const uint8_t *input, int width, int height, int pitch) {
+static void check_upload_shaded(const uint8_t *input, int width, int height, int pitch,
+                                unsigned shade) {
     gex_render_frame frame;
     CHECK(!gex_renderer_frame(&frame));
     memset(frame.pixels, 0xA5, (size_t)frame.pitch * frame.height);
-    CHECK(!gex_renderer_upload_bgr555(input, width, height, pitch));
+    CHECK(!gex_renderer_upload_bgr555_shaded(input, width, height, pitch, shade));
     for (int y = 0; y < frame.height; ++y) {
         int sy = y * height / frame.height;
         for (int x = 0; x < frame.width; ++x) {
@@ -61,12 +62,19 @@ static void check_upload(const uint8_t *input, int width, int height, int pitch)
             unsigned value = source[0] | (unsigned)source[1] << 8;
             unsigned expected = (value & 31) << 11 |
                 (value & 0x3E0) << 1 | (value >> 10 & 31);
+            expected = ((expected >> 11) * shade / 255) << 11 |
+                (((expected >> 5 & 63) * shade / 255) << 5) |
+                ((expected & 31) * shade / 255);
             const uint8_t *pixel = frame.pixels + y * frame.pitch + x * 2;
             CHECK(pixel[0] == (uint8_t)expected && pixel[1] == (uint8_t)(expected >> 8));
         }
         for (int x = frame.width * 2; x < frame.pitch; ++x)
             CHECK(frame.pixels[y * frame.pitch + x] == 0xA5);
     }
+}
+
+static void check_upload(const uint8_t *input, int width, int height, int pitch) {
+    check_upload_shaded(input, width, height, pitch, 255);
 }
 
 static void check_conversion(void) {
@@ -78,6 +86,9 @@ static void check_conversion(void) {
     }
     CHECK(!gex_renderer_resize(256, 256));
     check_upload(bytes, 256, 256, 512);
+    const unsigned shades[] = {0, 64, 128, 192, 255};
+    for (unsigned i = 0; i < sizeof shades / sizeof *shades; ++i)
+        check_upload_shaded(bytes, 256, 256, 512, shades[i]);
 
     uint32_t storage[32];
     for (unsigned i = 0; i < sizeof storage; ++i)
@@ -88,6 +99,8 @@ static void check_conversion(void) {
                 CHECK(!gex_renderer_resize(width, 5));
                 check_upload((const uint8_t *)storage + offset, width, 3,
                              width * 2 + padding);
+                check_upload_shaded((const uint8_t *)storage + offset, width, 3,
+                                    width * 2 + padding, 128);
             }
     CHECK(!gex_renderer_resize(9, 2));
     check_upload(bytes, 3, 5, 6);
@@ -200,6 +213,11 @@ int main(void) {
     CHECK(!gex_renderer_upload_bgr555(input, 2, 2, 6));
     CHECK(observed == observations + 1 && presented == presentations && uploads == 3);
     CHECK(frame.pixels[0] == 0x5A && frame.pixels[7] == 0x5A);
+    observations = observed; presentations = presented;
+    check_upload_shaded(input, 2, 2, 6, 128);
+    check_upload_shaded(input, 2, 2, 6, 0);
+    CHECK(uploads == 3 && presented == presentations + 2 && observed == observations + 2);
+    CHECK(gex_renderer_upload_bgr555_shaded(input, 2, 2, 6, 256) == -1);
     CHECK(!gex_renderer_resize(3, 2));
     CHECK(!gex_renderer_frame(&frame));
     sequence = frame.sequence;

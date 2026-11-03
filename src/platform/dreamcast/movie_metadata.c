@@ -3,10 +3,10 @@
 #include <string.h>
 #include "movie_decoder.h"
 
-/* Metadata-only support lets the shared MCI layer honour --skip-movies.
- * Decoding is explicitly unavailable rather than faking playback success. */
+/* Preserve the RAM-bounded software diagnostic profile without pretending to
+ * decode movies. Normal PVR builds use the shared FFmpeg decoder instead. */
 struct gex_movie_decoder { int unused; };
-static const char unavailable[] = "Dreamcast movie decoding is not implemented; use --skip-movies";
+static const char unavailable[] = "metadata-only Dreamcast build requires --skip-movies; use the PVR/FFmpeg build for playback";
 static uint32_t little32(const unsigned char *p) {
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }

@@ -161,11 +161,16 @@ int gex_renderer_pump(void) {
 }
 
 int gex_renderer_upload_bgr555(const uint8_t *pixels, int width, int height, int pitch) {
+    return gex_renderer_upload_bgr555_shaded(pixels, width, height, pitch, 255);
+}
+
+int gex_renderer_upload_bgr555_shaded(const uint8_t *pixels, int width, int height, int pitch,
+                                     unsigned shade) {
     if (device_mode) return fail("GPU-owned output forbids CPU framebuffer conversion");
     if (!pixels || !gex_renderer_valid_size(width, height) ||
-        pitch < width * 2 || !front.pixels)
+        pitch < width * 2 || !front.pixels || shade > 255)
         return fail("invalid renderer upload");
-    if (output->upload_bgr555) {
+    if (shade == 255 && output->upload_bgr555) {
         error[0] = 0;
         int result = output->upload_bgr555(&front, pixels, width, height, pitch,
                                            error, sizeof error);
@@ -219,6 +224,17 @@ int gex_renderer_upload_bgr555(const uint8_t *pixels, int width, int height, int
             target[x * 2 + 1] = (uint8_t)(rgb >> 8);
         }
     }
+    if (shade < 255)
+        for (int y = 0; y < front.height; ++y)
+            for (int x = 0; x < front.width; ++x) {
+                uint8_t *p = front.pixels + y * front.pitch + x * 2;
+                unsigned value = p[0] | (unsigned)p[1] << 8;
+                unsigned rgb = ((value >> 11) * shade / 255) << 11 |
+                    (((value >> 5 & 63) * shade / 255) << 5) |
+                    ((value & 31) * shade / 255);
+                p[0] = (uint8_t)rgb;
+                p[1] = (uint8_t)(rgb >> 8);
+            }
     return gex_renderer_commit();
 }
 

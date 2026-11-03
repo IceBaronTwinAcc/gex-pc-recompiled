@@ -3,12 +3,18 @@
 #include "platform/audio.h"
 #include "platform/runtime.h"
 #include "win32hle.h"
+#ifdef __ANDROID__
+#include <SDL2/SDL.h>
+#endif
 
 const recomp_dispatch_entry_t recomp_dispatch_table[] = {{0, NULL}};
 const uint32_t recomp_dispatch_count = 0;
 static int failures;
 #define EXPECT(expr) do { if (!(expr)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); ++failures; } } while (0)
 int main(void) {
+#ifdef __ANDROID__
+    SDL_SetMainReady();
+#endif
     if (!gex_audio_open()) return 77;
     int16_t pcm[4410 * 2] = {0};
     gex_audio_voice *v = gex_audio_voice_create(pcm, 4410, 44100, 2, 16);
@@ -17,6 +23,17 @@ int main(void) {
     gex_runtime_sleep_us(40000);
     gex_audio_position before = gex_audio_voice_position(v);
     EXPECT(before.playing && before.played > 0);
+#ifdef __ANDROID__
+    SDL_Event event = {.type = SDL_APP_DIDENTERBACKGROUND};
+    EXPECT(SDL_PushEvent(&event) == 1);
+    before = gex_audio_voice_position(v);
+    gex_runtime_sleep_us(30000);
+    EXPECT(gex_audio_voice_position(v).played == before.played);
+    event.type = SDL_APP_WILLENTERFOREGROUND;
+    EXPECT(SDL_PushEvent(&event) == 1);
+    gex_runtime_sleep_us(30000);
+    EXPECT(gex_audio_voice_position(v).played > before.played);
+#endif
     gex_audio_pause(1);
     before = gex_audio_voice_position(v);
     gex_runtime_sleep_us(30000);

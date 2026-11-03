@@ -9,8 +9,8 @@ All commands below run from the project root.
 
 A work-in-progress native recompilation of the DRM-free GOG PC release of
 Gex, using [sp00nznet/pcrecomp](https://github.com/sp00nznet/pcrecomp).
-The original executable is loaded as data; on Linux, its recovered functions
-execute as compiled C, not x86 machine code. Linux execution does not use Wine;
+The original executable is loaded as data; on Linux, macOS and Android, its recovered functions
+execute as compiled C, not x86 machine code. These targets do not use Wine;
 Wine is used to test the cross-compiled Windows executable.
 
 **This is a prototype, not a finished replacement for the original game.**
@@ -22,8 +22,10 @@ Wine is used to test the cross-compiled Windows executable.
 | Linux x86-64 | Built and run: both startup AVIs finish, animated title menu, world and cemetery maps, first graveyard level, movement/jump input, and normal guest exit. No complete playthrough yet. |
 | Windows x86-64 | MinGW-w64 HLE/SDL/FFmpeg build exercised headlessly under Wine. No physical Windows installation or complete playthrough validated. |
 | Windows x86 | MSVC/native32 launcher and CMake path provided; not built or run on Windows. |
-| macOS | Portable SDL/OpenAL/FFmpeg host provided; not built or run on macOS. |
-| Dreamcast | Experimental KallistiOS/SH4 backend builds and renders under headless Flycast with 16 MiB RAM. Scripted first-level gameplay is not yet verified; movies and VMU persistence are not implemented. |
+| macOS ARM64 | Linux OSXCross build run headlessly on an M1 with macOS 15.7.7: software and bgfx/Metal first-level gameplay, complete startup AVIs, native audio through the silent null device, and normal guest exit. No visible-window testing or complete playthrough yet. |
+| macOS x86-64 | Separate Intel-only OSXCross build exercised headlessly through Rosetta 2 on the M1: 32 target checks, software/Metal first-level gameplay, both complete startup AVIs and normal guest exit. Physical Intel Macs and their GPUs remain untested. |
+| Android ARM64/x86-64 | Both debug APKs bundle Vulkan and OpenGL ES 3.1. Both APIs run on an Android 15 x86-64 emulator and a Pixel 9a running Android 17. Physical native-window gameplay captures confirm the compute-only swap flicker fix on both APIs. No full playthrough or physical audio/controller validation yet. |
+| Dreamcast | Experimental KallistiOS/SH4 backend renders and completes both original intro AVIs under headless Flycast with 16 MiB RAM. Physical hardware, a complete playthrough and VMU persistence remain unverified or unfinished. |
 
 The lift contains 1,988 discovered function entries, including overlapping
 bodies and possible data misidentifications. This count is not proof of
@@ -47,7 +49,7 @@ The supplied executable and observed runtime behavior remain authoritative.
 ## Required original installation
 
 Supply your own authorized GOG installation in `Gex/`, including `GEX.exe`,
-`AVI/`, `IDL/`, `LEV/`, `MUS/`, and `VFX/`. Alternatively pass
+`AVI/`, `IDL/`, `LEV/`, `MUS/`, `SFX/`, and `VFX/`. Alternatively pass
 `--data /path/to/Gex` when running. The original executable must have this
 SHA-256:
 
@@ -58,6 +60,34 @@ e1fd63ecb09fca29d63286e22447752dcb120d7e682f8759d1021776f7698b86
 Other releases require separate analysis and generation. Both the generator
 and launcher reject an incompatible executable. Do not redistribute the
 original installation, game assets, or mechanically recovered game code.
+
+Desktop releases can import this installation at first launch. Windows uses
+the native COM folder dialog, Linux runs `zenity` (or `kdialog` if unavailable)
+without a shell, and macOS uses AppKit. Windows/Linux copy into the default
+working-directory `Gex`; the macOS `.app` imports into its own Resources, as
+described below. Android uses its system document-tree picker and private
+app storage. Setup is separate from the original title and Options menus.
+
+Desktop and Android importers use the pinned `config/game-assets.sha256`
+manifest: 661 required files covering `GEX.exe` and every supported AVI, IDL,
+LEV, MUS, SFX and VFX asset. Before any copying or staging-directory creation,
+each file must be present and readable and match both its exact byte count and
+SHA-256. Missing, truncated, modified and corrupted files are rejected with
+the failing relative path. The manifest contains metadata only, not retail data;
+ordinary builds never derive trusted checksums from a user-selected installation.
+`tools/game_asset_manifest.py` generates the C table for desktop builds and
+the Java table during Android packaging from the same manifest.
+
+The desktop importer copies all regular files and
+directories through an exclusive sibling staging folder, rejects links and
+special files, validates the copy, and atomically promotes it without replacing
+an existing destination. Errors are shown explicitly; failure removes the
+current staging folder and allows another selection. All required staged files
+are rehashed before promotion, detecting source changes during copying.
+Original files are never
+modified. An existing incomplete destination must be moved aside by the user,
+not silently merged or deleted. `--data PATH` remains a direct-use override;
+headless, check-only, dummy-video and smoke runs never invoke the desktop UI.
 
 ## Generate the C sources
 
@@ -96,14 +126,19 @@ Requirements: a C11 compiler, CMake 3.20+, Ninja (or another CMake generator),
 pkg-config, SDL2, SDL2_ttf, OpenAL, and FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, `libswscale`). The FFmpeg build must
 include the Indeo 3 decoder for the original startup movies.
+The default SDL build also includes bgfx; its build helper prepares the pinned
+dependencies and host shader compiler. Linux native Wayland presentation
+requires the Wayland EGL development library.
 
 ```sh
-cmake -S . -B build/linux/release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+tools/build-bgfx.sh build/linux/release \
   -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
-cmake --build build/linux/release --parallel 2
 build/linux/release/gex_recomp --check
 build/linux/release/gex_recomp
 ```
+
+For a build without bgfx, configure directly with
+`-DGEX_ENABLE_BGFX_RENDERER=OFF`; this also avoids its dependency setup.
 
 CMake applies the checked-in fixes in `patches/` to the toolchain's portable
 runtime. Application is idempotent and fails on conflicting source changes.
@@ -126,8 +161,8 @@ Shared project sources under `src/` use C11, the guest compatibility contracts,
 and the interfaces below. Linux/POSIX primitives live under `src/platform/linux/`,
 Windows primitives under `src/platform/windows/`, and shared SDL/FFmpeg services
 under `src/platform/desktop/`. `src/platform/hle/` holds shared guest-memory
-adapters. The Linux directory also retains the existing macOS POSIX branches;
-that unvalidated target has not acquired a separate backend.
+adapters. The Linux directory also retains the validated macOS POSIX branches;
+macOS uses these shared implementations rather than a separate backend.
 Executable identity checking uses portable streaming SHA-256, with no crypto
 library or movie-decoder dependency.
 
@@ -214,7 +249,7 @@ No wildcard adds new upstream HLE implementations to a backend.
 
 **Remaining target porting work:** implement the backend interfaces and a manifest
 for the target; no guest compatibility source-group rewrite is required for host
-operations. Linux and the MinGW executable under Wine have been exercised. The desktop sources
+operations. Linux, macOS ARM64, macOS x86-64 through Rosetta and the MinGW executable under Wine have been exercised. The desktop sources
 are not a WebAssembly backend; no browser backend is supplied. The Dreamcast
 manifest reuses the same guest compatibility sources with a different memory
 backend and compact stack/table limits. Desktop defaults remain a 4 GiB virtual
@@ -362,7 +397,10 @@ resolution or replace packet rasterization with a hardware implementation.
 The generated display-list entry also calls `gex_graphics_begin_frame`.
 The original level-name/loading scene starts each legacy active picture on black:
 its masked static-background tiles otherwise leave black texels untouched,
-retaining fragments of earlier Gex animation poses. Other scenes keep their
+retaining fragments of earlier Gex animation poses. The compatibility target's
+CPU history is reset to that same black picture before drawing: stale exported
+history must not cause later synchronization to erase newly drawn tiles.
+Other scenes keep their
 existing legacy framebuffer contents for fades and incremental drawing.
 Custom world targets start each submitted scene on black as well: background
 art need not cover the enlarged area, and masked scenery must not retain old
@@ -539,7 +577,7 @@ feedback remains a distinct issue to validate.
 | HUD | `gex_graphics_hud_begin/end`; `HUD_DRAWS` in `tools/graphics_rewrite.py` | Anchors, packet-range tags, whole-number pixel replication and original sampling/animation. Queueing untagged geometry before these ranges are classified loses the layout metadata. |
 | Display/device lifecycle | Replacements `0x00401000/0x004010A0/0x004010E0/0x00401100`; `gex_graphics_set_render_size/shutdown`; `gex_renderer_init/resize/shutdown` | Native resource allocation/reconfiguration and guest mode/format return values. Resize failure must retain the old configuration; no live viewport-resize API is presently exposed. |
 | Dreamcast GPU ownership and selection | `src/platform/dreamcast/renderer.c`, `packet_gpu.c`; `cmake/platforms/dreamcast.cmake` | PVR owns packet targets and GPU scanout through `src/packet_gpu.h`; the store-queue presenter is software-only. Native GPU pictures have no CPU pixel/history storage and forbid readback. |
-| Movies and direct RGB565/GDI frames | `src/movie.c`: `gex_movie_pump`; `gex_renderer_frame/commit`; `hle_gdi_window_surface` | Keep the RGB565 RAM-image path for desktop/software and movie ownership gate `0x451040`. PVR uploads native decoder output and aspect-fits/presents on the GPU. The current Dreamcast decoder remains unsupported. |
+| Movies and direct RGB565/GDI frames | `src/movie.c`: `gex_movie_pump`; `gex_renderer_frame/commit`; `hle_gdi_window_surface` | Keep the RGB565 RAM-image path for desktop/software and movie ownership gate `0x451040`. PVR uploads native decoder output through its staging texture and GPU aspect-fit composition; it does not overwrite live RTT textures from the CPU. |
 | Observers/screenshots | `gex_renderer_observe`, commit sequence in `src/renderer.c`; `observe_frame/monitor` in `src/main.c` | Supply the actual CPU image for desktop/software, or `pixels = NULL` with a presentation sequence for GPU-owned PVR. Never label stale RAM as displayed pixels. PVR refuses CPU screenshots and pixel-based gameplay verification. |
 | Submission synchronization | Shared guest-machine lock; renderer backend callback contract | Snapshot packet/state/texture versions before returning to guest code. GPU lifetime can extend beyond the lock; fence before reusing command buffers, textures or targets. Desktop GPU APIs remain owner-thread-affine even though Dreamcast VRAM writes need no desktop context. |
 
@@ -659,9 +697,10 @@ The following opt-in implementation follows these researched boundaries.
 
 One desktop executable includes both packet backends; use
 `--renderer software` or `--renderer opengl` to select at launch.
-`--hardware-renderer` remains an alias for `--renderer opengl`.
+`--hardware-renderer` selects bgfx when included, otherwise OpenGL (or GLdc
+when included). Dreamcast continues to select PVR.
 OpenGL enables exclusive packet rendering on the SDL desktop
-hosts (Linux and MinGW Windows). Software is the default when included.
+hosts (Linux and MinGW Windows). Without bgfx, software is the default when included.
 An OpenGL-only build selects OpenGL by default; runtime initialization failures
 never silently fall back to software.
 OpenGL 4.3 or newer with compute shaders and double-precision shader arithmetic
@@ -677,17 +716,18 @@ For example, reconfigure the same build directory:
 ```sh
 # Software-only: do not compile the packet OpenGL implementation or shaders.
 cmake -S . -B build/linux/release -DGEX_ENABLE_SOFTWARE_RENDERER=ON \
-  -DGEX_ENABLE_OPENGL_RENDERER=OFF
+  -DGEX_ENABLE_OPENGL_RENDERER=OFF -DGEX_ENABLE_BGFX_RENDERER=OFF
 # OpenGL-only: omit CPU packet palette/texel/blending loops.
 cmake -S . -B build/linux/release -DGEX_ENABLE_SOFTWARE_RENDERER=OFF \
-  -DGEX_ENABLE_OPENGL_RENDERER=ON
-# Restore the ordinary dual-backend executable.
+  -DGEX_ENABLE_OPENGL_RENDERER=ON -DGEX_ENABLE_BGFX_RENDERER=OFF
+# Restore the software/OpenGL dual-backend executable.
 cmake -S . -B build/linux/release -DGEX_ENABLE_SOFTWARE_RENDERER=ON \
   -DGEX_ENABLE_OPENGL_RENDERER=ON
 cmake --build build/linux/release --parallel 3
 ```
 
-Disabling both is a configure error. `--help` lists the included backends;
+Disabling every renderer is a configure error. `--help` lists the included backends
+and default;
 selecting an excluded one is a launcher error before game initialization.
 Shared packet coverage, upload/readback, movie, pause and framebuffer helpers
 remain compiled. The lifted original renderer remains intact, though the
@@ -747,6 +787,127 @@ GPU validation.
 Dreamcast has a separate native PVR packet backend described below. Its blending
 and readback deliberately differ from exact integer/bit-15 conformance.
 
+### Default bgfx backend
+
+`GEX_ENABLE_BGFX_RENDERER` defaults to `ON` for SDL desktop and Android builds.
+When included, bgfx is the default even if software rendering is also built.
+Explicit `--renderer` choices still override it; builds excluding bgfx retain
+their other backends, and Dreamcast's PVR default is unchanged.
+bgfx chooses its API using its platform preferences and device availability,
+not the newest API version. The usual choices are Vulkan on Linux, Direct3D 11
+on Windows and Metal on macOS. The selected API is logged, and there is no
+software or Noop fallback. Current upstream bgfx documents macOS 13 or newer;
+the toolchain's older deployment target alone does not establish compatibility
+with older macOS releases.
+
+Prepare the pinned, unmodified bgfx.cmake dependency and its host shader
+compiler, then build the Linux executable:
+
+```sh
+tools/build-bgfx.sh
+build/linux/bgfx/gex_recomp
+```
+
+The script pins bgfx.cmake to
+`1af3832b87ad0588c05f1f0bd7ee17a7b14d2315`; that revision pins bgfx, bx and
+bimg. Dependencies and host tools stay in ignored `.deps/` directories.
+Linux window presentation supports both X11 and native Wayland through SDL's
+window/display handles and bgfx's public native-handle type. The game build
+enables C++ only for bgfx's implementation and uses its public
+C99 API. No bgfx, bx or bimg patches are required. The shader compiler runs on
+the build host and produces embedded SPIR-V, Metal, GLSL 4.30 and ESSL 3.10
+shaders. Windows targets also include DXBC Shader Model 5 and DXIL Shader
+Model 6. Cross builds must use a host-native `GEX_BGFX_SHADERC`, not a target
+executable. The official bgfx.cmake user-script hook enables the bundled
+D3D4Linux shader compiler support without changing upstream files. On Linux,
+DXBC compilation requires Wine and runs silently in disposable prefixes,
+using bgfx's bundled native D3DCompiler DLL rather than Wine's incomplete
+replacement. DXIL compilation uses bgfx's bundled native Linux DXC.
+`GEX_BGFX_CMAKE_DIR` selects the dependency checkout, and `BX_DIR`, `BIMG_DIR`
+and `BGFX_DIR` can select existing source trees.
+
+Set `GEX_BGFX_API` to `auto` (the default), `vulkan`, `metal`, `opengl`,
+`opengles`, `direct3d11` or `direct3d12` to select an API. Explicit choices
+disable API fallback and fail if unavailable; they never run another renderer
+and report success. Direct3D profiles are included for Windows targets.
+The compute pipeline needs OpenGL 4.3, OpenGL ES 3.1 or Direct3D 11/12;
+Direct3D 9 and macOS's OpenGL 4.1 cannot run it.
+
+Upstream bgfx does not allow desktop OpenGL and OpenGL ES in the same library.
+The default `GEX_BGFX_GL_FLAVOUR=desktop` builds OpenGL; select `es` in a
+separate build directory for OpenGL ES. These are supported bgfx compile-time
+options, not dependency patches:
+
+```sh
+tools/build-bgfx.sh build/linux/bgfx-es -DGEX_BGFX_GL_FLAVOUR=es
+GEX_BGFX_API=opengles build/linux/bgfx-es/gex_recomp --renderer bgfx
+```
+
+All GPU resource creation, shader execution, synchronisation, readback and
+presentation are performed through bgfx. SDL supplies only a window, its
+native handle and input/events. There are no direct Vulkan, Metal or OpenGL
+calls, native-device overrides or bgfx internal API dependencies in the new
+backend. Window integration currently handles X11, Cocoa and Windows; native
+Wayland window handles are rejected explicitly. Presentation uses nearest
+sampling and black borders; SDL scaling filters and CPU popup-menu overlays
+are not available with this external GPU presenter.
+
+Coverage preparation preserves double-precision CPU interpolation and supplies
+integer texel coordinates to portable compute shaders. The GPU samples packed
+4/8-bit and direct-colour textures, performs palette lookup/modulation and
+implements the original zero masking and conditional integer half-blending.
+Immutable material and coverage buffers preserve ordering across bgfx's
+deferred submissions. Each compute invocation owns one destination pixel and
+walks its ordered packet chain, including overlaps and conditional blending.
+Batches split at target/material-snapshot changes, readbacks/uploads, and
+bounded coverage/material/overdraw limits; dense overlap cannot create an
+unbounded shader loop. Page and palette byte comparisons validate the immutable
+atlas snapshot without scanning its entire megabyte for every sprite.
+Double-precision coverage preparation runs on the calling thread under the
+shared serialization lock; only actual API work crosses to the dedicated bgfx
+worker. Guest worker migration never migrates the graphics API context.
+
+Picture compatibility operations still
+use bgfx readback and RAM mirrors, and presentation uploads the resulting
+RGB565 frame through bgfx. Ordered batching removes per-sprite dispatch/barrier
+and thread-handoff costs, but this is not a zero-copy replacement.
+The earlier 854x480 Vulkan gameplay smoke check did not pass: frame
+delivery is substantially slower than software, and automated menu navigation
+returned to the world map. Packet comparisons at that size do pass; the
+Android performance measurements below use the default internal resolution,
+not an acceptance claim for higher resolutions. Keep the existing backends
+available.
+Movies use the same presentation path. Headless runs create no
+window and render presentation into a real bgfx offscreen target, rather than
+substituting bgfx's Noop renderer.
+
+```sh
+ctest --test-dir build/linux/bgfx --output-on-failure -R 'bgfx'
+```
+
+The differential fixture checks 2592 individually resolved packets plus 7360
+batched packets at four resolutions,
+palette/atlas changes, clipping, blending, thread migration, copy/pause and
+partial CPU edits against the software reference. Batched cases cross coverage,
+material and per-pixel overlap limits, mutate palette/modulation data and
+switch targets without intermediate readbacks. The presentation fixture
+reads the actual offscreen GPU target and checks RGB565 conversion, orientation,
+odd pitches and resizing. The guest fixture exercises picture/CLUT feedback
+and HUD submission, including repeated level-name clears followed by new draws
+and picture synchronization. Device/shader errors fail these tests rather than
+skip them.
+API-specific tests force the selected API and run both the packet differential
+and the real presentation readback fixture. OpenGL and OpenGL ES are exercised
+headlessly through bgfx's EGL context. Windows Direct3D 11 and 12 fixtures have
+also run under isolated Wine: Direct3D 11 uses unmodified DXVK 3.1.1 because the
+built-in Wine renderer lacks the required R32U image capabilities; Direct3D 12
+uses Wine's vkd3d path. These checks do not replace testing on native Windows.
+The ARM64 macOS build has also passed these real Metal fixtures on an M1,
+including all 2592 packet cases and the presentation readback checks. Its
+headless game reaches the first graveyard, completes both startup movies and
+exits normally through the same bgfx backend. Visible Cocoa presentation and
+physical controller/audio-device behaviour have not been tested on the Mac.
+
 ### Framebuffer backend contract
 
 `renderer.h` has no SDL, Win32, DirectDraw, or guest-register types.
@@ -767,7 +928,8 @@ example:
 
 ```sh
 cmake -S . -B build/linux/memory -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DGEX_RENDERER_BACKEND_SOURCE="$PWD/src/renderer_headless.c"
+  -DGEX_RENDERER_BACKEND_SOURCE="$PWD/src/renderer_headless.c" \
+  -DGEX_ENABLE_BGFX_RENDERER=OFF
 cmake --build build/linux/memory --parallel 2
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
   build/linux/memory/gex_recomp --headless --skip-movies --autoplay \
@@ -839,21 +1001,485 @@ normally `$XDG_DATA_HOME/gex-recomp/Gex/settings.reg`, or
 `%APPDATA%\gex-recomp\Gex\settings.reg`. The file contains the game's
 registry-backed options, volume, controls, and window preferences, not gameplay
 progress. Writes use a temporary file and atomic replacement.
+On macOS, an explicit `XDG_DATA_HOME` overrides SDL's native preference location
+with the same layout as Linux, so automated tests do not touch normal settings.
 Unreadable or malformed existing settings stop startup with a diagnostic;
 write failures are reported and returned to the guest. The Windows native32
 host continues to use the real Windows registry.
 
-The original game includes password-based progress restoration through the title
-screen's **Password** entry. The lifted encoder and decoder retain that mechanism;
-this port does not add disk save slots, autosaves, or arbitrary save states.
-The complete password acquisition and restore workflow has not yet been checked
-end to end.
+### Three-deck password saves
 
-## Other desktop targets
+The title dispatcher can open the modal menu from the guest worker rather than
+the SDL owner thread. Its wait releases the guest-machine lock through
+`hle_block_begin/end`, preserving the worker's registers while the main thread
+presents frames and polls input and guest audio timers run. Menu state and
+framebuffer updates remain protected by the machine lock.
 
-For macOS, install the same libraries (for example via Homebrew's `sdl2`,
-`sdl2_ttf`, `ffmpeg`, `pkg-config`, `cmake`, and `ninja`) and use the Linux
-generation/build commands. This path still needs validation on a Mac.
+Linux, macOS, MinGW Windows and Android require selecting one of three **Video
+Decks** before starting a game. The title **Options** entry opens the separate
+settings screen described below. PLAY restores an occupied deck through the retail initializer
+and decoder, or starts a fresh game in an empty deck. An occupied deck must be
+erased before starting fresh there. The selected deck is the session's autosave
+target; no other slot is chosen implicitly or overwritten by a normal New Game.
+Opening the deck menu fades the last title frame to black over 250 ms, then
+fades the cabinet in over 250 ms. Navigation activates only once the cabinet
+is fully visible. Back and EXIT fade the cabinet out and the original title
+frame back in with the same timing. Window-close requests skip the return
+animation and remain responsive during either transition. The retained title
+frame stays on-device with GPU-owned renderers.
+
+The cabinet, three rows, PLAY/ERASE/COPY controls, indicator lamps and EXIT
+selection are extracted from the supplied save-menu screenshots. The extracted
+pack is compiled into the binary/APK, not loaded from the retail installation.
+LCD counts show completed normal levels encoded by the original password.
+`tools/save_menu_assets.py` reproduces extraction; see `assets/README.md`.
+Keyboard/controller directions navigate, X/A/Start confirms, C/B/Escape/Back
+cancels. Mouse/touch works on the cabinet controls. Destructive ERASE, COPY
+overwrites and manual-password replacement require explicit confirmation;
+CANCEL is initially selected. V/Y/shoulder opens the original manual password
+entry for that deck. A valid manually entered password is saved there too.
+
+`src/save_store.c` owns the portable three-slot record independently of the
+menu and writable-directory selection. `passwords.sav` lives next to the user's
+`settings.reg`, including Android's private files directory. Version 1 is 39
+bytes: eight-byte `GEXDECK1` magic, three nine-byte NUL-terminated password
+records (all zero for empty), and a little-endian CRC32 of the preceding 35
+bytes. Exact length, version, checksum, alphabet, password checksum and retail
+table-index bounds are checked before loading. Unreadable/corrupt files stop
+startup with a diagnostic and are not overwritten. Writes use the existing
+same-directory atomic replacement helper; failed commits leave both the old
+disk file and in-memory decks intact. An autosave failure is logged and shown
+in the menu, can be acknowledged without ending gameplay, and is retryable.
+
+`tools/save_rewrite.py` inserts address-scoped hooks into the reproducible lift.
+The title dispatcher at `0x40E1CD` selects a deck for New Game and routes Options
+to the native settings screen. Manual password entry remains accessible from
+the deck menu before the retail reset/restore flow. Cancellation returns without initializing
+a new game. The password-TV encoder call at `0x42AAF1` captures the authentic
+earned password; the validated manual-entry path at `0x40E971` also persists
+its password. Loading is not a guessed snapshot of progress flags: the selected
+code is passed to the existing `0x429940` initializer / `0x429390` decoder.
+The menu suspends guest execution, uses the portable presentation boundary,
+and consumes input until held confirmation buttons have been released.
+
+### Native Options
+
+SDL desktop and Android share `src/options_menu.c` and the existing safe modal
+presentation/input loop, including the same 250 ms fade-out and fade-in through
+black when entering Options and returning to the title. Guest frames are shaded
+before presentation so the animated background and text do not flash at full
+brightness during a fade. Closing the game from Options saves pending settings,
+releases the menu resources, and exits directly without resuming the title scene
+or its return fade. Back and the Options Exit entry still return to the title.
+The title-initialization hook replaces only the
+Password string with Options; the original widget, font, positions, animations,
+Start and Exit remain intact. The original password initializer/decoder is
+still used for manual entry from the three-deck menu.
+
+Options uses the original title's animated TV-static object and its green
+sprite font, drawn through the original text routine (`0x40BC70`) and the
+game's scaled CEL renderer (`0x4432C0`). A
+guest-stack copy preserves the title widget and its font model; the original
+palette, 13-pixel character advance, reference row spacing and Controls heading
+are retained. The Options title uses the title font at full size; the remaining
+text uses 75% glyph size, a compact substitute for the retail Options screen's
+different font. The size is
+independent of the guest pause state. Only the
+selected row wobbles, using the main menu's actual selection code and phase
+step. The three text-only sprite-call hooks select
+scaled CELs only while drawing Options; ordinary title drawing is unchanged.
+The native static backdrop fills the viewport without an Options border or
+CPU-framebuffer fit. Pointer input follows the native active-picture transform.
+The original packet upload/draw/present path handles software and hardware
+rendering. There is no Options screenshot pack, captured glyph atlas or
+CPU-resized font. The three-deck menu keeps its separate artwork and framebuffer
+presentation path.
+
+The selection marker is the original HUD's filled health hand (animation 2,
+frame 1), read from the data chunk in `LEV/GEX125.LEV`. A private single-frame
+model relocates only that CEL's texture and palette; no level initialization or
+title-model replacement is performed. The original sprite and texture-cache
+routines draw it and release its resources when Options closes.
+
+A window-close sentinel ends the modal and records a one-shot close request.
+The quit prelude at `0x4052D1` consumes it to skip the retail pause handshake
+before the normal quit confirmation and shutdown. Without that scoped bypass,
+closing Options briefly re-enters the title's pause renderer. Ordinary pause,
+quit outside a modal, and modal Exit/back retain their original paths.
+
+Each entry defines its kind, label, value, position and platform mask. The
+filtered visible-entry list is shared by drawing, navigation and hit testing.
+`GEX_OPTIONS_WINDOWS`, `LINUX`, `MACOS`, `ANDROID` and `DREAMCAST` flags may be
+combined for platform-specific entries; `GEX_OPTIONS_ALL` exposes common ones.
+All current entries are common. The Dreamcast flag reserves that extension
+point but does not enable this menu on the current Dreamcast host.
+
+Sound/Voice/Music call the original volume setters and update an already-playing
+music buffer's attenuation. Music Test requests actual installed music IDs and
+restores title music on exit without restarting music on an ordinary visit.
+Controls cycle the four existing packed
+action-key descriptors, swapping occupied bindings; the host's corresponding
+gamepad-to-key mappings continue to apply. This is not independent arbitrary
+keyboard/gamepad capture. Tongue Lash and Hurl intentionally share one action.
+Modal confirmation/back/navigation remain fixed. Exit/back flushes dirty
+settings using the original registry names and DWORD formats, so the retail
+loader restores them on subsequent runs. A failed flush leaves the menu open
+with an error and allows retry.
+
+The `password-decks` test uses the real lifted encoder, writes a checkpoint,
+restarts in a separate process, and restores through the retail initializer.
+It checks three-slot isolation, copy/erase and cancel/overwrite behavior,
+manual entry routing, repeat/held input, touch EXIT, malformed/truncated and
+CRC-valid invalid records, and transactional replacement failure/retry.
+The threaded case requires another machine-owning thread to select a deck and
+checks that the waiting worker's guest registers survive the handoff.
+Additional cases reject checksum-valid passwords with out-of-range retail
+fields. This is a controlled progress fixture, not a full playthrough to earn
+every password TV. Arbitrary position/health save states are not implemented.
+Options cases check audio state, music-track restoration, binding swaps through
+the retail input poller, separate-process registry reload, persistence failure
+and retry, fixed confirmation, pointer Exit and platform-mask matching.
+
+The legacy MSVC native32 host and Dreamcast retain their original menu/password
+flow. The new hooks are compile-gated out on both; Dreamcast currently has no
+VMU persistence. Its future backend can reuse the three-slot password format
+without coupling VMU storage to SDL or cabinet rendering.
+
+## Other targets
+
+### Android
+
+The development APK uses the same SDL2/POSIX runtime and unmodified bgfx as the
+desktop port. Every APK bundles **both Vulkan and OpenGL ES 3.1**, including
+SPIR-V and ESSL compute/presentation shaders. The platform window comes from
+SDL; all graphics device, shader, resource and presentation operations remain
+inside bgfx. There are no native Vulkan/EGL/GLES calls in the game and no bgfx
+patches. The original desktop-only OpenGL 4.3 backend is excluded.
+
+Packet compute views use a private 1x1 offscreen framebuffer. bgfx binds a
+view's framebuffer even for compute-only work: leaving the default binding
+would acquire and present an undrawn native backbuffer during packet/readback
+flushes. Mobile drivers can discard its contents, causing flicker that software
+emulator graphics may hide. Every flush restores the offscreen binding,
+including after swapchain resets; only completed image presentations use the
+native backbuffer. Movie playback and packet ordering are unchanged.
+Packet batches retain ordered per-pixel work rather than creating a compute
+dispatch and worker-thread round trip for every sprite. Atlas validation checks
+the current texture page and palette, including wrapped ranges, instead of
+comparing the entire atlas on each draw. All device submissions still run on
+the bgfx API worker.
+
+Android 8.0/API 26 or newer and a 64-bit ABI are required. ARM64 is the default;
+x86-64 is also available for emulator testing. ES 3.1 compute and R32U image
+read/write are required; Vulkan additionally needs a compatible device driver.
+Both APIs are compiled in, but this does not add unsupported GPU capabilities.
+No on-screen controls, virtual joystick, touch-to-mouse input or soft keyboard
+are added. Connect a physical controller or keyboard; Android Back maps to
+Escape. Landscape orientation and letterboxing preserve the game's aspect.
+
+Generate the guest sources first. On Linux, install CMake, Ninja, pkg-config,
+Make, curl, tar, Python 3.10+ and a JDK. The tested SDK layout uses platform
+`android-36`, build-tools `36.1.0` and NDK `27.2.12479018`:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+# Optional when the NDK is installed elsewhere:
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+tools/build-android.sh
+GEX_ANDROID_ABI=x86_64 tools/build-android.sh
+```
+
+The helper verifies the same pinned SDL2, SDL_ttf/FreeType, OpenAL Soft and
+FFmpeg archives as the macOS build. Target sources, prefixes and build caches
+stay under `.deps/android-*`; host shaderc is shared with the desktop builds.
+OpenAL uses OpenSL ES; minimal shared FFmpeg libraries decode AVI/Indeo3/PCM.
+APK packaging uses the SDK's aapt2, D8, zipalign and apksigner directly, with
+matching upstream SDL Java sources and the SDK's lambda stubs. Gradle and
+third-party Java dependencies are not needed.
+
+Outputs are `build/android/arm64-v8a/gex-recomp-debug.apk` and
+`build/android/x86_64/gex-recomp-debug.apk`. An optional first helper argument
+overrides the build directory; subsequent arguments go to game CMake.
+Each is a separate ABI package containing both renderers, native dependencies
+and licence notices, but **no original game files**. ELF load segments and APK
+alignment support 16 KiB pages. These are development/debuggable APKs, signed
+with a local debug key in ignored `.deps/`, not store-ready releases.
+
+Install on your explicitly selected adb device, then open the import launcher:
+
+```sh
+adb -s DEVICE install -r build/android/arm64-v8a/gex-recomp-debug.apk
+adb -s DEVICE shell am start -n org.gexrecomp.app/.LauncherActivity
+```
+
+When private `files/Gex` is missing, the launcher opens Android's standard
+directory picker after the same introductory popup as desktop setup. Choose your own
+GOG installation folder. The importer inventories the selected document tree
+and reads every required file through the content resolver to verify its
+size and SHA-256 before copying anything. It copies the entire folder through
+a unique staging directory, then verifies every required copied file again before
+making it launchable. This uses actual stream lengths, not document-provider
+size metadata. Existing-install startup retains lightweight layout/executable
+validation rather than rehashing all 200 MB on the UI thread.
+It does not alter source files, overwrite an existing
+destination, or require broad storage permissions. Invalid selections show
+an error with a **Choose folder** retry; cancellation closes setup. Failed
+imports clean up their own staging folder. Headless/validation intents never
+open setup dialogs, and directly launching `GexActivity` without data routes
+ordinary users through setup rather than leaving them at a dead end.
+On modern Android, directly pushing shell-owned folders under
+`Android/data/` can leave them unreadable by the app.
+
+For developer deployment without the picker, stream the files as the app's
+own UID instead (available because this APK is debuggable):
+
+```sh
+adb -s DEVICE shell run-as org.gexrecomp.app mkdir -p files/Gex
+tar -C Gex -cf - . | adb -s DEVICE exec-in run-as org.gexrecomp.app \
+    tar -xf - -C files/Gex
+```
+
+Settings live in private app storage, separately from the imported assets;
+native diagnostics are in private `files/last-run.log`. No broad storage
+permissions are required. Automatic API selection follows bgfx preferences.
+For explicit selection, stop the old process before starting the chosen API:
+
+```sh
+adb -s DEVICE shell am force-stop org.gexrecomp.app
+adb -s DEVICE shell am start -n org.gexrecomp.app/.GexActivity --es api vulkan
+# Alternatively: --es api opengles
+adb -s DEVICE shell run-as org.gexrecomp.app cat files/last-run.log
+```
+
+An explicit API disables fallback; the log must identify Vulkan or OpenGL ES,
+not merely show that the APK loaded. For automated checks, use an isolated
+headless emulator supporting **GLES 3.1 and Vulkan**. For example, emulator
+`-no-window -no-audio -gpu swangle -feature Vulkan` provides ANGLE/SwiftShader;
+plain `-gpu swiftshader` may expose only ES 3.0. Select its serial explicitly:
+
+```sh
+python3 tools/test-android.py --serial emulator-5580 \
+    --build build/android/x86_64 --data Gex --full-movies --native-display 0
+```
+
+The runner installs the APK, copies your data (or preserves an existing private
+installation with `--reuse-data` instead of `--data`), checks guest memory and exact
+GPU presentation/2592 ordered packets on **both APIs in the same library**,
+and launches the actual SDL activity/game headlessly with dummy audio and
+isolated test settings. Its 60-second gameplay budget accommodates software
+emulator graphics without reducing the player movement or changed-frame
+requirements. The native audio fixture also checks Android lifecycle
+pause/resume through the silent OpenAL device.
+Full checks also require both movie completions and
+normal guest exit on each API. Temporary remote fixtures/settings are removed
+and the app is stopped afterward.
+
+`--native-display ID` additionally exercises the real SDL surface on that Android
+display, rather than a dummy video driver. On a windowless emulator this still
+opens no host window. It compares the app SurfaceView's submitted buffers with
+completed game images: intermediate packet flushes must not swap the screen.
+This option resets/enables/disables SurfaceFlinger timing statistics, so use a
+dedicated test device/emulator. It does not replace actual scanout pixel
+inspection. Native-window diagnostics use the `validation=true` intent extra
+for isolated settings and null audio without forcing dummy video; `headless=true`
+continues to select offscreen rendering. Both test modes keep their activity's
+window awake without changing system power settings; unlock a physical device
+before starting. Ordinary launches do not set this flag.
+
+All 16 runner checks passed with an Android 15/API 35 x86-64 AOSP image using
+ANGLE/SwiftShader. Both forced APIs pass the exact-pixel presentation and
+packet/presentation isolation fixtures, 2592-packet differential fixtures,
+first-graveyard movement verification, both complete intro movies and
+`ExitProcess(0)`. The final batched build's native-window checks measured 345
+displayed buffers for 348 completed Vulkan images and 346 for 348 OpenGL ES
+images; before compute-view
+isolation, Vulkan submitted 914 buffers for 460 completed images.
+The real Android directory
+picker/importer was also exercised: all 680 copied files matched the original
+SHA-256 hashes, staging was promoted successfully, and the imported executable
+passed native boot validation. These emulator checks used no visible host
+windows or audible audio.
+
+On a physical ARM64 Pixel 9a running Android 17, silent main-screen gameplay
+captures reproduced severe OpenGL ES flicker before compute-view isolation:
+packet flushes swapped incomplete backbuffers, rather than an ARM CPU lifting
+error. After the fix, Vulkan and OpenGL ES captures show stable graveyard
+gameplay. The labeled OpenGL ES comparison contains near-black frames only on
+the before side. This physical screen inspection was explicitly authorized;
+all 14 headless physical-device checks also passed, including both APIs'
+packet/presentation isolation, first-level movement, complete startup movies
+and normal guest exit. The runner preserved the existing imported assets and
+ordinary settings. Automated fixtures remain headless and silent. These checks
+do not establish physical audio fidelity, controller behavior, other devices or
+a full playthrough.
+
+A subsequent level-name regression showed that clearing the legacy picture
+without clearing its compatibility history caused synchronization to erase
+newly rendered lettering. The guest/GPU fixture now covers repeated clears and
+interleaved draws/exports; physical Vulkan and OpenGL ES captures show intact
+level-name artwork after the history fix. Both forced APIs also pass this
+guest/GPU integration fixture on the physical phone, in addition to the 14
+runner checks.
+
+On the same Pixel, the graveyard autoplay movement segment was profiled with
+silent native screen recording enabled, at the default internal resolution:
+
+| API | Before batching/page validation | After | Compute dispatches per game image |
+| --- | --- | --- | --- |
+| Vulkan | 150.0 ms median (6.7 fps) | 33.5 ms median (29.8 fps) | 213 to 1 |
+| OpenGL ES | 118.5 ms median (8.4 fps) | 34.2 ms median (29.2 fps) | 196 to 1 |
+
+These are median presentation intervals for that measured segment, not a
+minimum-framerate or full-game guarantee. Profiling builds use
+`-DGEX_PROFILE_RENDERER=ON` to log frame dispatch/upload/readback counts and
+per-operation times; the development APKs normally leave diagnostic logging off.
+Compatibility framebuffer readback remains one per image in this segment.
+
+### macOS (ARM64 and Intel)
+
+The verified path cross-compiles on Linux using project-local OSXCross and
+deploys separate ARM64 or x86-64 executables to a Mac. It requires macOS 13 or newer;
+the tested SDK is macOS 15.5 and the runtime is an M1 on macOS 15.7.7. The
+original compute OpenGL backend is not available on macOS; bgfx is the
+default and normally chooses Metal. Use `--renderer software` for CPU rendering.
+No native Metal calls, injected devices or bgfx patches are used.
+
+Generate the guest sources first, as above. Install Linux CMake, Ninja,
+pkg-config, Make, curl, tar and LLVM with its Mach-O `ld64.lld` linker. Prepare
+an OSXCross checkout under `.deps/osxcross` using an SDK obtained from
+your own Mac's Xcode or Command Line Tools. The tested OSXCross revision is
+`27d21e4977c9751d01199c7a226a6faf494c3dd9`; its build settings were
+`UNATTENDED=1 BUILD_FLAVOR=llvm ENABLE_ARCHS="arm64 x86_64" OSX_VERSION_MIN=11.0 JOBS=3`.
+The game and all bundled dependencies explicitly target macOS 13.0. Make
+`ld64.lld` available to the wrappers, for example through a symlink in
+`.deps/osxcross/target/bin`. Follow OSXCross's SDK packaging/build instructions;
+the SDK and compiler tools are private build inputs and must not be committed.
+
+The toolchain also needs Apple's Darwin compiler runtime. An SDK alone does
+not supply `__isPlatformVersionAtLeast`, used by SDL's availability checks.
+Copy `libclang_rt.osx.a` from the same trusted Mac into the local resource
+directory, and use the Linux compiler's matching builtin headers:
+
+```sh
+# Replace this SSH target with your own trusted Mac.
+mac=user@mac
+apple_resources=$(ssh "$mac" 'xcrun clang -print-resource-dir')
+resources="$PWD/.deps/osxcross/target/lib/clang/runtime"
+mkdir -p "$resources/lib/darwin"
+scp "$mac:$apple_resources/lib/darwin/libclang_rt.osx.a" "$resources/lib/darwin/"
+# Use the host Clang version selected by your OSXCross wrappers.
+ln -s "$(clang -print-resource-dir)/include" "$resources/include"
+```
+
+`cmake/toolchains/macos.cmake` discovers the installed wrapper for `GEX_MACOS_ARCH` and
+SDK, enforces target-only library/header/pkg-config discovery, and uses that
+resource directory. Set `GEX_OSXCROSS_TARGET` or `CMAKE_OSX_SYSROOT` explicitly
+when the OSXCross checkout contains multiple versions.
+`GEX_MACOS_ARCH` accepts `arm64` (the default) or `x86_64`; mismatched cached
+target triples/architectures are rejected. The old `macos-arm64.cmake` remains
+a compatibility entry point defaulting to ARM64.
+
+```sh
+tools/build-macos.sh
+# Separate Intel executable and matching dylibs:
+GEX_MACOS_ARCH=x86_64 tools/build-macos.sh
+```
+
+The helper verifies pinned source archives and cross-builds SDL 2.32.10,
+SDL_ttf 2.24.0 with its vendored FreeType, OpenAL Soft 1.24.3 and minimal FFmpeg
+8.0.1 into `.deps/macos-arm64` or `.deps/macos-x86_64`. Dependency build trees
+are separate under `.deps/macos-build/<architecture>`; downloaded archives and
+unmodified sources are shared. FFmpeg includes AVI, Indeo 3, PCM U8 and
+swscale; optional x86 assembly is disabled so NASM is not required.
+bgfx and its shader compiler use the same unmodified pinned
+dependencies as the optional Linux renderer; shader compilation stays on the
+Linux host. No Homebrew libraries or global/Mac package installation is needed.
+Interrupted downloads use `.part` files and FFmpeg is marked installed only
+after a successful install.
+
+Outputs are in `build/macos/arm64-bgfx` or `build/macos/x86_64-bgfx`; an optional first argument selects
+another output directory and subsequent arguments are passed to game CMake.
+Do not reuse one architecture's build directory for the other. These are
+separate thin Mach-O builds, not a combined Universal 2 package.
+The helper produces **Gex Recompiled.app**, containing the executable in
+`Contents/MacOS`, dylibs in `Contents/Frameworks`, and licences in
+`Contents/Resources/licenses`. No retail executable or game assets are copied
+by the build. Finder launch uses the bundle's own
+`Contents/Resources/Gex`, independent of the current working directory.
+When missing, an AppKit `NSOpenPanel` selects the original installation for a
+validated copy into that folder. Move the app to a writable location before
+importing; a read-only disk image or app-translocated location cannot accept
+the copy. Explicit `--data PATH` bypasses setup and uses that installation
+directly without copying it.
+
+The dylibs use `@rpath`; the executable searches
+`@executable_path/../Frameworks` and `@executable_path/lib`. The helper retains
+the bare `gex_recomp`, `lib/`, and `licenses/` outputs for command-line checks.
+No Linux paths or Homebrew installation are needed at runtime.
+`tools/package-macos.py` also creates `gex-recomp-macos.zip`, allowlisting only
+the app executable, runtime libraries, metadata and licences. Repackaging
+preserves any locally imported `Resources/Gex` but never includes it in the
+distributable archive.
+On the Mac, the development Mach-O binaries can be ad-hoc signed with:
+
+```sh
+for binary in ./gex_recomp ./lib/*.dylib; do
+  codesign --force --sign - "$binary"
+done
+./gex_recomp --data /path/to/Gex --check
+```
+
+This is a development `.app`, not a Developer ID signed/notarised distribution.
+Importing into a bundle changes its contents and would invalidate a sealed
+bundle signature; do not promise notarised distribution with this in-bundle
+storage policy. Signing individual development Mach-O binaries does not
+require disabling Gatekeeper or changing machine security settings. Do not
+redistribute an app after importing copyrighted game files into it.
+
+For automated checks, deploy the `gex_*_test` executables alongside `lib/` and
+sign them too. For example, from that directory on the Mac:
+
+```sh
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null \
+  GEX_BGFX_API=metal ./gex_bgfx_test
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null \
+  GEX_BGFX_API=metal ./gex_bgfx_present_test
+```
+
+The Mac validation exercises both automatic selection and explicitly forced
+Metal, guest allocation/file views with 16 KiB host pages, fonts, threads,
+input, movie decoding/lifecycle, settings isolation and launcher errors.
+Generator/patch checks run on the Linux build host. Headless software and
+Metal game runs both require `first-graveyard=PASS`; Metal additionally
+completes both full intro movies and reaches `ExitProcess(0)` before its smoke
+deadline. These checks do not prove visible-window presentation, audible
+CoreAudio output, a physical Mac controller, Intel Macs or a full playthrough.
+
+The Intel executable and every bundled dylib are verified to contain only an
+`x86_64` slice. Rosetta availability is checked with
+`arch -x86_64 /usr/sbin/sysctl -in sysctl.proc_translated` (expected `1`).
+On the M1, the Intel fixtures and game are then run through Rosetta, with
+native fixture/game launches explicitly prefixed by `arch -x86_64`.
+All 32 target checks pass, including automatic/forced Metal and the 2592-case
+packet comparison. Software and Metal both reach the first graveyard; Metal
+completes both full startup movies and exits through `ExitProcess(0)`.
+This validates the translated CPU build against the M1's
+Metal GPU, not an Intel or AMD GPU.
+
+For a headless Intel gameplay check on an Apple Silicon Mac, from its deployment:
+
+```sh
+settings=$(mktemp -d)
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null \
+  XDG_DATA_HOME="$settings" GEX_BGFX_API=metal \
+  arch -x86_64 ./gex_recomp --renderer bgfx --headless --skip-movies \
+    --autoplay --verify-gameplay --smoke-seconds 24
+# Require exit zero and first-graveyard=PASS.
+```
+
+Use a temporary settings directory for each automated run and remove it after
+collecting the result. The ordinary `lib/` layout and ad-hoc signing steps above
+apply to both builds; the Intel package never loads the ARM64 dependency prefix.
 
 ### MinGW-w64 and Wine
 
@@ -1003,8 +1629,9 @@ To check complete startup movie transitions, omit `--skip-movies` and
 ## Known limitations
 
 - Full-level progression, all enemy/collision behaviors, every audiovisual
-  effect, and save/password workflows have not been comprehensively checked.
-- The legacy `PropertySheetA` settings dialog reports that it is unsupported.
+  effect, and full-playthrough password acquisition have not been comprehensively checked.
+- The legacy `PropertySheetA` settings dialog reports that it is unsupported;
+  SDL desktop and Android use the separate native Options screen instead.
 - Message boxes currently print to stderr and use the upstream automatic
   response; an interactive desktop confirmation UI is not implemented.
 - Forced termination of a still-running guest thread reports
@@ -1029,16 +1656,27 @@ The interface streams one borrowed event at a time; the consumer releases it
 only after presenting a video frame or accepting all its audio samples.
 Audio is interleaved signed 16-bit PCM, mono/stereo, at most 4,096 frames per
 event (16 KiB for stereo). A pending event is retained under audio backpressure
-instead of decoding ahead into an unbounded queue. Video renders directly into
+instead of decoding ahead into an unbounded queue. Video targets
 a caller-owned, pitched RGB565 little-endian or BGRA32 surface; a Dreamcast
 decoder can use RGB565 without a mandatory 32-bit intermediate image. Decoder
 buffering, texture alignment, and DMA ownership remain backend responsibilities.
+The desktop FFmpeg backend converts into a reusable, aligned, padded AVFrame
+and copies only the requested row bytes into that surface. Swscale's SIMD
+stores may extend into padding; writing directly into the caller's fitted
+rectangle polluted the right-hand black border at non-aligned widths such as
+the default 298x224 movie picture inside a 320x224 viewport. Per-row guard tests
+cover both output formats and the default movie resize.
 Audio playback is separate from the decoder and guest API. Linux uses OpenAL
 voices, Windows HLE uses native DirectSound buffers (MSVC native32 already
 forwards DirectSound to Windows), and Dreamcast uses AICA PCM channels.
 The host audio implementation, not Gex's CPU code, performs mixing and rate
 conversion. OpenAL and modern Windows may implement those operations in software
 inside their audio systems; only Dreamcast is guaranteed hardware voice mixing.
+The original startup soundtracks are 8-bit PCM: 11,025 Hz stereo for GEX000
+and 22,050 Hz mono for GEX001. Decoding expands those samples to signed 16-bit
+without denoising or removing the source's DC bias. The native loopback test
+compares movie streaming against uninterrupted, single-buffer OpenAL playback
+at both rates, including repeated ring wraps.
 
 `src/platform/audio.c` owns synchronized voice copies, the service worker and
 four bounded 16,384-frame movie/WAV rings. Guest `Lock` still returns guest
@@ -1144,17 +1782,18 @@ and PCM16, unaligned source pointers, rounded partial updates, repeated wraps,
 large source offsets, non-looping silence and untouched destination guards,
 in addition to the existing long-window, cursor and playback checks.
 
-A future KallistiOS codec/container implementation can replace just the decoder
-source without pulling FFmpeg into that target:
+A custom codec/container implementation can replace just the decoder source
+without pulling FFmpeg into that target:
 
 ```sh
 cmake -S . -B build/linux/custom \
   -DGEX_MOVIE_DECODER_SOURCE=/absolute/path/to/movie_decoder_kos.c
 ```
 
-This selects a real implementation of **all** functions in `movie_decoder.h`;
-the current Dreamcast decoder only reads AVI metadata to support explicit
-movie skipping. FFmpeg discovery/linking is conditional on
+This selects a real implementation of **all** functions in `movie_decoder.h`.
+The Dreamcast default now uses the shared FFmpeg decoder with native disc-I/O
+and pixel-conversion hooks rather than the old metadata-only stub.
+FFmpeg discovery/linking is conditional on
 selecting the default source. With the default platform manifest the rest of the
 project remains a desktop host, not a KallistiOS implementation. The Dreamcast manifest supplies the runtime services described above,
 including rendering, audio, filesystem, clocks and memory. Keep the existing MCI/player behavior
@@ -1170,17 +1809,16 @@ with a `pkg-config` wrapper that rejects FFmpeg queries. The desktop decoder
 tests separately decode each original AVI twice: all 457 video frames and
 335,899 stereo audio frames in the first movie, and all 867 video frames and
 1,274,490 mono audio frames in the second, must survive rewind with identical
-decoded hashes. This proves the separation works
-on the host, not that Indeo 3 decoding is fast enough on SH-4.
-
-For Dreamcast, choose a codec and bounded buffers using measured SH-4 decode
-time, memory, and storage bandwidth. Offline conversion of the owner's
-original movies is an option, but no converted assets or converter are shipped,
-and this change does not claim Dreamcast playback is implemented.
+decoded hashes. Dreamcast-specific checks additionally compare complete
+RGB565/PCM hashes against the scalar host reference and exercise disc seeks,
+cache boundaries and EOF. Host synthetic-color tests compare the compact
+converter byte-for-byte against scalar FFmpeg, including BGRA32, extremes,
+random chroma, odd pitches and untouched padding.
 
 ## Dreamcast backend
 
-The experimental backend uses KallistiOS, not Wine, SDL, or FFmpeg. All
+The experimental backend uses KallistiOS, not Wine or SDL, with a minimal
+static FFmpeg build for the original AVI/Indeo 3 movies. All
 Dreamcast-specific implementations live in `src/platform/dreamcast/`; the
 launcher, game logic, software rasterizer, input mapping, MCI scheduling and
 guest compatibility groups remain shared. It builds native SH4 code and uses
@@ -1285,7 +1923,70 @@ automatically reload the disc. It never changes persistent Flycast settings.
 
 The locally built CDI contains copyrighted installation data: do not
 redistribute it. The disc mounts assets at `/cd/Gex`. Default launch arguments
-skip movies; no converted or replacement movie assets are supplied.
+play the original movies; `--skip-movies` remains an explicit option. No
+converted or replacement movie assets are supplied.
+
+### Original intro movies
+
+`tools/build-dreamcast.sh` first runs `tools/build-dreamcast-ffmpeg.sh`, which
+verifies and builds the pinned, unmodified FFmpeg 8.0.1 archive for SH4. Only
+AVI, Indeo 3 and PCM U8 are enabled; there are no programs, networking, threads,
+assembly optimizations or general-purpose scaler. The target installation is
+`.deps/dreamcast-ffmpeg`; its LGPL notice is copied to
+`build/dreamcast/licenses/FFmpeg.txt`.
+
+The shared decoder uses public FFmpeg custom AVIO with a 64 KiB, 32-byte-aligned
+sector cache. KOS needs both sector-aligned file offsets and aligned buffers
+for multi-sector DMA, including after arbitrary AVI seeks. Ordinary FFmpeg
+file reads made complete first/second-movie decoding take about 56/128 emulated
+seconds before pixel conversion; aligned read-ahead reduced those figures to
+about 8/19 seconds. The native converter preserves scalar FFmpeg's BT.601
+matrix, bilinear 4:1:0 chroma interpolation and RGB565 ordered dithering without
+linking `libswscale`. It supports the original 320x240 YUV410P frames as RGB565
+or BGRA32, not arbitrary video resizing or replacement pixel formats.
+
+PVR uploads RGB565 through its CPU-written staging texture, then composes and
+presents through the normal GPU path without readback. Direct CPU replacement
+of an RTT texture retained stale black GPU data under Flycast; full-size frames
+must use the staging path too. The original shared
+MCI scheduling, pause/stop/rewind and AICA PCM streaming remain in use; no
+video frames or audio samples are deliberately dropped to meet deadlines.
+
+For a complete headless check:
+
+```sh
+FLYCAST=/absolute/path/to/compatible/headless/flycast \
+MKDCDISC=/absolute/path/to/mkdcdisc \
+MOVIES=1 RENDERER=pvr SMOKE_SECONDS=110 TEST_SECONDS=180 \
+  bash tools/test-dreamcast.sh
+```
+
+Use isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME` and dummy host audio as for other
+automated Flycast runs. Do not select SDL's dummy video driver: the emulator
+still needs a hidden Vulkan-capable surface. The runner explicitly mutes AICA
+output. `MOVIES=1` is mutually exclusive with `AUTOPLAY=1` and requires both
+completion messages, a return to title scene 63, one boot and no memory errors.
+The verified PVR run completed all 457/867 video frames and 335,899/1,274,490
+audio frames, reached the title at about 90.8 emulated seconds and exited
+normally. This is emulator evidence, not physical-console or audible-fidelity
+validation.
+
+Complete intro playback currently requires PVR. The reference software path
+misses the second movie's original game deadline and exceeds main RAM at the
+title transition, even in a software-only binary. With the default movie
+decoder, non-PVR launches must explicitly use `--skip-movies`; unsupported
+movie/renderer combinations fail at startup rather than cancelling midway or
+running out of memory. Combining the PVR and software renderers with this decoder
+also leaves insufficient RAM for software title loading, even when movies are
+skipped. The reference renderer requires a separate software-only build with
+`-DGEX_ENABLE_PVR_RENDERER=OFF`
+`-DGEX_MOVIE_DECODER_SOURCE="$PWD/src/platform/dreamcast/movie_metadata.c"`
+and `--skip-movies`. This retains the former lightweight AVI metadata reader
+and `-O2` guest compilation for software diagnostics; decoding fails explicitly
+rather than faking playback.
+The software profile is currently validated for title/menu rendering, not
+first-level gameplay: the timed Flycast autoplay check stalls in scene 55.
+Native PVR autoplay reaches scene 3 and exits normally.
 
 ### Memory and native services
 
@@ -1297,10 +1998,14 @@ Direct typed casts in other lifted/HLE paths still need investigation if an
 alignment exception is encountered; the current runs do not cover every path.
 The manifest uses 128 KiB guest stacks, 64 KiB native worker stacks, and smaller
 window/menu/DC/font/bitmap tables without changing desktop defaults.
+The AICA transfer scratch buffer is 16 KiB, not a retained 128 KiB maximum-size
+voice buffer. Large PCM uploads are split at store-queue boundaries, with
+four-byte-aligned prefixes copied separately before the aligned bulk transfer.
+This preserves all sample data while leaving room for movie-to-title loading.
 
 Generation outlines byte-identical overlapping entry bodies into
 `recomp_shared.c`, preserving each dispatch entry, original entry label, flags,
-and register setup. The resulting SH4 static footprint is about 4 MiB, rather
+and register setup. The resulting SH4 static footprint is about 4.5 MiB including movie decoding, rather
 than the initial 9 MiB text alone. Anonymous mapped DIBs share one retained
 pixel allocation, including when their format views differ, instead of
 allocating three copies of the game's 1 MiB atlas/framebuffer mapping.
@@ -1316,11 +2021,12 @@ provides TV/RGB 240p; VGA necessarily line-doubles the same native framebuffer.
 Physical cable/output behavior has not been verified.
 
 `--renderer pvr` selects the experimental `src/platform/dreamcast/packet_gpu.c`.
-`--renderer software` selects the reference packet renderer in the same
-executable and remains the default when included; PVR-only builds default to
-PVR. `--hardware-renderer` selects the
+`--renderer software` selects the reference packet renderer. Dreamcast now
+defaults to PVR when it is included, so ordinary movie playback follows the
+validated hardware path. `--hardware-renderer` selects the
 platform's included hardware backend. Configure
-`-DGEX_ENABLE_PVR_RENDERER=OFF` for software-only, or
+`-DGEX_ENABLE_PVR_RENDERER=OFF` with the metadata-only decoder described above
+for software-only, or
 `-DGEX_ENABLE_SOFTWARE_RENDERER=OFF` for PVR-only. PVR cannot be enabled on
 desktop platforms or together with packet OpenGL.
 
@@ -1373,8 +2079,9 @@ stores integral coordinates/UVs directly; general software interpolation retains
 its floating-point arithmetic. Ordinary axis-aligned rectangles clip and submit
 directly, choosing wrap from covered pixel-center samples. Actual wrap, skew and
 picture feedback retain general clipping, with irrelevant clipping edges and
-framebuffer-boundary splits skipped. The backend is compiled at `-O2`, matching
-the performance-critical game/raster sources. The shared scanline,
+framebuffer-boundary splits skipped. The backend, movie decoder/converter and
+raster sources are compiled at `-O2`; lifted guest code uses `-Os` to retain
+movie-to-title heap headroom within 16 MiB. The shared scanline,
 compact-rectangle, upload/download and history contracts remain available only
 for compatibility fixtures and other backends. PVR's production path replaces
 the direct clears, keyed loading artwork and complete pause capture/dim/banner
@@ -1407,11 +2114,10 @@ of framebuffer pixels, framebuffer-as-CLUT and
 CPU-source atlas uploads that reference device-owned pictures are explicitly
 unsupported rather than silently consuming stale pixels or reading them back.
 
-The shared movie path can decode to native-size CPU RGB565 asset data and
-upload it for GPU aspect-fit composition/presentation. GPU movie composition
-is exercised by the PVR fixture, but the current Dreamcast decoder is still a
-metadata-only stub: actual AVI playback requires a replacement decoder and
-otherwise fails explicitly. Normal console launches continue to skip movies.
+The shared movie path decodes the original AVIs to native-size CPU RGB565
+asset data and uploads it for GPU presentation. The PVR fixture covers native
+320x240 replacement frames, smaller aspect-fitted movies and subsequent
+picture copies/draws. Normal console launches play movies by default.
 Game logic, asset decoding/transcoding, texture validation and geometry
 submission still require CPU work. No physical-hardware performance win or
 full-playthrough equivalence has been established.
@@ -2387,6 +3093,62 @@ cached/hardware disagreement, then requests replay. It failed the restart
 and cumulative-count assertions before the fix; afterward it restarts and
 accounts for both plays (2,046 frames).
 
+Follow-up investigation of intermittent silent jumps/tail attacks has not
+established another native playback defect. A native startup-phase probe starts
+32 one-shots at varied offsets and polls every 2 ms; all remain active and
+advance after 40 ms. The firmware's ten-tick wait is not ten milliseconds:
+its ARM timer runs at 4,410 Hz. Do not infer a startup failure from that
+wait alone or increase the startup grace period without a reproducer.
+
+An initial isolated PVR game diagnostic sent 20 jump and 20 tail-attack button
+presses while tracing the original SFX entry and native voices. It
+recorded 67 original SFX requests and 75 native play calls, including
+four looping voices; all 71 observed one-shot completions accounted for
+the full sample length. Some button presses produced no ordinary effect
+request while other voice/idle activity occurred. Button presses alone
+do not establish that the associated action animation executed, and
+hardware completion does not prove audible output.
+
+Subsequent diagnostics captured the actual mixed AICA PCM in an isolated
+Flycast build, before emulator volume attenuation, while keeping host audio
+silent and the window headless. Link-time wrappers observed the player
+action callback, ordinary SFX requests and the speech-selection result;
+generated game sources were not edited. One run reproduced two complete
+tail attacks (sequence 43, then idle sequence 41) with no pending ordinary
+SFX. A further run traced a missing whoosh directly to successful speech
+selection: category `0x47` returned 1 and queued speech handle `0x1A6`,
+while the attack still ran and the ordinary SFX field remained -1.
+
+This substitution is present in the retail x86 executable, not an AICA
+decision or a newly introduced port rule. At `0x42773E`, tail-attack entry
+`sub_004276E0` calls `sub_004206B0(0x47)`. Its nonzero result branches at
+`0x427748` past the assignment of whoosh ID `0x66` to `0x4A0218`.
+Other recovered tail-attack entries use the same speech-or-whoosh pattern.
+The actual captured replacement speech also matched its source waveform;
+this is not merely a successful-return or hardware-cursor inference.
+
+The final 103.422-second capture covered 20 accepted tail attacks:
+19 gameplay whooshes and one replacement voice line. All 21 native
+whoosh starts, including two earlier menu effects, matched the mixed output.
+All 17 requested landing effects also matched; the first three jump-button
+presses did not execute jumps and were not counted as lost effects.
+Waveform matching used the live source PCM, rate-correct interpolation,
+normalized correlation of at least 0.6, and one-to-one matches within
+25 ms of a fitted guest-timer/audio-clock alignment. Observed timing
+residuals were under 3 ms, and the replacement voice correlation was
+0.7847. Low-score unrelated peaks were not counted as requested effects.
+
+Thus the reproduced missing tail whoosh is original speech substitution,
+not a demonstrated native mixer dropout. This bounded emulator evidence
+does not rule out additional cases or establish physical-console behavior.
+Production audio, animation and sound selection remain unchanged. The
+normal Flycast source and executable were restored byte-for-byte; the
+diagnostic capture hook was confined to a separate emulator executable.
+Heavier probes, including a floating-point logging variant, exhausted
+guest RAM during level loading. Those failures are not successful
+gameplay validation or proof that memory exhaustion caused the reported
+sound gaps.
+
 Final native PVR and AICA fixtures exit normally with zero failures. Linux
 Release passes all 32 tests, and all three targeted host renderer tests pass.
 Production PVR autoplay reaches Graveyard and exits normally with guest
@@ -2675,8 +3437,8 @@ Steady frame pacing, controller behavior, continuous audio fidelity and
 physical hardware remain unverified. See the OpenGL12 section below for the
 current GLdc memory constraints and measured presentation intervals.
 
-AVI metadata parsing supports `--skip-movies`, but actual Indeo 3 playback
-is explicitly unsupported. VMU save/settings persistence and a complete
+Both original Indeo 3 intro movies complete under headless Flycast; explicit
+`--skip-movies` remains available. VMU save/settings persistence and a complete
 playthrough remain unfinished.
 
 Use the matching ELF for Flycast GDB sessions. Enable the emulator's GDB
@@ -2829,8 +3591,8 @@ by `ExitProcess(0)`. Linux also completed both startup AVIs. Dreamcast reached
 scene 3 and normal exit, and an inspected external scanout showed Graveyard
 scenery, HUD and Gex with RTT readback disabled. These checks do not establish
 collision accuracy, a complete playthrough or physical-console performance.
-Dreamcast Indeo movie decoding remains unsupported, independently of the
-backend's native movie-frame presentation fixture.
+Dreamcast OpenGL12 intro playback remains unsupported; the original Indeo
+movies use the native PVR path described above.
 
 With `GEX_PROFILE_RENDERER=ON`, logs record presentation intervals (`dt` in
 microseconds), main-thread CPU deltas (`cpu_ns`), draws, texture uploads,

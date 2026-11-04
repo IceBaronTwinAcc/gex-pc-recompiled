@@ -1,6 +1,6 @@
 ![GexRecompiled logo](docs/GexRecompLogo.png)
 
-**Disclaimer:** This project and its coordinator are not affiliated with Crystal Dynamics, Microsoft or Square Enix. Gex is a registered trademark of Crystal Dynamics and later Square Enix, and the rights to the PC version belong to Microsoft. The trademark is used only to indicate compatibility with their software.
+**Disclaimer:** This project and its coordinator are not affiliated with Crystal Dynamics, Microsoft or Square Enix. Gex is a registered trademark of Crystal Dynamics and later Square Enix, and the rights to the PC version belong to Microsoft. The trademark is used only to indicate compatibility with their software. No original game assets or code is being distributed through this project.
 
 ## What is this?
 
@@ -52,11 +52,10 @@ Run - Right shoulder button
 
 ## Planned features
 
-- In-game settings
+- Ingame settings
 - Remapping
 - Texture pack support
-- Proper saving (exact original 3DO behaviour is infeasible, though)
-- macOS, Android, UWP (Xbox One/Series) and PSP support (feel free to contact if you're able to test on PSP or Xbox One)
+- UWP (Xbox One/Series) support, feel free to contact if you're able to test on Xbox One
 
 ## Contributing
 

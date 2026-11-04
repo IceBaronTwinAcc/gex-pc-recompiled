@@ -143,7 +143,17 @@ void gex_raster_present(gex_raster *r) {
 }
 
 void gex_raster_fill(gex_raster *r, int x, int y, int width, int height, unsigned rgb) {
-    if (!gex_raster_gpu_owned(r)) gpu_fail("device fill requires a GPU-owned target");
+    if (!gex_raster_gpu_owned(r)) {
+        gpu_submit(r);
+        materialize(r);
+        unsigned value = ((rgb >> 3) & 31) | ((rgb >> 6) & 0x3E0) | ((rgb >> 9) & 0x7C00);
+        for (int row = maximum(0, y); row < minimum(r->height, y + height); ++row)
+            for (int column = maximum(0, x); column < minimum(r->width, x + width); ++column)
+                r->pixels[row * r->width + column] = (uint16_t)value;
+        r->previous_pixels = 0;
+        r->cpu_newer = r->guest_newer = 1;
+        return;
+    }
     gex_gpu_vertex v[] = {{x, y, 0, 0}, {x + width, y, 0, 0},
                          {x, y + height, 0, 0}, {x + width, y + height, 0, 0}};
     gex_gpu_material m = {.opcode = 0x60, .rgb = rgb};

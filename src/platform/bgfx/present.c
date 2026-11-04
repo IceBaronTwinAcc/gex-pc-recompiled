@@ -2,6 +2,7 @@
 #include "platform/bgfx/backend.h"
 #include "packet_gpu.h"
 #include "win32hle.h"
+#include "platform/desktop/app_icon.h"
 
 void hle_screen_device_window(void *window);
 static SDL_Window *window;
@@ -16,7 +17,7 @@ static int open_renderer(int headless, char *error, size_t size) {
 #ifdef __ANDROID__
         SDL_SetHint(SDL_HINT_VIDEO_EXTERNAL_CONTEXT, "1");
 #endif
-        if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        if (gex_app_video_init()) {
             snprintf(error, size, "bgfx window video initialisation: %s", SDL_GetError());
             return -1;
         }
@@ -25,7 +26,7 @@ static int open_renderer(int headless, char *error, size_t size) {
 #ifdef __ANDROID__
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 #endif
-        window = SDL_CreateWindow("Gex - bgfx", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        window = gex_app_window("Gex - bgfx", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             960, 720, flags);
         if (!window) {
             snprintf(error, size, "bgfx window creation: %s", SDL_GetError());

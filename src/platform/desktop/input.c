@@ -2,17 +2,52 @@
 #include <SDL2/SDL.h>
 #include "win32hle.h"
 #include "platform/input.h"
+#include "preferences.h"
 
 static SDL_GameController *controller;
 static SDL_threadID owner;
 static int headless_mode;
 static uint32_t last_scan;
+static uint32_t keyboard_outputs[SDL_NUM_SCANCODES];
+static uint8_t captured_keys[SDL_NUM_SCANCODES];
+void gex_desktop_key_code(int scancode, uint32_t *key, uint32_t *scan);
 static const SDL_Scancode scancodes[GEX_KEY_COUNT] = {
     SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT, SDL_SCANCODE_UP, SDL_SCANCODE_DOWN,
     SDL_SCANCODE_X, SDL_SCANCODE_Z, SDL_SCANCODE_C, SDL_SCANCODE_V, SDL_SCANCODE_ESCAPE
 };
 
 static int keyboard_event(int scancode, int down) {
+    if ((unsigned)scancode >= SDL_NUM_SCANCODES) return 0;
+    uint32_t key, scan;
+    gex_desktop_key_code(scancode, &key, &scan);
+    if (captured_keys[scancode]) {
+        if (!down) captured_keys[scancode] = 0;
+        return 1;
+    }
+    if (gex_binding_key_filter && !keyboard_outputs[scancode] &&
+        gex_binding_key_filter(down, key, scan)) {
+        captured_keys[scancode] = down != 0;
+        return 1;
+    }
+    if (gex_prefs.bindings_active) {
+        if (down && !keyboard_outputs[scancode])
+            keyboard_outputs[scancode] = gex_controls_keyboard(key);
+        uint32_t mapped = keyboard_outputs[scancode];
+        if (!down) keyboard_outputs[scancode] = 0;
+        for (unsigned i = 0; i < GEX_KEY_COUNT; ++i)
+            if (mapped & (1u << i)) {
+                int held = down;
+                if (!held)
+                    for (unsigned j = 0; j < SDL_NUM_SCANCODES; ++j)
+                        if (keyboard_outputs[j] & (1u << i)) { held = 1; break; }
+                gex_gamepad_key((enum gex_input_key)i, held);
+            }
+        /* Do not leak old canonical bindings after the user reassigns them. */
+        if (mapped || key == 'X' || key == 'Z' || key == 'C' || key == 'V' ||
+            key == 0x1B || key == 0x0D || key == 0x20)
+            return 1;
+        return 0;
+    }
     if (gex_input_key_filter &&
         (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE) &&
         gex_input_key_filter(down, scancode == SDL_SCANCODE_RETURN ? 0x0D : 0x20, 0))
@@ -33,6 +68,8 @@ int gex_host_input_init(int headless) {
     owner = SDL_ThreadID();
     headless_mode = headless;
     last_scan = SDL_GetTicks() - 1000;
+    memset(keyboard_outputs, 0, sizeof keyboard_outputs);
+    memset(captured_keys, 0, sizeof captured_keys);
     hle_screen_key_hook = keyboard_event;
     return 0;
 }
@@ -64,6 +101,10 @@ int gex_host_input_poll(gex_input_state *state) {
     }
     *state = (gex_input_state){.focused = headless_mode || SDL_GetKeyboardFocus(),
                                .connected = controller != NULL, .reset = disconnected};
+    if (!state->focused) {
+        memset(keyboard_outputs, 0, sizeof keyboard_outputs);
+        memset(captured_keys, 0, sizeof captured_keys);
+    }
     if (controller) {
         state->x = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
         state->y = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);

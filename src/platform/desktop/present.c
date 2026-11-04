@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <SDL2/SDL.h>
 #include "win32hle.h"
+#include "platform/desktop/app_icon.h"
 
 /* A subset of the Win32 message ids SDL events map to. */
 #define WM_QUIT         0x0012u
@@ -34,8 +35,8 @@ static int          g_w, g_h;
 
 int hle_present_open(const char *title, int w, int h) {
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process */
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[present] SDL_Init: %s\n", SDL_GetError()); return -1; }
-    g_win = SDL_CreateWindow(title ? title : "win32hle",
+    if (gex_app_video_init() != 0) { fprintf(stderr, "[present] SDL_Init: %s\n", SDL_GetError()); return -1; }
+    g_win = gex_app_window(title ? title : "win32hle",
                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              w, h, SDL_WINDOW_SHOWN);
     if (!g_win) { fprintf(stderr, "[present] CreateWindow: %s\n", SDL_GetError()); return -1; }

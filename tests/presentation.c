@@ -170,6 +170,18 @@ int main(void) {
         int width, height;
         SDL_GetWindowSize(native, &width, &height);
         CHECK(width == 800 && height == 600);
+        gex_preferences_reset();
+        char error[256];
+        CHECK(!gex_video_desktop(&width, &height));
+        CHECK(width > 0 && height > 0);
+        CHECK(!gex_video_display(GEX_DISPLAY_BORDERLESS, error, sizeof error));
+        CHECK((SDL_GetWindowFlags(native) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP);
+        CHECK(!gex_video_display(GEX_DISPLAY_EXCLUSIVE, error, sizeof error));
+        /* SDL's dummy driver retains DESKTOP for both fullscreen variants. */
+        if (strcmp(SDL_GetCurrentVideoDriver(), "dummy"))
+            CHECK((SDL_GetWindowFlags(native) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN);
+        CHECK(!gex_video_display(GEX_DISPLAY_WINDOWED, error, sizeof error));
+        CHECK(!(SDL_GetWindowFlags(native) & SDL_WINDOW_FULLSCREEN));
         gex_renderer_shutdown();
         CHECK(SDL_GetWindowID(native) != 0);
         SDL_DestroyWindow(native);

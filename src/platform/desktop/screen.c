@@ -26,6 +26,9 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include "win32hle.h"
+#include "platform/desktop/app_icon.h"
+#include "platform/video.h"
+#include "preferences.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -101,6 +104,13 @@ static void settings_changed(void) {
 static void menu_draw(void);
 static int g_menu_depth;                                 /* hle_screen_menu's levels open; 0: closed */
 static void set_fullscreen(int on) {
+    if (gex_prefs.bindings_active) {
+        char error[256];
+        if (gex_video_display(on ? GEX_DISPLAY_BORDERLESS : GEX_DISPLAY_WINDOWED, error, sizeof error))
+            fprintf(stderr, "[video] %s\n", error);
+        g_menu_depth = 0;
+        return;
+    }
     g_fullscreen = on, g_menu_depth = 0;
 #ifdef __EMSCRIPTEN__
     (void)on;                                              /* the page does it, on the key itself (a gesture) */
@@ -207,6 +217,50 @@ static uint32_t scan_of(SDL_Scancode s) {
 #endif
     };
     return (unsigned)s < SDL_NUM_SCANCODES ? t[s] : 0;
+}
+
+void gex_desktop_key_code(int scancode, uint32_t *key, uint32_t *scan) {
+    *key = (uint32_t)vk_of((SDL_Scancode)scancode);
+    *scan = scan_of((SDL_Scancode)scancode);
+}
+
+int gex_video_display_count(void) {
+#ifdef __ANDROID__
+    return 1;
+#else
+    return 3;
+#endif
+}
+
+int gex_video_display(int mode, char *error, size_t size) {
+#ifdef __ANDROID__
+    if (mode != GEX_DISPLAY_BORDERLESS) {
+        snprintf(error, size, "Android requires fullscreen");
+        return -1;
+    }
+#endif
+    Uint32 flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
+        mode == GEX_DISPLAY_EXCLUSIVE ? SDL_WINDOW_FULLSCREEN : 0;
+    if (g_win && SDL_SetWindowFullscreen(g_win, flags)) {
+        snprintf(error, size, "Display change failed: %s", SDL_GetError());
+        return -1;
+    }
+    g_fullscreen = mode != GEX_DISPLAY_WINDOWED;
+    gex_prefs.display = mode;
+    settings_changed();
+    return 0;
+}
+
+int gex_video_desktop(int *width, int *height) {
+    if (!g_win) { *width = 320; *height = 240; return 0; }
+    int display = SDL_GetWindowDisplayIndex(g_win);
+    SDL_DisplayMode mode;
+    if (display < 0 || SDL_GetDesktopDisplayMode(display, &mode)) {
+        fprintf(stderr, "[video] cannot query display resolution: %s\n", SDL_GetError());
+        return -1;
+    }
+    *width = mode.w; *height = mode.h;
+    return 0;
 }
 
 /* window points -> game pixels, clamped to the picture */
@@ -843,8 +897,8 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
-    g_win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
+    if (gex_app_video_init() != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
+    g_win = gex_app_window(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
 #ifdef __EMSCRIPTEN__
@@ -915,6 +969,9 @@ void hle_screen_device_window(void *window) {
         SDL_GetWindowSize(g_win, &g_dst.w, &g_dst.h);
         g_dst.x = g_dst.y = 0;
         g_src_w = 320; g_src_h = 240;
-        if (g_fullscreen) SDL_SetWindowFullscreen(g_win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        if (gex_prefs.bindings_active) {
+            char error[256];
+            if (gex_video_display(gex_prefs.display, error, sizeof error)) hle_fatal("%s", error);
+        } else if (g_fullscreen) SDL_SetWindowFullscreen(g_win, SDL_WINDOW_FULLSCREEN_DESKTOP);
     }
 }

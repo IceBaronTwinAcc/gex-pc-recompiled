@@ -15,11 +15,13 @@
 #include "packet_gpu.h"
 #include "platform/host.h"
 #include "platform/filesystem.h"
+#include "preferences.h"
 #ifdef GEX_DESKTOP_SETUP
 #include "game_install.h"
 #endif
 #if GEX_ENABLE_PASSWORD_SAVES
 #include "save_menu.h"
+#include "options_menu.h"
 #include "platform/input.h"
 #endif
 
@@ -34,6 +36,12 @@ static uint64_t last_hash;
 static char screenshot[4096];
 static char settings_file[4096];
 static const char *const renderer_names[] = {"software", "opengl", "pvr", "opengl12", "bgfx"};
+#if GEX_ENABLE_PASSWORD_SAVES
+static int menu_input(void) {
+    uint32_t level = MEM32(0x4A2964);
+    return gex_save_modal_open() || MEM32(0x4A294C) || level >= 49;
+}
+#endif
 
 static void record_frame(const uint8_t *px, int w, int h, int pitch, int bpp) {
     uint64_t hash = 1469598103934665603ull;
@@ -152,6 +160,7 @@ int main(int argc, char **argv) {
                                  GEX_ENABLE_SOFTWARE_RENDERER ? 0 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
     int hardware_renderer = default_renderer;
     int render_width = 0, render_height = 0;
+    int explicit_renderer = 0, explicit_size = 0;
 #ifdef GEX_NATIVE_GAMEPLAY_WIDTH
     render_width = GEX_NATIVE_GAMEPLAY_WIDTH;
     render_height = GEX_NATIVE_GAMEPLAY_HEIGHT;
@@ -165,9 +174,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--skip-movies")) skip_movies = 1;
-        else if (!strcmp(argv[i], "--hardware-renderer")) hardware_renderer = GEX_ENABLE_PVR_RENDERER ? 2 :
-            GEX_ENABLE_BGFX_RENDERER ? 4 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
+        else if (!strcmp(argv[i], "--hardware-renderer")) {
+            explicit_renderer = 1;
+            hardware_renderer = GEX_ENABLE_PVR_RENDERER ? 2 :
+                GEX_ENABLE_BGFX_RENDERER ? 4 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
+        }
         else if (!strcmp(argv[i], "--renderer")) {
+            explicit_renderer = 1;
             if (i + 1 == argc) {
                 fprintf(stderr, "[gex] --renderer requires software, opengl, pvr, opengl12 or bgfx\n");
                 return 64;
@@ -184,6 +197,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--render-size")) {
+            explicit_size = 1;
             if (i + 1 == argc || gex_renderer_parse_size(argv[++i], &render_width, &render_height)) {
                 fprintf(stderr, "[gex] --render-size requires WIDTHxHEIGHT: 1..8192 per axis, at most 16777216 pixels\n");
                 return 64;
@@ -305,7 +319,18 @@ int main(int argc, char **argv) {
     if (settings_mode < 0) return 1;
     if (!settings_mode && hle_reg_load(settings_file)) return 1;
 #if GEX_ENABLE_PASSWORD_SAVES
+    mach_enter();
+    int options_error = gex_options_load();
+    mach_leave();
+    if (options_error) return 1;
+    if (!explicit_renderer && gex_prefs.renderer >= 0) hardware_renderer = gex_prefs.renderer;
+    if (!explicit_size && gex_prefs.width) {
+        render_width = gex_prefs.width; render_height = gex_prefs.height;
+    }
+    gex_controls_menu_hook = menu_input;
     if (gex_save_init(settings_file, monitor)) return 1;
+#else
+    (void)explicit_renderer; (void)explicit_size;
 #endif
     const gex_renderer_backend *renderer = gex_renderer_backend_get();
 #if GEX_ENABLE_BGFX_RENDERER
@@ -313,6 +338,10 @@ int main(int argc, char **argv) {
 #endif
     if (gex_renderer_init(renderer, headless) || gex_renderer_resize(320, 240))
         hle_fatal("renderer initialization failed: %s", gex_renderer_error());
+#if GEX_ENABLE_PASSWORD_SAVES
+    if (gex_options_video_init(hardware_renderer, render_width, render_height)) goto renderer_failed;
+    render_width = gex_prefs.width; render_height = gex_prefs.height;
+#endif
     if (render_width) {
         if (gex_graphics_set_render_size(render_width, render_height)) goto renderer_failed;
         fprintf(stderr, "[renderer] level viewport %dx%d (one logical pixel per render pixel)\n",

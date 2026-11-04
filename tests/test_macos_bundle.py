@@ -19,12 +19,14 @@ class MacBundleTests(unittest.TestCase):
             (contents / "MacOS").mkdir(parents=True)
             (contents / "Info.plist").write_bytes(plistlib.dumps({
                 "CFBundleExecutable": "Gex Recompiled", "CFBundleIdentifier": "org.gexrecomp.app",
+                "CFBundleIconFile": "gex.icns",
             }))
             binary = contents / "MacOS/Gex Recompiled"
             binary.write_bytes(b"test executable")
             binary.chmod(0o755)
             imported = contents / "Resources/Gex"
             imported.mkdir(parents=True)
+            (contents / "Resources/gex.icns").write_bytes(b"test icon")
             (imported / "GEX.exe").write_bytes(b"private installation")
             (contents / "Resources/.gex-import-incomplete").mkdir()
             (prefix / "lib").mkdir(parents=True)
@@ -39,4 +41,5 @@ class MacBundleTests(unittest.TestCase):
                 self.assertIn(f"{bundle.name}/Contents/MacOS/Gex Recompiled", files)
                 self.assertIn(f"{bundle.name}/Contents/Frameworks/libtest.dylib", files)
                 self.assertIn(f"{bundle.name}/Contents/Resources/licenses/test.txt", files)
+                self.assertEqual(output.read(f"{bundle.name}/Contents/Resources/gex.icns"), b"test icon")
                 self.assertFalse(any("/Gex/" in name or ".gex-import-" in name for name in files))

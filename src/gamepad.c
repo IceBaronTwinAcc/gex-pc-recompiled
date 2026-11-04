@@ -1,6 +1,7 @@
 #include <string.h>
 #include "gamepad.h"
 #include "platform/input.h"
+#include "preferences.h"
 
 static int axis_x, axis_y;
 static const struct { uint32_t key, scan; } bindings[GEX_KEY_COUNT] = {
@@ -8,6 +9,9 @@ static const struct { uint32_t key, scan; } bindings[GEX_KEY_COUNT] = {
     {'X', 0x2D}, {'Z', 0x2C}, {'C', 0x2E}, {'V', 0x2F}, {0x1B, 0x01}
 };
 static uint8_t keyboard[GEX_KEY_COUNT], pad[GEX_KEY_COUNT], sent[GEX_KEY_COUNT];
+static uint32_t blocked_buttons;
+static int previous_menu;
+static int capturing_pad;
 
 static void publish(void) {
     for (unsigned i = 0; i < GEX_KEY_COUNT; ++i) {
@@ -31,7 +35,12 @@ static int direction(int value, int previous) {
     return 0;
 }
 
-int gex_gamepad_init(int headless) { return gex_host_input_init(headless); }
+int gex_gamepad_init(int headless) {
+    blocked_buttons = 0;
+    previous_menu = gex_controls_menu();
+    capturing_pad = 0;
+    return gex_host_input_init(headless);
+}
 
 void gex_gamepad_pump(void) {
     gex_input_state state;
@@ -48,16 +57,34 @@ void gex_gamepad_pump(void) {
     } else if (state.connected) {
         axis_x = direction(state.x, axis_x);
         axis_y = direction(state.y, axis_y);
-        uint32_t buttons = state.buttons;
+        int menu = gex_controls_menu();
+        if (menu != previous_menu) {
+            blocked_buttons |= state.buttons;
+            previous_menu = menu;
+        }
+        if (gex_binding_pad_filter && !capturing_pad) blocked_buttons |= state.buttons;
+        capturing_pad = gex_binding_pad_filter != NULL;
+        blocked_buttons &= state.buttons;
+        uint32_t buttons = state.buttons & ~blocked_buttons;
+        if (gex_binding_pad_filter && gex_binding_pad_filter(buttons)) {
+            blocked_buttons |= state.buttons;
+            buttons = 0;
+        }
         pad[0] = axis_x < 0 || (buttons & GEX_PAD_LEFT);
         pad[1] = axis_x > 0 || (buttons & GEX_PAD_RIGHT);
         pad[2] = axis_y < 0 || (buttons & GEX_PAD_UP);
         pad[3] = axis_y > 0 || (buttons & GEX_PAD_DOWN);
-        pad[4] = (buttons & (GEX_PAD_A | GEX_PAD_START)) != 0;
-        pad[5] = (buttons & GEX_PAD_X) != 0;
-        pad[6] = (buttons & GEX_PAD_B) != 0;
-        pad[7] = (buttons & (GEX_PAD_Y | GEX_PAD_L | GEX_PAD_R)) != 0;
-        pad[8] = (buttons & GEX_PAD_BACK) != 0;
+        if (gex_prefs.bindings_active) {
+            uint32_t mapped = gex_controls_gamepad(buttons);
+            for (unsigned i = GEX_KEY_X; i < GEX_KEY_COUNT; ++i)
+                pad[i] = (mapped >> i) & 1;
+        } else {
+            pad[4] = (buttons & (GEX_PAD_A | GEX_PAD_START)) != 0;
+            pad[5] = (buttons & GEX_PAD_X) != 0;
+            pad[6] = (buttons & GEX_PAD_B) != 0;
+            pad[7] = (buttons & (GEX_PAD_Y | GEX_PAD_L | GEX_PAD_R)) != 0;
+            pad[8] = (buttons & GEX_PAD_BACK) != 0;
+        }
     }
     publish();
 }

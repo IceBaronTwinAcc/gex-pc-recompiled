@@ -68,6 +68,7 @@ const gex_packet_gpu *gex_packet_gpu_get(void);
 const gex_packet_gpu *gex_packet_gpu_gldc(void);
 int gex_packet_gpu_select_gldc(int headless);
 const gex_packet_gpu *gex_packet_gpu_bgfx(void);
+uint32_t gex_bgfx_supported_apis(void);
 int gex_packet_gpu_select_bgfx(void);
 void gex_packet_gpu_shutdown_bgfx(void);
 #if GEX_PROFILE_RENDERER

@@ -330,6 +330,20 @@ static void shaded_copy(void) {
     gex_raster_destroy(source);
 }
 
+static void solid_rectangles(void) {
+    gex_raster *r = gex_raster_create(16, 12);
+    CHECK(r != NULL);
+    if (!r) return;
+    gex_raster_fill(r, -2, -1, 6, 4, 0x204080);
+    for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 16; ++x)
+            CHECK(pixel(r, 16, x, y) == (x < 4 && y < 3 ? 0x1110 : 0));
+    gex_raster_fill(r, 14, 10, 4, 4, 0x00FF00);
+    CHECK(pixel(r, 16, 15, 11) == 0x3E0);
+    CHECK(pixel(r, 16, 13, 11) == 0);
+    gex_raster_destroy(r);
+}
+
 int main(void) {
     for (int factor = 0; factor < 32; ++factor)
         for (int value = 0; value < 32; ++value)
@@ -345,5 +359,6 @@ int main(void) {
     tiled_backdrop();
     fitted_pixel_grid();
     shaded_copy();
+    solid_rectangles();
     return failures ? 1 : 0;
 }

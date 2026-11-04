@@ -5,6 +5,7 @@
 
 /* Configure before guest graphics initialization; not a live resize API. */
 int gex_graphics_set_render_size(int width, int height);
+int gex_graphics_resize(int width, int height);
 int gex_graphics_enable_gpu(void);
 int gex_graphics_gpu_owned(void);
 int gex_graphics_native_operation(uint32_t function);
@@ -13,8 +14,14 @@ void gex_graphics_movie(const uint8_t *pixels, int width, int height, int pitch)
 void gex_graphics_fade_capture(void);
 void gex_graphics_fade_present(unsigned shade);
 void gex_graphics_fade_release(void);
+/* Hide cached outgoing frames until the retail scene transition completes. */
+void gex_graphics_hold_black(int enabled);
 /* Shade freshly rendered guest frames without changing their source pixels. */
 void gex_graphics_frame_shade(unsigned shade);
+/* Opaque Options widgets in the authored 320x224 canvas, before frame shading. */
+void gex_graphics_menu_rect(int x, int y, int width, int height, unsigned rgb);
+void gex_graphics_menu_clip_begin(int top, int bottom);
+void gex_graphics_menu_clip_end(void);
 void gex_graphics_cpu_access(void);
 void gex_graphics_atlas_access(uint32_t rectangle);
 int gex_graphics_view_width(void);

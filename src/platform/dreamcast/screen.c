@@ -1,5 +1,15 @@
 #include <kos.h>
 #include "win32hle.h"
+#include "platform/video.h"
+#include "preferences.h"
+
+int gex_video_display_count(void) { return 1; }
+int gex_video_display(int mode, char *error, size_t size) {
+    if (mode == GEX_DISPLAY_BORDERLESS) return 0;
+    snprintf(error, size, "Dreamcast requires fullscreen");
+    return -1;
+}
+int gex_video_desktop(int *width, int *height) { *width = 640; *height = 480; return 0; }
 
 int (*hle_screen_key_hook)(int, int);
 int (*hle_screen_cursor_hook)(void);

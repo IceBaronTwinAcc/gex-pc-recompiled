@@ -6,6 +6,7 @@
 #include <bgfx/c99/bgfx.h>
 #include "platform/bgfx/backend.h"
 #include "packet_gpu.h"
+#include "preferences.h"
 #include "cs_packet_spirv.h"
 #include "cs_packet_metal.h"
 #include "cs_packet_glsl.h"
@@ -65,6 +66,7 @@ static void *native_window, *native_display;
 static SDL_Window *presentation_window;
 #endif
 static int window_width, window_height;
+static int swap_buffers;
 static bgfx_program_handle_t program = {UINT16_MAX}, presenter = {UINT16_MAX};
 static bgfx_uniform_handle_t parameters = {UINT16_MAX}, sampler = {UINT16_MAX};
 static bgfx_index_buffer_handle_t atlas_buffer = {UINT16_MAX}, table_buffer = {UINT16_MAX};
@@ -143,13 +145,41 @@ static int requested_api(request *r, bgfx_renderer_type_t *type) {
         {"direct3d12", BGFX_RENDERER_TYPE_DIRECT3D12}
     };
     const char *name = SDL_getenv("GEX_BGFX_API");
-    if (!name) name = "auto";
+    if (!name) name = gex_api_name(gex_prefs.api);
     for (size_t i = 0; i < sizeof names / sizeof *names; ++i)
         if (!strcmp(name, names[i].name)) {
             *type = names[i].type;
             return 0;
         }
     return fail(r, "GEX_BGFX_API requires auto, vulkan, metal, opengl, opengles, direct3d11 or direct3d12");
+}
+
+static int api_index(bgfx_renderer_type_t type) {
+    switch (type) {
+    case BGFX_RENDERER_TYPE_VULKAN: return GEX_API_VULKAN;
+    case BGFX_RENDERER_TYPE_METAL: return GEX_API_METAL;
+    case BGFX_RENDERER_TYPE_OPENGL: return GEX_API_OPENGL;
+    case BGFX_RENDERER_TYPE_OPENGLES: return GEX_API_OPENGLES;
+    case BGFX_RENDERER_TYPE_DIRECT3D11: return GEX_API_D3D11;
+    case BGFX_RENDERER_TYPE_DIRECT3D12: return GEX_API_D3D12;
+    default: return GEX_API_AUTO;
+    }
+}
+
+uint32_t gex_bgfx_supported_apis(void) {
+    bgfx_renderer_type_t types[BGFX_RENDERER_TYPE_COUNT];
+    uint8_t count = bgfx_get_supported_renderers(BGFX_RENDERER_TYPE_COUNT, types);
+    uint32_t mask = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        int api = api_index(types[i]);
+#ifdef __APPLE__
+        /* macOS OpenGL stops at 4.1 and cannot run the compute packet shader. */
+        if (api != GEX_API_METAL) continue;
+#endif
+        if (api && shader_profile(types[i]) >= 0)
+            mask |= 1u << api;
+    }
+    return mask;
 }
 
 static void close_device(void) {
@@ -192,10 +222,14 @@ static int open_device(request *r) {
     init.swapChain.ndt = native_display;
     init.swapChain.width = visible ? (uint32_t)window_width : 0;
     init.swapChain.height = visible ? (uint32_t)window_height : 0;
+    swap_buffers = gex_prefs.triple ? 3 : 2;
+    init.swapChain.numBackBuffers = (uint8_t)swap_buffers;
+    init.swapChain.maxFrameLatency = (uint8_t)swap_buffers;
     init.reset = visible ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
     if (!bgfx_init(&init)) return fail(r, "cannot initialise the platform GPU backend");
     initialised = 1;
     bgfx_renderer_type_t actual = bgfx_get_renderer_type();
+    gex_prefs.active_api = api_index(actual);
     int profile = shader_profile(actual);
     if ((!init.fallback && actual != init.type) || profile < 0 ||
         !compute_shaders[profile].bytes) {
@@ -485,6 +519,7 @@ static int present_frame(request *r) {
     if (!visible) { r->width = frame_width; r->height = frame_height; }
     if (r->width <= 0 || r->height <= 0) return 0;
     if (visible && (r->width != window_width || r->height != window_height ||
+                    swap_buffers != (gex_prefs.triple ? 3 : 2) ||
                     (r->window && r->window != native_window))) {
         if (r->window) native_window = r->window;
         bgfx_init_t defaults;
@@ -493,6 +528,9 @@ static int present_frame(request *r) {
         defaults.swapChain.ndt = native_display;
         defaults.swapChain.width = (uint32_t)r->width;
         defaults.swapChain.height = (uint32_t)r->height;
+        swap_buffers = gex_prefs.triple ? 3 : 2;
+        defaults.swapChain.numBackBuffers = (uint8_t)swap_buffers;
+        defaults.swapChain.maxFrameLatency = (uint8_t)swap_buffers;
         bgfx_reset(BGFX_RESET_VSYNC, &defaults.swapChain);
         window_width = r->width; window_height = r->height;
     }

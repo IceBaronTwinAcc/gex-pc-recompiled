@@ -240,11 +240,12 @@ int gex_save_key(int down, uint32_t key, uint32_t scan) {
 static int pointer(int x, int y, int down) {
     if (!opened) return 0;
     if (opened == 3) return 1;
-    if (down <= 0) return 1;
     if (opened == 2) {
-        if (gex_graphics_screen_point(&x, &y) && gex_options_pointer(x, y)) result = 0;
+        if (gex_graphics_screen_point(&x, &y) && gex_options_pointer_event(x, y, down)) result = 0;
+        else if (!down) gex_options_pointer_event(0, 0, 0);
         return 1;
     }
+    if (down <= 0) return 1;
     gex_render_frame frame;
     if (gex_renderer_frame(&frame)) hle_fatal("save menu pointer target unavailable");
     gex_render_rect fit = gex_renderer_fit(frame.width, frame.height, 320, 240);
@@ -291,11 +292,13 @@ static int run_menu(int notice) {
     fprintf(stderr, menu_kind == 2 ? "[options] Options menu opened\n" : "[saves] Video Deck menu opened\n");
     enum { TITLE_OUT, MENU_IN, MENU_IDLE, MENU_OUT, TITLE_IN };
     int transition = opened == 3 ? TITLE_OUT : MENU_IDLE;
+    int exit_action = 0;
     uint32_t fade_started = gex_host_ticks_ms();
     if (animated) gex_graphics_fade_capture();
     uint32_t last = gex_host_ticks_ms() - 34;
     for (;;) {
-        if (animated && !modal_close_requested && opened == menu_kind && result == 0) {
+        if (animated && !modal_close_requested && opened == menu_kind && result >= 0) {
+            exit_action = result;
             opened = 3;
             transition = MENU_OUT;
             result = -1;
@@ -330,7 +333,12 @@ static int run_menu(int notice) {
             if (elapsed == FADE_MS) {
                 if (transition == TITLE_OUT) transition = MENU_IN;
                 else if (transition == MENU_IN) { transition = MENU_IDLE; opened = menu_kind; }
-                else if (transition == MENU_OUT) transition = TITLE_IN;
+                else if (transition == MENU_OUT) {
+                    if (exit_action) {
+                        if (exit_action == 1) gex_graphics_hold_black(1);
+                        result = exit_action;
+                    } else transition = TITLE_IN;
+                }
                 else if (transition == TITLE_IN) { transition = MENU_IDLE; result = 0; }
                 fade_started = gex_host_ticks_ms();
             }
@@ -368,6 +376,7 @@ void gex_save_options(void) {
 }
 
 int gex_save_menu_open(void) { return opened == 1; }
+int gex_save_modal_open(void) { return opened != 0; }
 
 int gex_save_take_close_request(void) {
     int requested = close_requested;

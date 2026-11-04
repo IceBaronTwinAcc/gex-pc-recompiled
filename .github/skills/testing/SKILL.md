@@ -8,6 +8,10 @@ description: Build, test, and debug this Gex recompilation with headless automat
 ## Safety and scope
 
 - Run from the project root and inspect the affected code before choosing checks.
+- Build and test only for the current host platform unless the user explicitly
+  requests another target. Do not cross-compile, run Wine/emulator/device tests,
+  or rebuild/package other-platform artifacts as part of routine validation.
+  The Linux commands below apply only when working on Linux.
 - Launch automated game and test applications headlessly. Use `--headless` for
   `gex_recomp` and `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy` for SDL tests.
   Do not open visible windows for automated checks, including through Wine.
@@ -57,9 +61,11 @@ cmake --build build/linux/debug --parallel 3
 ctest --test-dir build/linux/debug --output-on-failure -R 'movie'
 ```
 
-For changes spanning the runtime, run all tests. GCC Release and Clang Release
-builds are available in `build/linux/release` and `build/linux/clang`; build each before
-running its tests. Linux Clang results do not validate macOS or Windows.
+For changes spanning the runtime, run all tests for the current platform.
+On Linux, GCC Release and Clang Release builds are available in
+`build/linux/release` and `build/linux/clang`; build each before running its
+tests. Linux Clang results do not validate macOS or Windows, and do not require
+testing those platforms.
 
 Headless gameplay check (create the settings directory before use):
 

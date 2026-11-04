@@ -976,16 +976,18 @@ it releases its inputs and allows another controller to take over.
 | --- | --- |
 | D-pad or left stick | Move / arrow keys |
 | South face button (Xbox A / PlayStation Cross) | Jump, select, enter TV / X |
-| Start / Options | Jump, select, enter TV / X (same as south face button) |
+| Start / Options | Pause during gameplay |
 | West face button (Xbox X / PlayStation Square) | Tail-whip / Z |
 | East face button (Xbox B / PlayStation Circle) | Tongue / C |
-| North face button (Xbox Y / PlayStation Triangle), either shoulder | Run / V |
-| Back / Share | Exit / Esc |
+| North face button (Xbox Y / PlayStation Triangle) | Run / V |
+| East face button in menus | Back / Esc |
 
-These are keyboard-equivalent bindings, not the original WinMM joystick
-configuration. If the game's keyboard controls have been changed, the actions
-follow those keyboard assignments. There is no controller-remapping UI or
-rumble yet. SDL's controller mappings apply; an unrecognized device needs an
+These are action bindings, not the original WinMM joystick configuration.
+Options > Controls captures independent keyboard and gamepad bindings for
+gameplay and menus. Tongue Lash and Hurl have separate binding fields but send
+the same context-sensitive retail action. Escape and Enter/Space remain
+emergency menu navigation keys. There is no rumble yet.
+SDL's controller mappings apply; an unrecognized device needs an
 SDL mapping (for example through `SDL_GAMECONTROLLERCONFIG`).
 The analog stick has a deadzone and hysteresis to prevent drift and chatter.
 Keyboard and controller holds combine without releasing each other's inputs.
@@ -1027,6 +1029,10 @@ is fully visible. Back and EXIT fade the cabinet out and the original title
 frame back in with the same timing. Window-close requests skip the return
 animation and remain responsive during either transition. The retained title
 frame stays on-device with GPU-owned renderers.
+PLAY and manual-entry confirmation fade the cabinet to black without returning
+to the title. Outgoing retail frames remain black until the existing outgoing
+transition completes at `0x40A882`, preventing the cached title from flashing
+during loading without changing the retail initializer or fade cleanup.
 
 The cabinet, three rows, PLAY/ERASE/COPY controls, indicator lamps and EXIT
 selection are extracted from the supplied save-menu screenshots. The extracted
@@ -1070,7 +1076,9 @@ black when entering Options and returning to the title. Guest frames are shaded
 before presentation so the animated background and text do not flash at full
 brightness during a fade. Closing the game from Options saves pending settings,
 releases the menu resources, and exits directly without resuming the title scene
-or its return fade. Back and the Options Exit entry still return to the title.
+or its return fade. The initial Options screen contains only the Options
+heading, Controls, Audio, Video and Exit. Submenu Exit/Back returns to categories;
+category Exit/Back returns to the title.
 The title-initialization hook replaces only the
 Password string with Options; the original widget, font, positions, animations,
 Start and Exit remain intact. The original password initializer/decoder is
@@ -1080,10 +1088,21 @@ Options uses the original title's animated TV-static object and its green
 sprite font, drawn through the original text routine (`0x40BC70`) and the
 game's scaled CEL renderer (`0x4432C0`). A
 guest-stack copy preserves the title widget and its font model; the original
-palette, 13-pixel character advance, reference row spacing and Controls heading
-are retained. The Options title uses the title font at full size; the remaining
-text uses 75% glyph size, a compact substitute for the retail Options screen's
-different font. The size is
+palette and character advance are retained. Screen headings use the title font
+at full size, and menu entries now use the same full-size glyphs and character
+advance. Controls places keyboard/gamepad fields beneath each action, Audio
+places sliders beneath their labels, and Video wraps long labels and values.
+Submenus smoothly scroll as the selection moves, keeping the complete selected
+entry visible. The heading, full-size "Restart to apply" notice, and smaller
+error/capture notices stay fixed.
+Video reserves a taller footer so the full-size restart notice, including
+descenders and shadows, stays inside the authored picture's bottom edge.
+Scoped packet clipping prevents partially visible rows and the selection hand
+from drawing over them; slider rectangles use the same viewport. Pointer/touch
+hit testing follows the displayed scroll position, including slider dragging.
+Entering or returning from a category resets its viewport, and selection
+wraparound scrolls back to the corresponding end of the list.
+The size is
 independent of the guest pause state. Only the
 selected row wobbles, using the main menu's actual selection code and phase
 step. The three text-only sprite-call hooks select
@@ -1107,24 +1126,43 @@ before the normal quit confirmation and shutdown. Without that scoped bypass,
 closing Options briefly re-enters the title's pause renderer. Ordinary pause,
 quit outside a modal, and modal Exit/back retain their original paths.
 
-Each entry defines its kind, label, value, position and platform mask. The
-filtered visible-entry list is shared by drawing, navigation and hit testing.
-`GEX_OPTIONS_WINDOWS`, `LINUX`, `MACOS`, `ANDROID` and `DREAMCAST` flags may be
-combined for platform-specific entries; `GEX_OPTIONS_ALL` exposes common ones.
-All current entries are common. The Dreamcast flag reserves that extension
-point but does not enable this menu on the current Dreamcast host.
+Controls groups Tongue Lash, Hurl, Tailwhip, Jump, Run and Pause under Gameplay,
+then Confirm and Back under Menus. Left/right selects the keyboard or gamepad
+column; confirm waits for a new physical key/button. Pointer input selects the
+column directly. Conflicting bindings for different actions in the same context
+are rejected, rather than silently orphaning an action. Captured input is
+consumed until release. Movement remains on arrows/D-pad/left stick.
 
-Sound/Voice/Music call the original volume setters and update an already-playing
-music buffer's attenuation. Music Test requests actual installed music IDs and
-restores title music on exit without restarting music on an ordinary visit.
-Controls cycle the four existing packed
-action-key descriptors, swapping occupied bindings; the host's corresponding
-gamepad-to-key mappings continue to apply. This is not independent arbitrary
-keyboard/gamepad capture. Tongue Lash and Hurl intentionally share one action.
-Modal confirmation/back/navigation remain fixed. Exit/back flushes dirty
-settings using the original registry names and DWORD formats, so the retail
-loader restores them on subsequent runs. A failed flush leaves the menu open
-with an error and allows retry.
+Audio provides 0-100 Sound/Voice/Music sliders, adjusted in five-point steps
+or by clicking/dragging their rails. They call the original volume setters and
+update an already-playing music buffer's attenuation. Rails and knobs are
+native raster rectangles, drawn before fade shading on CPU and GPU-owned output.
+Music Test retains the original installed-track sequence and title-track
+restoration without restarting music on an ordinary visit.
+
+Video lists every compiled packet renderer and each supported bgfx graphics
+API. Renderer/API selection takes effect on restart. Desktop display mode
+switches immediately between Windowed, Borderless fullscreen and Exclusive
+fullscreen; Android exposes only its fullscreen mode. Render resolution defaults
+to the display aspect ratio at 240 vertical pixels (427x240 on a 1920x1080
+display). Resolution choices include higher standard heights and the native
+display size; they apply after closing Options, once the retained-title fades
+have released their old-size resources. Explicit `--renderer` and
+`--render-size` arguments take precedence over saved preferences at startup.
+Live resizing keeps the retail packet arena and cached CEL pointers intact;
+desktop/mobile builds reserve a four-megabyte arena covering the supported
+16-megapixel viewport limit rather than relocating it during a title callback.
+Vsync stays enabled. Triple buffering requests three swapchain images on bgfx
+Vulkan/Metal/Direct3D 11/12 (Metal uses the public frame-latency setting to
+control its drawable count); other active backends explicitly report that it is
+unavailable instead of pretending to enable it.
+
+Versioned DWORD preferences live under `Software\\GexRecomp\\Options` in the
+existing atomic `settings.reg` store. Existing retail audio switches and keyboard
+bindings are migrated on first use; the retail guest keeps canonical action keys,
+while the host applies the independent physical bindings. Exit/back from
+categories flushes pending settings. A failed flush leaves the menu open with
+an error and allows retry.
 
 The `password-decks` test uses the real lifted encoder, writes a checkpoint,
 restarts in a separate process, and restores through the retail initializer.
@@ -1136,9 +1174,13 @@ checks that the waiting worker's guest registers survive the handoff.
 Additional cases reject checksum-valid passwords with out-of-range retail
 fields. This is a controlled progress fixture, not a full playthrough to earn
 every password TV. Arbitrary position/health save states are not implemented.
-Options cases check audio state, music-track restoration, binding swaps through
-the retail input poller, separate-process registry reload, persistence failure
-and retry, fixed confirmation, pointer Exit and platform-mask matching.
+Options cases check category navigation, slider limits, music-track restoration,
+independent keyboard/gamepad capture, conflicts, canonical retail input,
+separate-process reload, persistence failure/retry and submenu Exit.
+`options-screens` enters Options through the real title callback on software and
+bgfx, captures every category, exercises a dragged slider, and returns through
+the title fades. Input tests cover remapping, Pause versus Jump, context changes,
+and releasing the key that opened binding capture.
 
 The legacy MSVC native32 host and Dreamcast retain their original menu/password
 flow. The new hooks are compile-gated out on both; Dreamcast currently has no

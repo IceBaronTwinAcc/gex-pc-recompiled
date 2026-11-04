@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "platform/gl/context.h"
+#include "platform/desktop/app_icon.h"
 #include "renderer.h"
 
 gex_gl_gen_fn gex_gl_gen_framebuffers;
@@ -45,7 +46,7 @@ void gex_gl_close(void) {
 int gex_gl_open(char *error, size_t size) {
     SDL_Window *saved_window = SDL_GL_GetCurrentWindow();
     SDL_GLContext saved_context = SDL_GL_GetCurrentContext();
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO))
+    if (gex_app_video_init())
         goto failed;
     video_owned = 1;
     if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 1) ||
@@ -53,7 +54,7 @@ int gex_gl_open(char *error, size_t size) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0) ||
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0) || SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0))
         goto failed;
-    window = SDL_CreateWindow(
+    window = gex_app_window(
         "Gex - OpenGL 1.2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (headless ? SDL_WINDOW_HIDDEN : 0));
     if (window)
@@ -77,7 +78,7 @@ int gex_gl_open(char *error, size_t size) {
     LOAD(gex_gl_attach_texture, "glFramebufferTexture2D");
     LOAD(gex_gl_framebuffer_status, "glCheckFramebufferStatus");
 #undef LOAD
-    if (SDL_GL_SetSwapInterval(0))
+    if (SDL_GL_SetSwapInterval(headless ? 0 : 1))
         fprintf(stderr, "[opengl12] swap control unavailable: %s\n", SDL_GetError());
     if (SDL_GL_MakeCurrent(saved_context ? saved_window : window, saved_context))
         goto failed;

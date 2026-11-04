@@ -21,6 +21,21 @@ static int configure(const gex_render_frame *frame, char *error, size_t size) {
 
 static int present(const gex_render_frame *frame, char *error, size_t size) {
     HWND window = (HWND)(uintptr_t)MEM32(0x4875A0);
+    static HWND icon_window;
+    if (window && window != icon_window) {
+        HMODULE module = GetModuleHandleA(NULL);
+        HICON large = LoadImageA(module, MAKEINTRESOURCEA(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+        HICON small = LoadImageA(module, MAKEINTRESOURCEA(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+        if (!large || !small) {
+            snprintf(error, size, "cannot load application icon (%lu)", GetLastError());
+            return -1;
+        }
+        SendMessageA(window, WM_SETICON, ICON_BIG, (LPARAM)large);
+        SendMessageA(window, WM_SETICON, ICON_SMALL, (LPARAM)small);
+        icon_window = window;
+    }
     RECT rect;
     HDC dc = GetDC(window);
     if (!dc || !GetClientRect(window, &rect)) {

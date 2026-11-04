@@ -60,6 +60,7 @@ SCREEN_HOOKS = {
         "    gex_graphics_pause_end();",
 }
 VIEW_HOOKS = {
+    "L_0040A882:": "    gex_graphics_hold_black(0);",
     "L_0044093B:": "    RECOMP_CALL(sub_00405120);\n    RECOMP_FLAGS_IN();",
     "L_00440ACE:": "    RECOMP_CALL(sub_00405120);\n    RECOMP_FLAGS_IN();",
     "L_0040A0AD:": "    gex_graphics_camera_begin();",

@@ -7,6 +7,7 @@
 #include "save_store.h"
 #include "save_menu.h"
 #include "options_menu.h"
+#include "preferences.h"
 #include "renderer.h"
 #include "graphics_guest.h"
 #include "platform/host.h"
@@ -217,7 +218,7 @@ static void validation(void) {
 
 static void options_input_test(void) {
     static const struct { unsigned key, action; } bindings[] = {
-        {'C', 0x20}, {'Z', 0x80}, {'X', 4}, {'V', 0x40}
+        {'C', 0x80}, {'Z', 0x20}, {'X', 0x40}, {'V', 4}
     };
     MEM32(0x487FF8) = 0;
     MEM32(0x455018) = UINT32_MAX;
@@ -231,13 +232,23 @@ static void options_input_test(void) {
 
 static void options_test(const char *mode, const char *settings) {
     CHECK(!hle_reg_load(settings));
+    CHECK(!gex_options_load());
+    if (!strcmp(mode, "options-read")) {
+        int next = 0;
+        for (int i = 1; i < 5; ++i)
+            if (gex_renderer_available(i)) { next = i; break; }
+        CHECK(gex_prefs.renderer == next && gex_prefs.api == GEX_API_AUTO);
+    }
+    CHECK(!gex_options_video_init(0, 320, 240));
     if (!strcmp(mode, "options-read")) {
         hle_call_guest(0x408B60, 0, NULL);
-        for (unsigned i = 0; i < 3; ++i) CHECK(!MEM32(0x455000 + i * 4));
-        CHECK(MEM32(0x45560C) == 0x082C005A); /* Lash/Hurl: Z, controller X. */
-        CHECK(MEM32(0x4555D0) == 0x082E0043);
-        CHECK(MEM32(0x455594) == 0x082F0056); /* Jump: V, controller Y/shoulders. */
-        CHECK(MEM32(0x455648) == 0x082D0058);
+        for (unsigned i = 0; i < 3; ++i) CHECK(gex_prefs.volume[i] == 0);
+        CHECK(gex_prefs.bindings[GEX_ACTION_LASH].key == 'Q');
+        CHECK(gex_prefs.bindings[GEX_ACTION_HURL].key == 'W');
+        CHECK(gex_prefs.bindings[GEX_ACTION_LASH].button == GEX_PAD_L);
+        CHECK(gex_prefs.bindings[GEX_ACTION_HURL].button == GEX_PAD_R);
+        CHECK(gex_prefs.bindings[GEX_ACTION_JUMP].key == 'X');
+        CHECK(gex_prefs.bindings[GEX_ACTION_CONFIRM].key == 'X');
         options_input_test();
         return;
     }
@@ -245,7 +256,10 @@ static void options_test(const char *mode, const char *settings) {
         CHECK(!gex_file_remove(settings));
         CHECK(!gex_directory_create(settings));
         gex_options_begin();
-        CHECK(!gex_options_key(0x27));
+        CHECK(!gex_options_pointer(60, 105)); /* Audio category. */
+        CHECK(!gex_options_key(0x27)); /* Raise the Sound slider from zero. */
+        CHECK(gex_prefs.volume[0] == 5);
+        CHECK(!gex_options_key(0x1B)); /* Back returns to categories, not the title. */
         CHECK(!gex_options_key(0x1B)); /* Failed persistence keeps the menu open. */
         CHECK(!gex_directory_remove(settings));
         CHECK(gex_options_key(0x1B)); /* The same change can be retried. */
@@ -279,22 +293,24 @@ static void options_test(const char *mode, const char *settings) {
     uint32_t effects = MEM32(0x455000), voice = MEM32(0x455004);
     gex_options_begin();
     CHECK(!gex_options_scaled_text());
-    CHECK(!gex_options_pointer(60, 55)); /* The boundary belongs to Voice, not Sound. */
-    CHECK(MEM32(0x455000) == effects && MEM32(0x455004) == !voice);
-    CHECK(!gex_options_pointer(60, 55));
-    CHECK(MEM32(0x455004) == voice);
+    CHECK(!gex_options_key(0x27)); /* Root left/right never changes a setting. */
+    CHECK(MEM32(0x455000) == effects && MEM32(0x455004) == voice);
     uint32_t request = MEM32(0x48A034);
-    CHECK(!gex_options_pointer(60, 105)); /* Controls is a heading, not Music Test. */
+    CHECK(!gex_options_pointer(60, 65)); /* Open Controls, without playing Music Test. */
     CHECK(MEM32(0x48A034) == request);
+    CHECK(!gex_options_pointer(60, 39)); /* Gameplay heading is not selectable. */
+    CHECK(!gex_binding_key_filter);
     gex_options_end();
     MEM32(0x48A034) = 0; /* The worker has consumed the title's music request. */
     gex_options_begin();
     gex_options_end();
     CHECK(!MEM32(0x48A034)); /* Merely opening Options must not restart music. */
     gex_options_begin();
+    CHECK(!gex_options_pointer(60, 105));
     for (unsigned i = 0; i < 3; ++i) {
-        CHECK(!gex_options_key(0x27));
+        for (unsigned step = 0; step < 22; ++step) CHECK(!gex_options_key(0x25));
         CHECK(!MEM32(0x455000 + i * 4));
+        CHECK(gex_prefs.volume[i] == 0);
         CHECK(!gex_options_key(0x28));
     }
     CHECK((int32_t)MEM32(0x49FB20) == -10000);
@@ -307,28 +323,77 @@ static void options_test(const char *mode, const char *settings) {
     CHECK(MEM32(0x48A034) == 110);
     CHECK(!gex_options_key(0x25));
     CHECK(MEM32(0x48A034) == 239);
-    CHECK(!gex_options_key(0x28));
-    CHECK(!gex_options_key(0x27)); /* Lash swaps with Whip rather than orphaning it. */
-    CHECK(MEM32(0x45560C) == 0x082C005A && MEM32(0x4555D0) == 0x082E0043);
-    CHECK(!gex_options_key(0x28));
-    CHECK(!gex_options_key(0x28));
-    CHECK(!gex_options_key(0x27));
-    CHECK(MEM32(0x455594) == 0x082F0056 && MEM32(0x455648) == 0x082D0058);
+    CHECK(!gex_options_key(0x1B));
+    CHECK(!gex_options_pointer(60, 65));
+    CHECK(!gex_options_key(0x0D));
+    CHECK(gex_binding_key_filter != NULL);
+    CHECK(gex_binding_key_filter(1, 'X', 0x2D)); /* Reject a binding used by Jump. */
+    CHECK(gex_binding_key_filter != NULL);
+    CHECK(gex_binding_key_filter(1, 'Q', 0x10));
+    CHECK(!gex_binding_key_filter);
+    CHECK(gex_prefs.bindings[GEX_ACTION_LASH].key == 'Q');
+    CHECK(!gex_options_key(0x27)); /* Select the gamepad column. */
+    CHECK(!gex_options_key(0x0D));
+    CHECK(gex_binding_pad_filter != NULL);
+    CHECK(gex_binding_pad_filter(GEX_PAD_L));
+    CHECK(!gex_binding_pad_filter);
+    CHECK(!gex_options_pointer(70, 180)); /* Hurl has its own keyboard binding. */
+    CHECK(gex_binding_key_filter && gex_binding_key_filter(1, 'W', 0x11));
+    CHECK(!gex_options_pointer(210, 180));
+    CHECK(gex_binding_pad_filter && gex_binding_pad_filter(GEX_PAD_R));
+    CHECK(gex_prefs.bindings[GEX_ACTION_HURL].key == 'W');
     options_input_test();
-    CHECK(!gex_options_key(0x28));
-    CHECK(!gex_options_key(0x28));
-    CHECK(gex_options_key('X')); /* Confirm remains fixed despite Jump rebinding. */
+    for (unsigned i = 1; i < 8; ++i) CHECK(!gex_options_key(0x28));
+    CHECK(!gex_options_key(0x0D)); /* Submenu Exit only returns one level. */
+    CHECK(gex_options_key(0x1B));
     gex_options_end();
     CHECK(MEM32(0x48A034) == 110);
     gex_options_begin();
     CHECK(!gex_options_pointer(319, 239));
-    CHECK(gex_options_pointer(60, 215));
+    CHECK(gex_options_pointer(60, 195));
     gex_options_end();
     gex_options_begin();
     CHECK(!gex_options_key(0x26)); /* Up wraps to Exit. */
     CHECK(!gex_options_key(0x25));
     CHECK(!gex_options_key(0x27));
     CHECK(gex_options_key(0x0D));
+    gex_options_end();
+    gex_options_begin();
+    CHECK(!gex_options_pointer(60, 140)); /* Video category. */
+    CHECK(!gex_options_pointer(60, 150));
+    CHECK(gex_prefs.display == GEX_DISPLAY_BORDERLESS);
+    CHECK(!gex_options_pointer(60, 150));
+    CHECK(gex_prefs.display == GEX_DISPLAY_EXCLUSIVE);
+    CHECK(!gex_options_pointer(60, 150));
+    CHECK(gex_prefs.display == GEX_DISPLAY_WINDOWED);
+    CHECK(!gex_options_key(0x28));
+    CHECK(!gex_options_key(0x28));
+    CHECK(!gex_options_key(0x27)); /* Software must not claim triple-buffer support. */
+    CHECK(!gex_prefs.triple);
+    static const int triple_apis[] = {GEX_API_VULKAN, GEX_API_METAL, GEX_API_D3D11, GEX_API_D3D12};
+    for (unsigned i = 0; i < sizeof triple_apis / sizeof *triple_apis; ++i) {
+        gex_prefs.active_renderer = 4;
+        gex_prefs.active_api = triple_apis[i];
+        CHECK(!gex_options_key(0x27) && gex_prefs.triple);
+        CHECK(!gex_options_key(0x27) && !gex_prefs.triple);
+    }
+    gex_prefs.active_renderer = 0;
+    gex_prefs.active_api = GEX_API_AUTO;
+    unsigned seen = 1, choices = 0;
+    for (unsigned i = 0; i < 3; ++i) CHECK(!gex_options_key(0x26));
+    do {
+        CHECK(!gex_options_key(0x27));
+        CHECK(gex_renderer_available(gex_prefs.renderer));
+        seen |= 1u << gex_prefs.renderer;
+        if (gex_prefs.renderer == 4 && gex_prefs.api)
+            CHECK(gex_prefs.supported_apis & (1u << gex_prefs.api));
+    } while ((gex_prefs.renderer || gex_prefs.api) && ++choices < 16);
+    CHECK(choices < 16);
+    for (int i = 0; i < 5; ++i)
+        CHECK(((seen >> i) & 1) == (unsigned)gex_renderer_available(i));
+    CHECK(!gex_options_key(0x27)); /* Persist the next compiled backend. */
+    CHECK(!gex_options_key(0x1B));
+    CHECK(gex_options_key(0x1B));
     gex_options_end();
 }
 

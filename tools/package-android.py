@@ -58,8 +58,10 @@ def main():
                 archive.write(path, path.relative_to(classes))
         run(tools / "d8", "--min-api", "26", "--lib", android, "--output", dex, jar)
         unsigned = work / "unsigned.apk"
+        resources = work / "resources.zip"
+        run(tools / "aapt2", "compile", "--dir", root / "android/res", "-o", resources)
         run(tools / "aapt2", "link", "-o", unsigned, "-I", android,
-            "--manifest", root / "android/AndroidManifest.xml")
+            "--manifest", root / "android/AndroidManifest.xml", "-R", resources)
         with zipfile.ZipFile(unsigned, "a", zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(dex.glob("*.dex")):
                 archive.write(path, path.name)

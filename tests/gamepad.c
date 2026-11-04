@@ -16,10 +16,20 @@ const recomp_dispatch_entry_t recomp_dispatch_table[] = {{0, NULL}};
 const uint32_t recomp_dispatch_count = 0;
 static int failures;
 static uint32_t async_key;
+static int configured_menu;
+static int menu_context(void) { return configured_menu; }
 
 #define CHECK(expression) do { \
     if (!(expression)) { fprintf(stderr, "%s:%d: %s (%s)\n", __FILE__, __LINE__, #expression, SDL_GetError()); ++failures; } \
 } while (0)
+
+static int capture_key_test(int down, uint32_t vk, uint32_t scan) {
+    if (down) {
+        CHECK(vk == 'Q' && scan == 0x10);
+        gex_binding_key_filter = NULL;
+    }
+    return 1;
+}
 
 static unsigned key(uint32_t vk) {
     uint32_t args[] = {vk};
@@ -143,6 +153,29 @@ int main(void) {
     CHECK(hle_screen_key_hook(SDL_SCANCODE_X, 0));
     CHECK(!key('X') && !key(0x13));
     CHECK(!hle_screen_key_hook(SDL_SCANCODE_F1, 1));
+    gex_preferences_reset();
+    gex_controls_menu_hook = menu_context;
+    CHECK(!gex_controls_bind(GEX_ACTION_JUMP, 0, 'Q', 0x10));
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_Q, 1));
+    CHECK(key('X') == 0x8001);
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_Q, 0));
+    CHECK(!key('X'));
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_X, 1));
+    CHECK(!key('X')); /* The old Jump key must not leak through. */
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_X, 0));
+    configured_menu = 1;
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_RETURN, 1));
+    CHECK(key('X') == 0x8001);
+    gex_binding_key_filter = capture_key_test;
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_RETURN, 0));
+    CHECK(!key('X')); /* Release the capture-triggering key normally. */
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_Q, 1));
+    CHECK(!gex_binding_key_filter);
+    CHECK(!key('X'));
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_Q, 0));
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_RETURN, 1));
+    CHECK(key('X') == 0x8001);
+    CHECK(hle_screen_key_hook(SDL_SCANCODE_RETURN, 0));
     gex_gamepad_shutdown();
     CHECK(!key('Z') && !hle_screen_key_hook);
     CHECK(!SDL_JoystickDetachVirtual(index));

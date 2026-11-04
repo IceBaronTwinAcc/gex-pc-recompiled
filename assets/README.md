@@ -1,3 +1,32 @@
+# Application icon
+
+`icons/source.png` is the user-supplied Gex Recompiled icon. All platform icons
+are generated from it, retaining transparency and aspect ratio with square
+padding rather than stretching or cropping.
+
+```sh
+python tools/app_icon.py generate
+```
+
+Regeneration requires Pillow; normal builds use only Python's standard library.
+Windows embeds the multi-resolution ICO in the executable. macOS bundles and
+distributes the ICNS in `Contents/Resources`. SDL windows use an embedded
+alpha-capable bitmap, including the software, bgfx and fixed-function GL paths.
+Android packages density-specific launcher icons and a safely inset adaptive
+foreground on a black background for system-selected masks.
+
+Linux installs the desktop entry and hicolor icons with the executable:
+
+```sh
+cmake --install build/linux/release --prefix "$HOME/.local"
+```
+
+Keep `$HOME/.local/bin` on `PATH` when using this per-user installation.
+X11 window class and Wayland application ID both use `org.gexrecomp.app`,
+matching the desktop entry and installed icon name. Dreamcast disc executables
+have no application launcher icon; this does not change disc boot branding or
+VMU save icons.
+
 # Video Deck artwork
 
 `save-menu.bin` is the background and ten selected-control states extracted from

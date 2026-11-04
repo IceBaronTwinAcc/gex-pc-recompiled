@@ -1018,6 +1018,95 @@ static void screen_layouts(uint32_t atlas, uint32_t packet) {
     MEM32(0x4A2990) = MEM32(0x455B84) = 0;
 }
 
+static void menu_clipping(uint32_t atlas, int hardware) {
+    const int sizes[][2] = {{320, 224}, {854, 480}, {240, 427}};
+    uint32_t stack = g_esp;
+    for (unsigned size = 0; size < sizeof sizes / sizeof *sizes; ++size) {
+        int width = sizes[size][0], height = sizes[size][1];
+        CHECK(!gex_graphics_set_render_size(width, height));
+        gex_graphics_packet_arena();
+        uint32_t packet = MEM32(0x4A2AE0);
+        memset(hle_ptr(atlas), 0, 0x100000);
+        memset(hle_ptr(packet), 0, 120);
+        MEM32(0x4A2964) = 63;
+        MEM32(0x4A2990) = MEM32(0x4A2958) = 0;
+        MEM32(0x451040) = MEM32(0x4A294C) = 0;
+        MEM32(0x450008) = 0; MEM32(0x45000C) = 320;
+        MEM32(0x450010) = 8; MEM32(0x450014) = 232;
+        if (hardware) CHECK(!gex_graphics_enable_gpu());
+        for (unsigned i = 0; i < 3; ++i) {
+            uint32_t p = packet + i * 40;
+            MEM8(p + 7) = 0x60;
+            MEM16(p + 10) = 8; MEM16(p + 14) = 224;
+            MEM16(p + 12) = i == 1 ? 320 : 160;
+        }
+        MEM8(packet + 4) = MEM8(packet + 5) = MEM8(packet + 6) = 248;
+        MEM8(packet + 84) = 248;
+        MEM16(packet + 88) = 160;
+        for (int pass = 0; pass < 3; ++pass) {
+            gex_graphics_begin_frame();
+            MEM32(0x4A2AE4) = pass == 1 ? MEM32(0x4A2ADC) - 40 : packet;
+            gex_graphics_menu_clip_begin(50, 197);
+            MEM32(0x4A2AE4) = packet + 40;
+            gex_graphics_menu_clip_end();
+            if (pass == 2) gex_graphics_end_frame();
+            gex_graphics_draw_packet(packet + 40);
+            gex_graphics_draw_packet(packet);
+            gex_graphics_draw_packet(packet + 80);
+            gex_graphics_end_frame();
+            gex_graphics_flush(); g_esp = stack;
+            gex_render_frame frame;
+            CHECK(!gex_renderer_frame(&frame));
+            gex_render_rect rect = gex_renderer_fit(width, height, 320, 224);
+            int split = rect.x + 160 * rect.width / 320;
+            int top = rect.y + 50 * rect.height / 224;
+            int bottom = rect.y + 197 * rect.height / 224;
+            for (int y = 0; y < height; ++y)
+                for (int x = 0; x < width; ++x) {
+                    unsigned expected = 0;
+                    if (x >= rect.x && x < rect.x + rect.width &&
+                        y >= rect.y && y < rect.y + rect.height) {
+                        if (x >= split) expected = 31;
+                        else if (pass == 2 || (y >= top && y < bottom)) expected = 0x7FFF;
+                    }
+                    CHECK(frame_pixel(&frame, x, y) == rgb565(expected));
+                }
+        }
+        gex_graphics_shutdown();
+    }
+}
+
+static void scene_blackout(uint32_t atlas, int hardware) {
+    CHECK(!gex_graphics_set_render_size(320, 224));
+    gex_graphics_packet_arena();
+    uint32_t packet = MEM32(0x4A2AE0), stack = g_esp;
+    memset(hle_ptr(atlas), 0, 0x100000);
+    memset(hle_ptr(packet), 0, 40);
+    MEM8(packet + 4) = 248; MEM8(packet + 7) = 0x60;
+    MEM16(packet + 10) = 8; MEM16(packet + 12) = 320; MEM16(packet + 14) = 224;
+    MEM32(0x4A2964) = 63;
+    MEM32(0x4A2990) = MEM32(0x4A2958) = 0;
+    MEM32(0x451040) = MEM32(0x4A294C) = 0;
+    MEM32(0x450008) = 0; MEM32(0x45000C) = 320;
+    MEM32(0x450010) = 8; MEM32(0x450014) = 232;
+    if (hardware) CHECK(!gex_graphics_enable_gpu());
+    for (int pass = 0; pass < 4; ++pass) {
+        gex_graphics_hold_black(pass == 1 || pass == 2);
+        gex_graphics_frame_shade(pass >= 2 ? 128 : 255);
+        gex_graphics_begin_frame();
+        gex_graphics_draw_packet(packet);
+        gex_graphics_end_frame();
+        gex_graphics_flush(); g_esp = stack;
+        gex_render_frame frame;
+        CHECK(!gex_renderer_frame(&frame));
+        unsigned expected = pass == 0 ? 0xF800 : pass == 3 ? 0x7800 : 0;
+        for (int y = 0; y < frame.height; ++y)
+            for (int x = 0; x < frame.width; ++x)
+                CHECK(frame_pixel(&frame, x, y) == expected);
+    }
+    gex_graphics_shutdown();
+}
+
 static void screen_transitions(uint32_t atlas) {
     const int sizes[][2] = {{427, 240}, {854, 480}, {240, 427}};
     uint32_t stack = g_esp;
@@ -1478,6 +1567,8 @@ int main(int argc, char **argv) {
         hardware_coherence(atlas, quad);
         CHECK(!gex_renderer_init(gex_renderer_backend_get(), 1));
         hud_packets(atlas, 1, 1);
+        menu_clipping(atlas, 1);
+        scene_blackout(atlas, 1);
         gex_renderer_shutdown();
         mach_leave();
 #if GEX_ENABLE_BGFX_RENDERER
@@ -1501,6 +1592,8 @@ int main(int argc, char **argv) {
     hud_packets(atlas, 1, 0);
     expanded_viewport(atlas, quad);
     screen_layouts(atlas, quad);
+    menu_clipping(atlas, 0);
+    scene_blackout(atlas, 0);
     screen_transitions(atlas);
     transition_layout(atlas);
     recycled_backdrops(atlas);

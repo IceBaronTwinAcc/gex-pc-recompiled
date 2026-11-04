@@ -6,6 +6,7 @@
     <key>CFBundleIdentifier</key><string>org.gexrecomp.app</string>
     <key>CFBundleName</key><string>Gex Recompiled</string>
     <key>CFBundleDisplayName</key><string>Gex Recompiled</string>
+    <key>CFBundleIconFile</key><string>gex.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>${PROJECT_VERSION}</string>
     <key>CFBundleShortVersionString</key><string>${PROJECT_VERSION}</string>

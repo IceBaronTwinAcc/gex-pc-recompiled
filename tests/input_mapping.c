@@ -1,11 +1,15 @@
 #include <stdio.h>
 #include "gamepad.h"
 #include "platform/input.h"
+#include "preferences.h"
 
 static gex_input_state snapshot;
 static int poll_ready = 1, failures;
 static unsigned held[256], presses[256];
 static unsigned event_count;
+static int in_menu;
+static int menu_context(void) { return in_menu; }
+static int capture_button(uint32_t buttons) { return buttons != 0; }
 
 int gex_host_input_init(int headless) { (void)headless; return 0; }
 int gex_host_input_poll(gex_input_state *state) {
@@ -83,5 +87,61 @@ int main(void) {
     CHECK(held['X']);
     gex_gamepad_shutdown();
     CHECK(!held['X']);
+    gex_preferences_reset();
+    gex_controls_menu_hook = menu_context;
+    poll_ready = 1;
+    snapshot = (gex_input_state){.focused = 1, .connected = 1};
+    CHECK(!gex_gamepad_init(1));
+    snapshot.buttons = GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(held[0x1B] && !held['X']); /* Pause is no longer conflated with Jump. */
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    CHECK(!gex_controls_bind(GEX_ACTION_LASH, 1, GEX_PAD_L, 0));
+    snapshot.buttons = GEX_PAD_L;
+    gex_gamepad_pump();
+    CHECK(held['C'] && !held['V']);
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    CHECK(!gex_controls_bind(GEX_ACTION_HURL, 0, 'Q', 0x10));
+    CHECK(gex_controls_keyboard('Q') == 1u << GEX_KEY_C);
+    CHECK(gex_controls_bind(GEX_ACTION_LASH, 0, 'X', 0x2D) == -1);
+    CHECK(gex_controls_bind(GEX_ACTION_JUMP, 1, GEX_PAD_Y, 0) == -1);
+    CHECK(gex_controls_bind(GEX_ACTION_CONFIRM, 0, 0x1B, 1) == -1);
+    CHECK(gex_controls_bind(GEX_ACTION_BACK, 0, 0x0D, 0x1C) == -1);
+    CHECK(gex_controls_bind(GEX_ACTION_BACK, 0, 0x20, 0x39) == -1);
+    in_menu = 1;
+    snapshot.buttons = GEX_PAD_A;
+    gex_gamepad_pump();
+    CHECK(!held['X']); /* The opening press is blocked across context changes. */
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    snapshot.buttons = GEX_PAD_A;
+    gex_gamepad_pump();
+    CHECK(held['X']);
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    CHECK(!gex_controls_bind(GEX_ACTION_CONFIRM, 1, GEX_PAD_START, 0));
+    CHECK(gex_controls_gamepad(GEX_PAD_A) == 0);
+    CHECK(gex_controls_gamepad(GEX_PAD_START) == 1u << GEX_KEY_X);
+    gex_binding_pad_filter = capture_button;
+    snapshot.buttons = GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(!held['X']);
+    gex_binding_pad_filter = NULL;
+    gex_gamepad_pump();
+    CHECK(!held['X']); /* Captured buttons stay consumed until released. */
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    snapshot.buttons = GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(held['X']);
+    int width, height;
+    CHECK(!gex_preferences_default_size(1920, 1080, &width, &height));
+    CHECK(width == 427 && height == 240);
+    CHECK(!gex_preferences_default_size(1280, 1024, &width, &height));
+    CHECK(width == 300 && height == 240);
+    CHECK(gex_preferences_default_size(0, 1080, &width, &height) == -1);
+    gex_gamepad_shutdown();
     return failures ? 1 : 0;
 }

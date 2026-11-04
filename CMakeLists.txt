@@ -44,6 +44,24 @@ if(NOT EXISTS "${GEX_PLATFORM_FILE}")
     message(FATAL_ERROR "Platform manifest does not exist: ${GEX_PLATFORM_FILE}")
 endif()
 include("${GEX_PLATFORM_FILE}")
+if(GEX_PLATFORM_DESKTOP_TESTS)
+    set(GEX_APP_ICON_HEADER "${CMAKE_CURRENT_BINARY_DIR}/app_icon_data.h")
+    add_custom_command(OUTPUT "${GEX_APP_ICON_HEADER}"
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/app_icon.py"
+            embed "${GEX_APP_ICON_HEADER}"
+        DEPENDS tools/app_icon.py assets/icons/window.bmp VERBATIM)
+    add_library(gex_app_icon STATIC src/platform/desktop/app_icon.c "${GEX_APP_ICON_HEADER}")
+    target_include_directories(gex_app_icon PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(gex_app_icon PRIVATE ${GEX_PLATFORM_LIBRARIES})
+    if(BUILD_TESTING)
+        add_executable(gex_app_icon_test tests/app_icon.c "${GEX_APP_ICON_HEADER}")
+        target_include_directories(gex_app_icon_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_link_libraries(gex_app_icon_test PRIVATE gex_app_icon ${GEX_PLATFORM_LIBRARIES})
+        add_test(NAME application-icon COMMAND gex_app_icon_test)
+        set_tests_properties(application-icon PROPERTIES TIMEOUT 10
+            ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+    endif()
+endif()
 option(GEX_ENABLE_SOFTWARE_RENDERER "Build CPU packet rasterization" ON)
 if(GEX_PACKET_GPU_SOURCE)
     set(GEX_OPENGL_DEFAULT ON)
@@ -82,12 +100,18 @@ target_compile_definitions(gex_renderer PUBLIC
     GEX_ENABLE_GLDC_RENDERER=$<BOOL:${GEX_ENABLE_GLDC_RENDERER}>
     GEX_ENABLE_BGFX_RENDERER=$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>
     GEX_ENABLE_OPENGL_RENDERER=$<BOOL:${GEX_ENABLE_OPENGL_RENDERER}>)
+add_library(gex_preferences STATIC src/preferences.c)
+target_link_libraries(gex_preferences PUBLIC gex_renderer)
 if(GEX_ENABLE_PVR_RENDERER)
     set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/dreamcast/packet_gpu.c")
 elseif(NOT GEX_ENABLE_OPENGL_RENDERER)
     set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/packet_gpu_none.c")
 endif()
 add_library(gex_packet_gpu STATIC "${GEX_PACKET_GPU_SOURCE}" src/platform/packet_gpu_select.c)
+target_link_libraries(gex_packet_gpu PRIVATE gex_preferences)
+if(TARGET gex_app_icon)
+    target_link_libraries(gex_packet_gpu PRIVATE gex_app_icon)
+endif()
 set_source_files_properties("${GEX_PACKET_GPU_SOURCE}" PROPERTIES
     COMPILE_DEFINITIONS gex_packet_gpu_get=gex_packet_gpu_platform_get)
 target_include_directories(gex_packet_gpu PUBLIC src)
@@ -204,6 +228,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(gex_input_mapping_test tests/input_mapping.c src/gamepad.c)
     target_include_directories(gex_input_mapping_test PRIVATE src)
+    target_link_libraries(gex_input_mapping_test PRIVATE gex_preferences)
     add_test(NAME portable-input-mapping COMMAND gex_input_mapping_test)
     add_executable(gex_sha256_test tests/sha256.c src/sha256.c)
     target_include_directories(gex_sha256_test PRIVATE src)
@@ -264,11 +289,15 @@ else()
         "${PCRECOMP_DIR}/runtime/recomp32" src)
     target_compile_options(gex_hle PRIVATE -fno-strict-aliasing -fwrapv)
     add_library(gex_runtime_platform STATIC ${GEX_RUNTIME_PLATFORM_SOURCES})
+    if(TARGET gex_app_icon)
+        target_link_libraries(gex_runtime_platform PRIVATE gex_app_icon)
+    endif()
     target_compile_definitions(gex_runtime_platform PRIVATE GEX_NO_DIRECTDRAW)
     target_include_directories(gex_runtime_platform PRIVATE src
         "${PCRECOMP_DIR}/runtime/win32hle" "${PCRECOMP_DIR}/runtime/recomp32")
     target_link_libraries(gex_runtime_platform PRIVATE ${GEX_PLATFORM_LIBRARIES})
     target_link_libraries(gex_hle PUBLIC gex_runtime_platform)
+    target_link_libraries(gex_hle PUBLIC gex_preferences)
     target_link_libraries(gex_host PUBLIC gex_hle)
     add_library(gex_renderer_backend STATIC "${GEX_RENDERER_BACKEND_SOURCE}")
     if(GEX_ENABLE_BGFX_RENDERER)
@@ -440,6 +469,9 @@ if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_RUNTIME STREQUAL "native32") AND 
         set_target_properties(gex_recomp PROPERTIES MACOSX_BUNDLE TRUE
             OUTPUT_NAME "Gex Recompiled"
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/Info.plist.in")
+        set(GEX_MACOS_ICON "${PROJECT_SOURCE_DIR}/assets/icons/gex.icns")
+        set_source_files_properties("${GEX_MACOS_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        target_sources(gex_recomp PRIVATE "${GEX_MACOS_ICON}")
         add_custom_command(TARGET gex_recomp POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E make_directory
                 "$<TARGET_BUNDLE_DIR:gex_recomp>/Contents/Resources")
@@ -469,6 +501,22 @@ if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_RUNTIME STREQUAL "native32") AND 
         endif()
     endif()
 endif()
+if(WIN32)
+    enable_language(RC)
+    configure_file(cmake/windows/app.rc.in "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/app.rc" PROPERTIES
+        OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/assets/icons/gex.ico")
+    target_sources(gex_recomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    include(GNUInstallDirs)
+    install(TARGETS gex_recomp RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES cmake/linux/org.gexrecomp.app.desktop DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+    foreach(size 16 24 32 48 64 128 256 512)
+        install(FILES "assets/icons/gex-${size}.png"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/${size}x${size}/apps"
+            RENAME org.gexrecomp.app.png)
+    endforeach()
+endif()
 if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
     target_compile_definitions(gex_game PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
     target_compile_definitions(gex_recomp PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
@@ -496,6 +544,43 @@ if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
             "$<TARGET_FILE:gex_password_saves_test>" "${GEX_EXECUTABLE}"
             ${CMAKE_CROSSCOMPILING_EMULATOR})
         set_tests_properties(password-decks PROPERTIES TIMEOUT 60)
+        if(NOT CMAKE_CROSSCOMPILING)
+            add_executable(gex_options_screens_test tests/options_screens.c
+                src/platform_shims.c src/movie.c src/autoplay.c src/gameplay.c src/gamepad.c
+                src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
+            target_compile_definitions(gex_options_screens_test PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
+            target_link_libraries(gex_options_screens_test PRIVATE
+                gex_game gex_saves gex_renderer_backend gex_movie_decoder)
+            set(GEX_OPTIONS_TEST_BACKENDS "")
+            if(GEX_ENABLE_SOFTWARE_RENDERER)
+                list(APPEND GEX_OPTIONS_TEST_BACKENDS software)
+            endif()
+            if(GEX_ENABLE_BGFX_RENDERER)
+                list(APPEND GEX_OPTIONS_TEST_BACKENDS bgfx)
+            endif()
+            if(NOT GEX_OPTIONS_TEST_BACKENDS)
+                if(GEX_ENABLE_OPENGL_RENDERER)
+                    list(APPEND GEX_OPTIONS_TEST_BACKENDS opengl)
+                elseif(GEX_ENABLE_GLDC_RENDERER)
+                    list(APPEND GEX_OPTIONS_TEST_BACKENDS opengl12)
+                endif()
+            endif()
+            add_test(NAME options-screens COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/options_screens.py"
+                "$<TARGET_FILE:gex_options_screens_test>" "${GEX_EXECUTABLE}" ${GEX_OPTIONS_TEST_BACKENDS})
+            set_tests_properties(options-screens PROPERTIES TIMEOUT 60)
+            add_executable(gex_save_handoff_test tests/save_handoff.c
+                src/platform_shims.c src/movie.c src/autoplay.c src/gameplay.c src/gamepad.c
+                src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
+            target_compile_definitions(gex_save_handoff_test PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
+            target_link_libraries(gex_save_handoff_test PRIVATE
+                gex_game gex_saves gex_renderer_backend gex_movie_decoder)
+            add_test(NAME save-handoff COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/save_handoff.py"
+                "$<TARGET_FILE:gex_save_handoff_test>" "$<TARGET_FILE:gex_password_saves_test>"
+                "${GEX_EXECUTABLE}" ${GEX_OPTIONS_TEST_BACKENDS})
+            set_tests_properties(save-handoff PROPERTIES TIMEOUT 60)
+        endif()
     endif()
 endif()
 if(TARGET gex_graphics_guest_test)

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Gex Recompiled
+Comment=Native recompilation of the PC version of Gex
+Exec=gex_recomp
+Icon=org.gexrecomp.app
+Terminal=false
+Categories=Game;ActionGame;
+StartupWMClass=org.gexrecomp.app

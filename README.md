@@ -10,6 +10,8 @@ A work-in-progress AI-led static recompilation of the [Windows release of Gex (1
 
 Place the release binary beside the Gex installation folder and launch it.
 
+For Dreamcast, build a disc image using the [Google Collab notebook](https://colab.research.google.com/drive/1iSmvVwsAUM3AcrhQpQ6I9beYAy6lBi0H?usp=sharing) and run it through your preferred method of launching homebrew.
+
 ## Why GOG? Can I use another version?
 
 The GOG version was chosen due to accessibility. The physical PC release is untested; if you have it, I would greatly appreciate it if you could test it and report whether it works.
@@ -25,13 +27,14 @@ As in entirely vibecoded and only vaguely steered due to a lack of necessary kno
 
 ## Features
 
-- Native OpenGL rendering, bypassing the original software rasteriser and DirectDraw presentation.
+- Native bgfx rendering, bypassing the original software rasteriser and DirectDraw presentation.
 - Native OpenAL and DirectSound backends for audio.
 - Custom resolution support (widescreen 427x240 works fine minus the occasional odd texture tiling; usage of higher resolutions is not recommended).
+- Password saving.
 
 ## Controls
 
-Remapping is not implemented yet.
+Remapping accessible in the game settings.
 
 Keyboard:
 
@@ -42,7 +45,7 @@ Tongue - C
 Run - V
 Fullscreen - F11
 
-SDL Gamepads:
+Gamepads:
 
 Movement - D-pad/left joystick
 Jump - A

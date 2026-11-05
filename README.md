@@ -1,5 +1,7 @@
 ![GexRecompiled logo](docs/GexRecompLogo.png)
 
+[![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/1158-gex/)
+
 **Disclaimer:** This project and its coordinator are not affiliated with Crystal Dynamics, Microsoft or Square Enix. Gex is a registered trademark of Crystal Dynamics and later Square Enix, and the rights to the PC version belong to Microsoft. The trademark is used only to indicate compatibility with their software. No original game assets or code is being distributed through this project.
 
 ## What is this?

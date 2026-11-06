@@ -29,7 +29,7 @@ As in entirely vibecoded and only vaguely steered due to a lack of necessary kno
 
 ## Features
 
-- Native bgfx rendering, bypassing the original software rasteriser and DirectDraw presentation.
+- Native bgfx (OpenGL, ES, Vulkan, Metal, DirectX 11&12) rendering, bypassing the original software rasteriser and DirectDraw presentation.
 - Native OpenAL and DirectSound backends for audio.
 - Custom resolution support (widescreen 427x240 works fine minus the occasional odd texture tiling; usage of higher resolutions is not recommended).
 - Password saving.
@@ -57,8 +57,6 @@ Run - Right shoulder button
 
 ## Planned features
 
-- Ingame settings
-- Remapping
 - Texture pack support
 - UWP (Xbox One/Series) support, feel free to contact if you're able to test on Xbox One
 

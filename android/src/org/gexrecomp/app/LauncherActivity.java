@@ -102,7 +102,7 @@ public final class LauncherActivity extends Activity {
         }
         Uri tree = data.getData();
         AlertDialog progress = new AlertDialog.Builder(this).setTitle("Importing Gex")
-            .setMessage("Validating and copying your original game into private app storage. Please wait.")
+            .setMessage("Validating and copying your original game into private app storage. This can take several minutes. Please wait.")
             .setCancelable(false).create();
         progress.show();
         new Thread(() -> {

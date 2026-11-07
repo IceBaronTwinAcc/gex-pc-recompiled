@@ -20,6 +20,11 @@ public final class GexActivity extends SDLActivity {
     }
 
     @Override
+    public void setOrientationBis(int width, int height, boolean resizable, String hint) {
+        super.setOrientationBis(width, height, resizable, "LandscapeLeft LandscapeRight");
+    }
+
+    @Override
     protected void onCreate(Bundle state) {
         gameDirectory = new File(getFilesDir(), "Gex");
         try {

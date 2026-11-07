@@ -5,6 +5,28 @@ description: Build, test, and debug this Gex recompilation with headless automat
 
 # Gex testing
 
+For build or test setup failures, see
+[`docs/build-test-troubleshooting.md`](../../../docs/build-test-troubleshooting.md).
+For renderer evidence and backend isolation, see
+[`docs/renderer-debugging.md`](../../../docs/renderer-debugging.md).
+For Android checks, device-side effects, and evidence, see
+[`docs/android-testing.md`](../../../docs/android-testing.md).
+For build and test routes on Linux, Windows, macOS, and Dreamcast, see
+[`docs/platform-build-testing.md`](../../../docs/platform-build-testing.md).
+
+## Flycast quick route
+
+For any Dreamcast emulator test, read
+[`docs/flycast-testing.md`](../../../docs/flycast-testing.md) before launching.
+It explains how to locate and verify the supplied Flycast binary, and provides
+an isolated manual-test recipe, required log markers, and failure handling.
+
+Use the user-supplied emulator first, not `/usr/bin/flycast`, an AppImage, or a
+new source build. The attachment path is local to this workspace; if missing,
+ask for its new location. Do not silently substitute stock Flycast.
+Always enable `config:Debug.SerialConsoleEnabled=yes` so guest failures are
+visible. Full-MMU initialization alone does not prove the game started.
+
 ## Safety and scope
 
 - Run from the project root and inspect the affected code before choosing checks.

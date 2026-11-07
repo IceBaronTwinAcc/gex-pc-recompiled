@@ -1191,6 +1191,9 @@ without coupling VMU storage to SDL or cabinet rendering.
 
 ### Android
 
+For an agent-oriented test checklist, including device selection and runner
+side effects, see [Android testing](android-testing.md).
+
 The development APK uses the same SDL2/POSIX runtime and unmodified bgfx as the
 desktop port. Every APK bundles **both Vulkan and OpenGL ES 3.1**, including
 SPIR-V and ESSL compute/presentation shaders. The platform window comes from
@@ -1217,7 +1220,10 @@ read/write are required; Vulkan additionally needs a compatible device driver.
 Both APIs are compiled in, but this does not add unsupported GPU capabilities.
 No on-screen controls, virtual joystick, touch-to-mouse input or soft keyboard
 are added. Connect a physical controller or keyboard; Android Back maps to
-Escape. Landscape orientation and letterboxing preserve the game's aspect.
+Escape. The launcher, import dialogs, and game stay in landscape (allowing
+either landscape direction); SDL cannot switch gameplay to portrait.
+Letterboxing preserves the game's aspect. The system folder picker controls
+its own orientation.
 
 Generate the guest sources first. On Linux, install CMake, Ninja, pkg-config,
 Make, curl, tar, Python 3.10+ and a JDK. The tested SDK layout uses platform
@@ -1273,7 +1279,9 @@ On modern Android, directly pushing shell-owned folders under
 `Android/data/` can leave them unreadable by the app.
 
 For developer deployment without the picker, stream the files as the app's
-own UID instead (available because this APK is debuggable):
+own UID instead (available because this APK is debuggable). This can overwrite
+or merge with existing private files: use it only on an authorized disposable
+installation, not the user's existing game data.
 
 ```sh
 adb -s DEVICE shell run-as org.gexrecomp.app mkdir -p files/Gex
@@ -1312,6 +1320,10 @@ isolated test settings. Its 60-second gameplay budget accommodates software
 emulator graphics without reducing the player movement or changed-frame
 requirements. The native audio fixture also checks Android lifecycle
 pause/resume through the silent OpenAL device.
+`--data` can overwrite or merge with an existing private installation.
+Even `--reuse-data` replaces the APK, stops the app, and replaces the last-run
+log. Use an explicitly authorized dedicated target; see the runbook for the
+complete side-effect and cleanup checklist.
 Full checks also require both movie completions and
 normal guest exit on each API. Temporary remote fixtures/settings are removed
 and the app is stopped afterward.
@@ -1554,14 +1566,16 @@ The checked-in runtime patch uses initialized `selectany` data on MinGW so
 condition flags, alias dispatch, x87 integer shadows, and backedge/yield state
 have one shared instance across translation units.
 
-With Wine installed, run:
+For an agent-oriented platform checklist and evidence limits, see
+[platform builds and tests](platform-build-testing.md). With Wine installed, run:
 
 ```sh
 bash tools/test-mingw.sh
 ```
 
 The script creates a disposable Wine prefix, disables graphical drivers, sets
-both SDL drivers to `dummy` inside that prefix, and runs all CTest cases,
+both SDL drivers to `dummy` inside that prefix, and runs non-GPU CTest cases
+(`-LE gpu`),
 first-level gameplay verification, complete intro playback, and normal exit.
 It never uses the user's normal Wine prefix or settings. CMake prepends Wine
 to cross-compiled C tests; Python launcher/settings tests receive the same
@@ -1867,6 +1881,12 @@ guest compatibility groups remain shared. It builds native SH4 code and uses
 the original PC executable only as data.
 
 ### Flycast compatibility
+
+For agent execution, start with [Flycast testing](flycast-testing.md).
+That short runbook prioritizes the user-supplied local emulator, provides
+isolated manual-test commands, and defines the startup evidence to check.
+Use the source-build instructions below only when a replacement is needed;
+do not rebuild Flycast for each game change.
 
 Use a Flycast development build with automatic full-MMU detection for
 non-Windows-CE software. **Flycast 2.4 is incompatible with this port.**

@@ -1,10 +1,13 @@
 #include <kos.h>
+#include <dc/vmu_fb.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "win32hle.h"
 #include "platform/host.h"
 #include "platform/filesystem.h"
+#include "vmu_image.xbm"
 
 uint32_t gex_host_ticks_ms(void) { return (uint32_t)timer_ms_gettime64(); }
 void gex_host_delay(uint32_t milliseconds) { thd_sleep(milliseconds); }
@@ -20,9 +23,27 @@ int gex_host_working_directory(char *path, size_t size) {
     fprintf(stderr, "[dreamcast] cannot read current directory: %s\n", strerror(errno));
     return -1;
 }
+static void show_vmu_image(maple_device_t *dev) {
+    vmufb_t fb;
+    vmufb_clear(&fb);
+    vmufb_paint_xbm(&fb, 0, 0, vmu_image_width, vmu_image_height,
+                    vmu_image_bits);
+    vmufb_present(&fb, dev);
+}
+
 int gex_host_settings_path(char *path, size_t size) {
     if (size) path[0] = 0;
     fprintf(stderr, "[dreamcast] settings are session-only; VMU persistence is not implemented\n");
+    for (int port = 0; port < MAPLE_PORT_COUNT; ++port) {
+        for (int unit = 0; unit < MAPLE_UNIT_COUNT; ++unit) {
+            maple_device_t *dev = maple_enum_dev(port, unit);
+            if (!dev || !(dev->info.functions & MAPLE_FUNC_LCD)) continue;
+            show_vmu_image(dev);
+            fprintf(stderr, "[dreamcast] VMU startup image sent\n");
+            return 1;
+        }
+    }
+    fprintf(stderr, "[dreamcast] no VMU LCD found\n");
     return 1;
 }
 void gex_host_install_diagnostics(void) {

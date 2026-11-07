@@ -1,5 +1,10 @@
 # Agent instructions
 
+## Project navigation
+
+- Read [docs/project-structure.md](docs/project-structure.md) for the repository
+  map, runtime flow, generated-code boundaries, and task-specific starting points.
+
 ## Protected documentation
 
 - Never edit any `README.md` or `CONTRIBUTING.md` file unless the user

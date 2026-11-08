@@ -43,6 +43,9 @@ void test_audio_write_lead(gex_audio_voice *voice, uint32_t frames) {
     voice->native->playing = 1;
     gex_mutex_unlock(&audio_lock);
 }
+const uint8_t *test_audio_pcm(gex_audio_voice *voice) {
+    return voice->native->pcm;
+}
 void gex_native_voice_gain(gex_native_voice *v, float left, float right) { v->left = left; v->right = right; }
 void gex_native_voice_rate(gex_native_voice *v, int rate) { v->rate = rate; }
 

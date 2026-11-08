@@ -78,9 +78,10 @@ repository root in one shell. It builds the
 current source into a new scratch directory, creates a **test-only** CDI, copies
 only emulator configuration/controller mappings, and launches for at most
 15 minutes. It does not copy the user's VMU saves or change release binaries.
-The PVR-only profile avoids the previously observed combined-renderer RAM
-exhaustion; skipping movies is intentional for this VMU/gameplay test, not
-evidence that movie playback works.
+This PVR-only profile skips movies intentionally for the VMU/gameplay test,
+not as evidence that movie playback works. The normal combined-renderer RAM
+repair and full-intro checks are documented under
+[Dreamcast reserve-only heap RAM](development.md#dreamcast-reserve-only-heap-ram).
 
 ```sh
 set -euo pipefail
@@ -195,3 +196,12 @@ is intentional for automation only; set `GEX_TEST_FAST_FORWARD=no` for timing
 comparisons. Require the appropriate readiness markers and no fatal errors.
 Do not convert a manual disc into an unattended gameplay claim: autoplay and
 guest deadlines must be selected explicitly for automated tests.
+
+Package test arguments as a newline-terminated file named **`gex-test.cfg`**.
+The launcher reads only `/cd/gex-test.cfg`; a differently named `.cfg` leaves
+the default interactive arguments in effect. Check for `[smoke]` observations
+when a smoke deadline was requested instead of diagnosing a host timeout as
+a guest deadlock. Timed `--autoplay` requires `--skip-movies`; full-intro checks
+use `--headless --smoke-seconds 120 --renderer pvr` without autoplay. Require
+both movie-completion messages, post-movie scene 63 and exit zero. Check normal
+main-menu exit separately with skip-movie autoplay, requiring `ExitProcess(0)`.

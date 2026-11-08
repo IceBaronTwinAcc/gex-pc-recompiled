@@ -3,6 +3,8 @@
 #include <dc/sound/sfxmgr.h>
 #include <dc/sound/aica_comm.h>
 #include <dc/spu.h>
+#include <dc/g2bus.h>
+#include "arm/aica_cmd_iface.h"
 #include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,23 +13,42 @@
 
 #define WINDOW 32768u
 #define TRANSFER_BYTES 16384u
+#define COMMAND_TIMEOUT_US 100000u
 struct gex_native_voice {
     struct gex_native_voice *next;
     const uint8_t *pcm;
     uint32_t frames, capacity, origin, last, cursor;
     uint32_t ram[2];
+    uint32_t command_tail, command_bytes;
     int channel[2], channels, bits, rate, playing, looping, windowed, half;
     uint64_t played, epoch, started, half_source[2];
     float left, right;
 };
 static gex_native_voice *voices;
 static uint8_t *transfer;
+static uint32_t command_queue_size;
 static int logged_voice, logged_cursor;
+static uint32_t queue_read(size_t field) {
+    return g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CMD_QUEUE + field);
+}
+static int command_consumed(gex_native_voice *v) {
+    if (!v->command_bytes) return 1;
+    uint32_t tail = queue_read(offsetof(aica_queue_t, tail));
+    uint32_t consumed = (tail + command_queue_size - v->command_tail) % command_queue_size;
+    v->command_tail = tail;
+    v->command_bytes = consumed >= v->command_bytes ? 0 : v->command_bytes - consumed;
+    return !v->command_bytes;
+}
 static void command(gex_native_voice *v, uint32_t operation) {
     AICA_CMDSTR_CHANNEL(packet, cmd, ch);
     memset(packet, 0, sizeof packet);
     int sync = v->channel[0] < 32 && (v->channels == 1 || v->channel[1] < 32);
     snd_sh4_to_aica_stop();
+    /* Refresh fences on submission too, before later traffic can lap the queue. */
+    for (gex_native_voice *pending = voices; pending; pending = pending->next)
+        command_consumed(pending);
+    int tracked = operation == AICA_CH_CMD_START || operation == AICA_CH_CMD_STOP;
+    if (tracked) v->command_tail = queue_read(offsetof(aica_queue_t, tail));
     for (int c = 0; c < v->channels; ++c) {
         cmd->cmd = AICA_CMD_CHAN; cmd->size = AICA_CMDSTR_CHANNEL_SIZE;
         cmd->cmd_id = v->channel[c];
@@ -59,6 +80,10 @@ static void command(gex_native_voice *v, uint32_t operation) {
             cmd->cmd_id |= (uint32_t)mask;
         }
         snd_sh4_to_aica(packet, cmd->size);
+    }
+    if (tracked) {
+        uint32_t head = queue_read(offsetof(aica_queue_t, head));
+        v->command_bytes = (head + command_queue_size - v->command_tail) % command_queue_size;
     }
     snd_sh4_to_aica_start();
 }
@@ -134,6 +159,9 @@ static void upload(gex_native_voice *v, uint32_t at, uint32_t n, uint64_t source
 }
 int gex_native_audio_open(void) {
     if (snd_init() < 0) { fprintf(stderr, "[audio] cannot initialize AICA\n"); return 0; }
+    command_queue_size = queue_read(offsetof(aica_queue_t, size));
+    if (command_queue_size < 3 * AICA_CMDSTR_CHANNEL_SIZE * sizeof(uint32_t))
+        hle_fatal("Invalid AICA command queue size");
     transfer = memalign(32, TRANSFER_BYTES);
     if (!transfer) { fprintf(stderr, "[audio] cannot allocate AICA transfer buffer\n"); return 0; }
     fprintf(stderr, "[audio] AICA hardware voices, no SH4 sample mixer\n");
@@ -154,7 +182,12 @@ static void release(gex_native_voice *v) {
     if (v->channel[0] >= 0) {
         command(v, AICA_CH_CMD_STOP);
         /* The ARM must consume STOP before RAM or channels can be reused. */
-        thd_sleep(2);
+        uint64_t deadline = timer_us_gettime64() + COMMAND_TIMEOUT_US;
+        while (!command_consumed(v)) {
+            if (timer_us_gettime64() >= deadline)
+                hle_fatal("AICA STOP command timed out on channel %d", v->channel[0]);
+            thd_sleep(1);
+        }
         for (int c = 0; c < v->channels; ++c) {
             snd_sfx_chn_free(v->channel[c]); v->channel[c] = -1;
             snd_mem_free(v->ram[c]); v->ram[c] = 0;
@@ -163,8 +196,12 @@ static void release(gex_native_voice *v) {
 }
 static void poll(gex_native_voice *v) {
     if (!v->playing) return;
-    /* AICA command submission is asynchronous, including its initial cursor. */
-    if (timer_us_gettime64() - v->started < 3000) return;
+    /* The queue tail advances only after START, including stereo sync, executes. */
+    if (!command_consumed(v)) {
+        if (timer_us_gettime64() - v->started >= COMMAND_TIMEOUT_US)
+            hle_fatal("AICA START command timed out on channel %d", v->channel[0]);
+        return;
+    }
     uint32_t frame = snd_get_pos((unsigned)v->channel[0]);
     if (frame >= v->capacity) frame %= v->capacity;
     uint32_t n = (frame + v->capacity - v->last) % v->capacity;

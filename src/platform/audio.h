@@ -19,6 +19,10 @@ void gex_audio_pause(int paused);
 void gex_audio_close(void);
 gex_audio_voice *gex_audio_voice_create(const void *pcm, uint32_t frames,
                                        int rate, int channels, int bits);
+/* Borrow caller-owned PCM instead of copying it. Keep it alive until every
+ * sharing voice is destroyed, and notify each voice after writes with update. */
+gex_audio_voice *gex_audio_voice_create_shared(uint8_t *pcm, uint32_t frames,
+                                              int rate, int channels, int bits);
 void gex_audio_voice_destroy(gex_audio_voice *voice);
 void gex_audio_voice_update(gex_audio_voice *voice, uint32_t frame,
                             const void *pcm, uint32_t frames);

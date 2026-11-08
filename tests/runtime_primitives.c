@@ -224,6 +224,19 @@ static void test_files(const char *directory) {
 }
 
 static void test_guest_memory(void) {
+    uint32_t args[] = {0, 65536, 0x2000, 4};
+    uint32_t reserved = hle_call_guest(hle_resolve("VirtualAlloc"), 4, args);
+    CHECK(reserved);
+    if (reserved) {
+        args[0] = reserved; args[1] = 4096; args[2] = 0x1000;
+        CHECK(hle_call_guest(hle_resolve("VirtualAlloc"), 4, args) == reserved);
+        MEM8(reserved) = 0x37;
+        CHECK(hle_call_guest(hle_resolve("VirtualAlloc"), 4, args) == reserved && MEM8(reserved) == 0x37);
+        args[0] = reserved + 65536 - 4096; args[1] = 8192;
+        CHECK(!hle_call_guest(hle_resolve("VirtualAlloc"), 4, args));
+        args[0] = reserved; args[1] = 0; args[2] = 0x8000;
+        CHECK(hle_call_guest(hle_resolve("VirtualFree"), 3, args));
+    }
     uint32_t memory = hle_vm_reserve(0, 32768);
     CHECK(memory);
     if (!memory) return;

@@ -272,7 +272,7 @@ index 1c33129..a700178 100644
  /* The copy: same format at both ends (DirectDraw does not convert either),
   * clipped to both surfaces, stretched nearest-neighbour when the sizes
 diff --git a/runtime/win32hle/dsound.c b/runtime/win32hle/dsound.c
-index 8880749..c44a28a 100644
+index 8880749..71e0567 100644
 --- a/runtime/win32hle/dsound.c
 +++ b/runtime/win32hle/dsound.c
 @@ -1,26 +1,14 @@
@@ -782,7 +782,7 @@ index 8880749..c44a28a 100644
 +    if (!b->data_refs) { hle_free(b->data); free(b); RET(DSERR_NODRIVER, 4); }
      *b->data_refs = 1;
 +    if (!b->primary) {
-+        b->voice = gex_audio_voice_create(b->data, bytes / (uint32_t)b->block,
++        b->voice = gex_audio_voice_create_shared(b->data, bytes / (uint32_t)b->block,
 +                                          b->rate, b->channels, b->bits);
 +        if (!b->voice) {
 +            hle_free(b->data); free(b->data_refs); free(b); RET(DSERR_NODRIVER, 4);
@@ -808,7 +808,7 @@ index 8880749..c44a28a 100644
 -    b->playing = 0, b->pos = 0;
 +    gex_mutex_unlock(&g_mix);
 +    b->playing = 0;
-+    b->voice = src->primary ? NULL : gex_audio_voice_create(b->data, b->bytes / (uint32_t)b->block,
++    b->voice = src->primary ? NULL : gex_audio_voice_create_shared(b->data, b->bytes / (uint32_t)b->block,
 +                                                           b->rate, b->channels, b->bits);
 +    if (!src->primary && !b->voice) { --*b->data_refs; free(b); RET(DSERR_NODRIVER, 3); }
 +    gains(b);
@@ -1245,7 +1245,7 @@ index 40fe7d8..3b9d1ec 100644
      uint32_t fg = pack(d, d->text), bg = pack(d, d->bk);
      for (int j = 0; j < ih; j++) {
 diff --git a/runtime/win32hle/guest_mem.c b/runtime/win32hle/guest_mem.c
-index ea99921..377452d 100644
+index ea99921..836d750 100644
 --- a/runtime/win32hle/guest_mem.c
 +++ b/runtime/win32hle/guest_mem.c
 @@ -13,22 +13,12 @@
@@ -1272,7 +1272,7 @@ index ea99921..377452d 100644
  
  #define HDR   16u            /* [size][magic][class][-] before every heap block */
  #define MAGIC 0x48454150u    /* 'HEAP' */
-@@ -37,78 +27,10 @@
+@@ -37,78 +27,12 @@
  #ifdef HLE_FLAT
  /* ================================================================ flat */
  
@@ -1349,12 +1349,14 @@ index ea99921..377452d 100644
 -void hle_vm_zero(uint32_t va, uint32_t size)    { madvise((void *)(uintptr_t)va, size, MADV_DONTNEED); }
 -#endif /* !__EMSCRIPTEN__ */
 +uint32_t hle_vm_reserve(uint32_t address, uint32_t size) { return gex_flat_vm_reserve(address, size); }
++uint32_t hle_vm_reserve_only(uint32_t address, uint32_t size) { return gex_flat_vm_reserve_only(address, size); }
++uint32_t hle_vm_commit(uint32_t address, uint32_t size) { return gex_flat_vm_commit(address, size); }
 +void hle_vm_release(uint32_t address, uint32_t size) { gex_flat_vm_release(address, size); }
 +void hle_vm_zero(uint32_t address, uint32_t size) { gex_flat_vm_zero(address, size); }
  
  void *hle_heap_alloc(uint32_t n, int zero) {
      uint8_t *p = (uint8_t *)(zero ? calloc(1, (size_t)n + HDR) : malloc((size_t)n + HDR));
-@@ -142,7 +64,7 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
+@@ -142,7 +66,7 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
  #define SHIM_HI   0x80000000u
  #define MAX_RANGES 8192
  
@@ -1363,7 +1365,7 @@ index ea99921..377452d 100644
  static struct { uint64_t lo, hi; } g_rng[MAX_RANGES];   /* reserved, sorted by lo */
  static int g_nrng;
  static size_t g_host_page;
-@@ -153,7 +75,7 @@ uint32_t hle_va_bad(const void *p) {
+@@ -153,7 +77,7 @@ uint32_t hle_va_bad(const void *p) {
  }
  
  static void mem_init_once(void) {
@@ -1372,7 +1374,7 @@ index ea99921..377452d 100644
      /* Nothing is accessible until reserved, page zero included: a guest NULL
       * (or a VA nobody handed out) faults, as it would on Windows. */
  #ifdef RECOMP_MEM_BASE
-@@ -162,29 +84,24 @@ static void mem_init_once(void) {
+@@ -162,29 +86,24 @@ static void mem_init_once(void) {
       * mapped is replaced (Linux says so with NOREPLACE; macOS honours a free
       * hint). */
      void *want = (void *)(uintptr_t)(RECOMP_MEM_BASE);
@@ -1409,7 +1411,7 @@ index ea99921..377452d 100644
  }
  
  static int overlaps(uint64_t lo, uint64_t hi) {
-@@ -225,16 +142,16 @@ static uint32_t vm_reserve_locked(uint32_t va, uint32_t size) {
+@@ -225,25 +144,28 @@ static uint32_t vm_reserve_locked(uint32_t va, uint32_t size) {
      } else if (lo < GRAN || hi > SPAN || overlaps(lo, hi)) {
          return 0;                                         /* page zero stays unmapped */
      }
@@ -1428,8 +1430,11 @@ index ea99921..377452d 100644
 +    gex_mutex_unlock(&g_mem_lock);
      return r;
  }
++uint32_t hle_vm_reserve_only(uint32_t va, uint32_t size) { return hle_vm_reserve(va, size); }
++uint32_t hle_vm_commit(uint32_t va, uint32_t size) { (void)size; return va; }
  
-@@ -243,7 +160,8 @@ uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
+ /* Release the reservation that starts at va (size is the caller's note of
+  * it; the table knows). Its pages go back to inaccessible and zero. */
  static void vm_release_locked(uint32_t va) {
      for (int i = 0; i < g_nrng; i++) {
          if (g_rng[i].lo != va) continue;
@@ -1439,7 +1444,7 @@ index ea99921..377452d 100644
          memmove(&g_rng[i], &g_rng[i + 1], sizeof g_rng[0] * (size_t)(g_nrng - i - 1));
          g_nrng--;
          return;
-@@ -251,9 +169,9 @@ static void vm_release_locked(uint32_t va) {
+@@ -251,9 +173,9 @@ static void vm_release_locked(uint32_t va) {
  }
  void hle_vm_release(uint32_t va, uint32_t size) {
      (void)size;
@@ -1451,7 +1456,7 @@ index ea99921..377452d 100644
  }
  
  /* Decommit: the range reads as zero when touched again. Whole host pages are
-@@ -263,7 +181,8 @@ void hle_vm_zero(uint32_t va, uint32_t size) {
+@@ -263,7 +185,8 @@ void hle_vm_zero(uint32_t va, uint32_t size) {
      uint64_t plo = (lo + g_host_page - 1) & ~(uint64_t)(g_host_page - 1), phi = hi & ~(uint64_t)(g_host_page - 1);
      if (plo >= phi) { memset(host(va), 0, size); return; }
      memset(host((uint32_t)lo), 0, (size_t)(plo - lo));
@@ -1461,7 +1466,7 @@ index ea99921..377452d 100644
      memset(host((uint32_t)phi), 0, (size_t)(hi - phi));
  }
  
-@@ -310,9 +229,9 @@ void *hle_heap_alloc(uint32_t n, int zero) {
+@@ -310,9 +233,9 @@ void *hle_heap_alloc(uint32_t n, int zero) {
      if (n > 0xFFFFFFFFu - GRAN - HDR) return NULL;
      uint32_t total = n + HDR, va;
      int c = total <= SMALL_MAX ? class_of(total) : -1;
@@ -1473,7 +1478,7 @@ index ea99921..377452d 100644
      if (!va) return NULL;
      uint32_t *h = (uint32_t *)host(va);
      h[0] = n, h[1] = MAGIC, h[2] = c >= 0 ? (uint32_t)c : LARGE, h[3] = 0;
-@@ -330,10 +249,10 @@ void hle_heap_free(void *u) {
+@@ -330,10 +253,10 @@ void hle_heap_free(void *u) {
      uint32_t *h = (uint32_t *)u - 4;
      uint32_t va = hle_va(h);
      h[1] = 0;
@@ -1486,7 +1491,7 @@ index ea99921..377452d 100644
  }
  
  void *hle_heap_realloc(void *u, uint32_t n, int zero) {
-@@ -380,7 +299,7 @@ uint32_t hle_guest_strdup(const char *s) {
+@@ -380,7 +303,7 @@ uint32_t hle_guest_strdup(const char *s) {
  /* ---- scratch ----
   * 256 KB a thread, reserved on its first use and kept. */
  #define SCRATCH 0x40000u
@@ -1959,7 +1964,7 @@ index 4afaf0f..3487fb7 100644
  /* ---------------------------------------------------------- handles
   * Kernel objects the guest holds by HANDLE: files, find searches, events,
 diff --git a/runtime/win32hle/kernel32.c b/runtime/win32hle/kernel32.c
-index c4cd821..9cfd93e 100644
+index c4cd821..75083d2 100644
 --- a/runtime/win32hle/kernel32.c
 +++ b/runtime/win32hle/kernel32.c
 @@ -9,21 +9,13 @@
@@ -2069,7 +2074,35 @@ index c4cd821..9cfd93e 100644
  void hle_thread_id_adopt(uint32_t tid) { g_tid = tid; }
  uint32_t hle_thread_id(void) {
      if (!g_tid) g_tid = hle_thread_id_new();
-@@ -268,15 +232,13 @@ static void k_IsProcessorFeaturePresent(void) { RET(0, 1); }
+@@ -221,14 +185,22 @@ static int region_of(uint32_t a) {
+ static void k_VirtualAlloc(void) {                       /* (addr, size, type, protect) */
+     uint32_t addr = A32(0), size = (A32(1) + 0xFFFu) & ~0xFFFu, type = A32(2);
+-    if (addr && region_of(addr) >= 0) {                  /* commit inside a reservation */
+-        RET(addr & ~0xFFFu, 4);
+-    }
+     if (!size) { g_last_error = ERROR_INVALID_PARAMETER; RET(0, 4); }
+-    uint32_t p = hle_vm_reserve(addr, size);
++    int region = addr ? region_of(addr) : -1;
++    if (region >= 0) {
++        uint32_t start = addr & ~0xFFFu;
++        if (start < g_region[region].base ||
++            size > g_region[region].size - (start - g_region[region].base)) {
++            g_last_error = ERROR_INVALID_PARAMETER; RET(0, 4);
++        }
++        uint32_t p = hle_vm_commit(start, size);
++        if (!p) g_last_error = ERROR_NOT_ENOUGH_MEMORY;
++        RET(p, 4);
++    }
++    uint32_t p = (type & MEM_RESERVE) && !(type & MEM_COMMIT) ?
++        hle_vm_reserve_only(addr, size) : hle_vm_reserve(addr, size);
+     if (!p) { g_last_error = ERROR_NOT_ENOUGH_MEMORY; RET(0, 4); }
+     for (int i = 0; i < MAX_REGIONS; i++)
+         if (!g_region[i].size) { g_region[i].base = p, g_region[i].size = size; break; }
+-    (void)type;
+     RET(p, 4);
+ }
+ static void k_VirtualFree(void) {                        /* (addr, size, type) */
+@@ -268,15 +240,13 @@ static void k_IsProcessorFeaturePresent(void) { RET(0, 1); }
  
  /* --- time --- */
  static uint32_t ticks_ms(void) {
@@ -2087,7 +2120,7 @@ index c4cd821..9cfd93e 100644
      if (A32(0)) MEM32(A32(0)) = (uint32_t)us, MEM32(A32(0) + 4) = (uint32_t)(us >> 32);
      RET(1, 1);
  }
-@@ -285,11 +247,11 @@ static void k_QueryPerformanceCounter(void) {
+@@ -285,11 +255,11 @@ static void k_QueryPerformanceCounter(void) {
  static void k_Sleep(void) {
      uint32_t ms = A32(0);
      hle_block_begin();
@@ -2101,7 +2134,7 @@ index c4cd821..9cfd93e 100644
  
  /* --- strings (KERNEL32's lstr*; the CRT has the rest) --- */
  static void k_lstrlenA(void) { char *s = ASTR(0); RET(s ? (uint32_t)strlen(s) : 0u, 1); }
-@@ -298,7 +260,7 @@ static void k_lstrcpyA(void) { char *d = ASTR(0), *s = ASTR(1); if (d && s) memm
+@@ -298,7 +268,7 @@ static void k_lstrcpyA(void) { char *d = ASTR(0), *s = ASTR(1); if (d && s) memm
  static void k_lstrcpynA(void) { char *d = ASTR(0), *s = ASTR(1); int n = (int)A32(2); if (d && s && n > 0) { strncpy(d, s, (size_t)n - 1); d[n - 1] = 0; } RETP(d, 3); }
  static void k_lstrcatA(void) { char *d = ASTR(0), *s = ASTR(1); if (d && s) strcat(d, s); RETP(d, 2); }
  static void k_lstrcmpA(void) { RET((uint32_t)strcmp(ASTR(0) ? ASTR(0) : "", ASTR(1) ? ASTR(1) : ""), 2); }
@@ -2110,7 +2143,7 @@ index c4cd821..9cfd93e 100644
  
  /* STARTUPINFOA is 68 bytes; the CRT reads it early. */
  static void k_GetStartupInfoA(void) { uint32_t si = A32(0); if (si) { memset(hle_ptr(si), 0, 68); MEM32(si) = 68; } RETV(1); }
-@@ -314,8 +276,8 @@ void hle_enter_cs(uint32_t cs) {
+@@ -314,8 +284,8 @@ void hle_enter_cs(uint32_t cs) {
      uint32_t me = hle_thread_id();
      while (CS_OWNER(cs) && CS_OWNER(cs) != me) {
          hle_block_begin();
@@ -2121,7 +2154,7 @@ index c4cd821..9cfd93e 100644
          hle_block_end();
      }
      CS_OWNER(cs) = me;
-@@ -337,11 +299,28 @@ static void k_TryEnterCriticalSection(void) {
+@@ -337,11 +307,28 @@ static void k_TryEnterCriticalSection(void) {
  }
  
  /* --- Interlocked (on guest memory) --- */
@@ -2155,7 +2188,7 @@ index c4cd821..9cfd93e 100644
  
  /* --- events, mutexes, semaphores, waits --- */
  typedef struct { int manual, signaled; } hevent;
-@@ -461,7 +440,7 @@ uint32_t hle_wait(int n, const uint32_t *h, int all, uint32_t timeout) {
+@@ -461,7 +448,7 @@ uint32_t hle_wait(int n, const uint32_t *h, int all, uint32_t timeout) {
          }
          if (timeout != INFINITE && ticks_ms() - start >= timeout) return WAIT_TIMEOUT;
          hle_block_begin();
@@ -2164,7 +2197,7 @@ index c4cd821..9cfd93e 100644
          hle_block_end();
          if (timeout == 0) return WAIT_TIMEOUT;
      }
-@@ -477,7 +456,7 @@ static void k_WaitForMultipleObjects(void) {             /* (n, handles, all, ti
+@@ -477,7 +464,7 @@ static void k_WaitForMultipleObjects(void) {             /* (n, handles, all, ti
  
  /* --- thread-local storage: per host thread --- */
  #define TLS_SLOTS 64
@@ -2173,7 +2206,7 @@ index c4cd821..9cfd93e 100644
  static uint8_t g_tls_used[TLS_SLOTS];
  static void k_TlsAlloc(void) {
      for (int i = 0; i < TLS_SLOTS; i++) if (!g_tls_used[i]) { g_tls_used[i] = 1; RET((uint32_t)i, 0); }
-@@ -514,7 +493,7 @@ static uint32_t atom_intern(const char *s) {
+@@ -514,7 +501,7 @@ static uint32_t atom_intern(const char *s) {
      if (!s) return 0;
      for (int i = 0; i < g_atom_n; i++) if (!strcmp(g_atoms[i].s, s)) return ATOM_BASE + (uint32_t)i;
      if (g_atom_n >= 1024) return 0;
@@ -3609,10 +3642,19 @@ index 83caa92..2810744 100644
  #define MENU_BASE 0x4D450000u                            /* 'ME' */
  static menu_t *MENU(uint32_t h) { uint32_t i = h - MENU_BASE; return h >= MENU_BASE && i < MAX_MENU && g_menu[i].used ? &g_menu[i] : NULL; }
 diff --git a/runtime/win32hle/win32hle.h b/runtime/win32hle/win32hle.h
-index 190ded0..ad5ed65 100644
+index 190ded0..39b48cb 100644
 --- a/runtime/win32hle/win32hle.h
 +++ b/runtime/win32hle/win32hle.h
-@@ -286,6 +286,7 @@ extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software
+@@ -76,6 +76,8 @@ static inline uint32_t hle_a32(int i) {
+  * Pages: a reservation at va (0: anywhere), zero-filled, 0 on failure. */
+ void     hle_mem_init(void);                            /* map the guest block; idempotent */
+ uint32_t hle_vm_reserve(uint32_t va, uint32_t size);
++uint32_t hle_vm_reserve_only(uint32_t va, uint32_t size);
++uint32_t hle_vm_commit(uint32_t va, uint32_t size);
+ void     hle_vm_release(uint32_t va, uint32_t size);
+ void     hle_vm_zero(uint32_t va, uint32_t size);       /* decommit: reads as zero again */
+ /* The heap every Heap/Local/Global block comes from: a 16-byte header before
+@@ -286,6 +288,7 @@ extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software
   * when its pixels or palette may have. */
  int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
  void hle_dd_mode(int *w, int *h, int *bpp);
@@ -3620,7 +3662,7 @@ index 190ded0..ad5ed65 100644
  extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
  int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
  void hle_dsound_set_master(float gain);              /* 0 mutes */
-@@ -294,16 +295,22 @@ void hle_dsound_register_com(void);                  /* CoCreateInstance(CLSID_D
+@@ -294,16 +297,22 @@ void hle_dsound_register_com(void);                  /* CoCreateInstance(CLSID_D
   * s16 pushed at its own rate. */
  int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */
  void hle_audio_stream_push(int id, const int16_t *pcm, int frames);
@@ -3643,7 +3685,7 @@ index 190ded0..ad5ed65 100644
  extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
  void hle_screen_title(const char *title);
  extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
-@@ -346,7 +353,8 @@ extern const win32hle_shim win32hle_advapi32[];       /* the registry; COMCTL32,
+@@ -346,7 +355,8 @@ extern const win32hle_shim win32hle_advapi32[];       /* the registry; COMCTL32,
   * to a file on every write. Roots are the HKEY_ values (HKLM 0x80000002). */
  void hle_reg_set_string(uint32_t root, const char *path, const char *name, const char *value);
  void hle_reg_set_dword(uint32_t root, const char *path, const char *name, uint32_t value);

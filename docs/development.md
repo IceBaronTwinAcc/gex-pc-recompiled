@@ -3178,6 +3178,11 @@ advance after 40 ms. The firmware's ten-tick wait is not ten milliseconds:
 its ARM timer runs at 4,410 Hz. Do not infer a startup failure from that
 wait alone or increase the startup grace period without a reproducer.
 
+That earlier bounded investigation does not rule out startup failures under
+different command traffic. The subsequent enemy-hit/results-speech report
+exposed a separate command-acknowledgement race, described in
+[Intermittent Dreamcast audio](#intermittent-dreamcast-audio).
+
 An initial isolated PVR game diagnostic sent 20 jump and 20 tail-attack button
 presses while tracing the original SFX entry and native voices. It
 recorded 67 original SFX requests and 75 native play calls, including
@@ -3707,3 +3712,208 @@ timings. The fixture needs the pinned GLdc source's private texture metadata;
 production live readback remains forbidden. `tools/test-dreamcast.sh` accepts
 `RENDERER=opengl12`, creates a separate `gex-test.cdi`, and reports native
 presentation evidence without pretending that CPU pixels verify gameplay.
+
+## Intermittent Dreamcast audio
+
+A later headless Graveyard diagnostic reproduced a real AICA startup race.
+In the observed trace interval of one normally exiting run, 11 of 79 native play calls were incorrectly
+completed within roughly 5-6 ms, including samples intended to last hundreds
+of milliseconds. Capturing the supplied Flycast's actual ALSA output confirmed
+missing source waveforms; a completed frame count alone would have incorrectly
+reported success. The earlier retail speech-for-whoosh substitution remains
+valid, but is a different cause of an unrequested effect.
+
+`snd_sh4_to_aica` publishes packets, rather than acknowledging execution.
+The former three-millisecond startup grace could expire before the ARM
+consumed START. A nonlooping voice then saw KEYONB clear, reported its whole
+sample as completed, and queued STOP. When the ARM eventually processed those
+packets, START was immediately followed by STOP. This explains why hardware
+completion accounting looked correct while the captured sound was missing.
+Likewise, a fixed two-millisecond STOP delay did not guarantee that channels
+and sample RAM were safe to reuse.
+
+The Dreamcast backend now tracks the command queue's removal position through
+the end of each START/STOP batch, including stereo synchronized START.
+Pending starts remain logically playing without reading the old hardware
+cursor or KEYONB. STOP waits for actual command consumption before freeing
+resources. Fences are refreshed on submission as well as polling to handle
+queue wrap during later traffic. An unconsumed command has a bounded
+100-millisecond fatal timeout, not a silently successful completion or an
+unbounded wait. No extra fixed startup delay, software mixer, voice stealing,
+or change to retail sound selection was introduced.
+
+The queue layout comes from the same KOS firmware header used by `snd_iface.c`:
+`kernel/arch/dreamcast/sound/arm/aica_cmd_iface.h`. The Dreamcast manifest adds
+its include directories only to the native audio implementation and its
+fixture. Do not copy memory addresses into shared platform code or modify the
+installed KOS firmware to make the test pass.
+
+### Reproducing and checking this fault
+
+1. Follow [the Flycast runbook](flycast-testing.md). Use the supplied emulator,
+   an isolated profile, headless output, serial logging and no fast-forward.
+   For private PCM capture, route the explicitly selected ALSA backend to a
+   private null device; do not mute or rewrite the user's host settings.
+2. Keep speech preparation, guest playback requests, native START calls,
+   hardware state and mixed PCM as separate evidence. A speech slot being
+   prepared is not a playback request. Link-time wrappers can miss calls
+   defined in the same generated object; missing wrapper output is not proof
+   that the guest did not call a function.
+3. Confirm the actual negotiated capture format before matching waveforms.
+   This diagnostic used 44,100-Hz, stereo, little-endian signed PCM16.
+   Compare source PCM at its own rate with the captured output, using
+   source offsets and guest/audio clock alignment. An unrelated occurrence
+   elsewhere in the recording does not satisfy a particular request.
+4. Flag implausibly early completions separately from intentional buffer
+   releases. The observed missing one-shots were marked complete at 5-6 ms,
+   not merely quieter or outside the positional gate. Preserve the failed
+   baseline before overwriting the fixed run's logs and PCM.
+5. Run the real-KOS `gex_aica_test` target. Its test-only packet hook schedules
+   START/STOP 200 firmware ticks into the future; production packets are not
+   delayed. The old backend failed the pending-start and STOP-before-reuse
+   assertions. The corrected fixture exercises mono/stereo START, pending
+   gain/rate updates, 128 varied startup phases and an actual queue wrap,
+   together with the existing sample-RAM, streaming and replay checks.
+6. Repeat the normal-input game capture with the corrected backend. Three
+   corrected comparisons each recorded 79 starts, with zero implausibly early
+   completions. Previously absent `0x9C` and `0xB2` source waveforms reappeared
+   in the actual mixed output, with correlations of 0.705 and 1.000.
+7. Do not count repeated attack buttons as successful enemy hits, or force
+   only `0x455C3C` to fabricate the results screen. That diagnostic bypassed
+   the required scene lifecycle and crashed; it was not evidence of a
+   production audio failure. A complete Graveyard results-screen speech
+   handoff and identification of the reported slap remain separate,
+   unverified cases. This startup fix applies to both effect and speech
+   voices, but does not establish that every omission has the same cause.
+
+The game-waveform probes used a separate metadata-only movie build with
+`--skip-movies`, not the normal FFmpeg decoder. The normal executable was
+successfully rebuilt, but its headless autoplay/skip-movie route exhausted RAM
+near the first Graveyard load. The retained, unchanged executable failed on
+the same route too; compiling PVR without the software selector did not remove
+that limit. A normal-decoder run completed both original AVIs but did not
+reach the menu or exit before its 160-second bound. These are not passing
+normal-build or movie-handoff checks. The existing executable and release
+artifacts were not replaced with a build that failed validation.
+
+## Dreamcast reserve-only heap RAM
+
+The normal-build investigation above found a distinct memory-budget problem.
+The retail CRT's small-block heap requests `VirtualAlloc(NULL, 0x400000,
+MEM_RESERVE, PAGE_READWRITE)` in `sub_0044DA20`, then initially commits only
+`0x10000` bytes. The former flat-memory implementation physically allocated
+and zeroed all four megabytes on Dreamcast. Do not shrink the guest's requested
+range or disable its allocator: subsequent commits need stable addresses.
+
+The portability interface now separates reserve-only ranges from commit.
+Existing fully accessible image/thread reservations retain their behavior.
+Dreamcast reserve-only ranges use guest virtual addresses starting at
+`0x01000000`, with physical 64-KiB backing allocated only for committed chunks.
+The backend supports 32 reservations, up to 16 MiB each, within
+`0x01000000..0x08000000`; unsupported requests and physical allocation failures
+are reported. Other flat backends retain their existing eager implementation,
+and based hosts retain their operating system's demand-backed address space.
+The VirtualAlloc shim checks commit bounds before forwarding the request.
+
+A KOS MMU mapping callback supplies cached, read/write 64-KiB data entries.
+The original PE image and store-queue mappings remain pinned. Dynamic heap
+entries can be replaced in the UTLB rather than consuming one permanent slot
+per committed chunk. Decommit/release flushes backing data and invalidates
+translations before RAM reuse, rebuilding the pinned mappings. A failed
+multi-chunk commit rolls back only newly allocated chunks; prior data remains
+valid. Fully backed flat reservations are now at least 4-KiB aligned, as
+VirtualAlloc's page-based bookkeeping requires.
+
+DirectSound voices also borrow the existing guest PCM buffer instead of
+creating another full sample copy for each original/duplicate voice. The
+shared audio API makes ownership explicit; copying voices and movie-stream
+rings retain owned storage. Each duplicate has independent playback/cursors,
+all duplicates receive Unlock updates, and the final guest buffer release
+follows native voice destruction.
+
+### Checking this change
+
+1. Follow [the Flycast runbook](flycast-testing.md), with the supplied emulator,
+   an isolated profile, headless output, serial logging and fast-forward off.
+   Use the normal FFmpeg decoder with both PVR and software selection enabled,
+   selecting PVR for this game run. A metadata-only decoder is not equivalent.
+2. Use a small session-only heap probe around allocations and scene changes.
+   Record `mallinfo().uordblks` separately from arena/free-list bytes.
+   `fordblks` excludes RAM beyond the current heap break; it is not total
+   remaining Dreamcast RAM. Preserve the failing normal-build log.
+3. Distinguish reserve-only calls from commits. The original four-megabyte
+   request has flags `0x2000`, followed by a 64-KiB `0x1000` commit. Follow
+   their actual guest call sites instead of assuming the allocation is a
+   thread stack, renderer cache or retained decoder.
+4. Build and run `gex_vm_test` on real KOS in the supplied Flycast. Require
+   `Dreamcast guest VM: PASS (0 failures)` and guest exit zero. The fixture
+   checks reservation overhead below 4 KiB, one-chunk commitment cost,
+   recommit preservation, out-of-range rejection, injected allocation-failure
+   rollback, 64 committed chunks exceeding available dynamic TLB slots,
+   decommit/recommit, address reuse, partial zeroing and pinned-image survival.
+   Its deliberate failed allocation is not a game OOM.
+5. Build and run the host `runtime-primitives`, `audio-streams`,
+   `wave-streaming` and `movie-backend-contract` checks. These cover the
+   portable commit boundary, shared-buffer identity/lifetime, independent
+   duplicate playback, wrapped updates and unchanged owned stream storage.
+   Verify `tools/prepare_runtime.py` accepts the updated checked-in patch.
+6. Compare the same Graveyard route before/after. At scene 3 the observed live
+   heap fell from 11,692,220 to 7,568,572 bytes: 4,123,648 bytes reclaimed.
+   The instrumented normal build records actual player motion and exits
+   through the ordinary main-menu confirmation with `ExitProcess(0)`.
+   The uninstrumented normal build also reaches scenes 63, 55, 49 and 3 with
+   `--skip-movies`, then exits zero. The real AICA fixture still reports
+   `0/128 missed`, one queue wrap and zero failures with these changes.
+7. Verify the packaged test configuration's name before diagnosing startup.
+   The Dreamcast launcher reads only `/cd/gex-test.cfg`. An earlier full-movie
+   probe packaged `dc-ram-production.cfg` instead: its autoplay and smoke
+   deadline were never enabled. Both movies completed, but the 250-second
+   host timeout was not evidence of a movie-handoff deadlock. Two debugger
+   samples 30 seconds apart show 157 further presentations, changing native
+   PCs and successful machine-lock handoffs. Decoder-close tracing also
+   confirms both decoder releases return. Also respect the launcher guard:
+   timed `--autoplay` requires `--skip-movies`. Check complete intro playback
+   with `--headless --smoke-seconds 120 --renderer pvr`, separately from
+   skip-movie autoplay gameplay/normal exit. Do not remove that guard to
+   accommodate a probe or fabricate the guest's scene transition.
+8. With that corrected full-intro probe, both movies complete, scene 63 is
+   observed at about 90.7 seconds, and the 120-second guest smoke deadline
+   exits zero with 2,151 GPU presentations. Together with the uninstrumented
+   skip-movie gameplay/normal-exit run, this validates the normal decoder
+   build's repaired RAM budget and intro handoff. It still does not identify
+   the original reported enemy-hit slap or results-screen speech.
+9. The complete Linux software/OpenGL regression build passes 37 of 38 CTest
+   entries. The remaining `generator-and-patches` entry reports two existing
+   platform-boundary violations in `main.c` and `options_menu.c`; those
+   `__EMSCRIPTEN__` branches are present in HEAD and unchanged by this repair.
+   Do not describe the entire suite as passing. A software-only probe also
+   cannot satisfy `options-screens`' expected backend-change restart notice;
+   enabling `GEX_ENABLE_OPENGL_RENDERER=ON` supplies the second choice and
+   makes that check pass without changing UI code.
+
+## Dreamcast Start button routing
+
+The Dreamcast Maple backend translates `CONT_START` to `GEX_PAD_START`
+correctly. A reported Start-to-jump fault came from `src/gamepad.c`'s fallback
+mapping: it combined A and Start into the guest X key. Dreamcast does not
+load the desktop Options bindings, so `gex_prefs.bindings_active` remains
+false and selects that fallback. Desktop Options defaults already map Start
+to the Escape key used for pause.
+
+The fallback now maps A to X (jump/confirm) and Start or Back to Escape
+(pause/back), without changing configurable bindings or other action buttons.
+Do not remap the controller in Flycast to compensate for this guest-input
+fault. To investigate a similar report:
+
+1. Check the isolated Flycast mapping and player-one controller detection.
+2. Follow the physical button through the platform backend's portable bit,
+   then through the active or fallback mapping to the guest key.
+3. Test press, hold, release and simultaneous A/Start input. Start alone must
+   never hold X; releasing A while Start remains held must release X and
+   retain Escape.
+4. Run `portable-input-mapping` and the headless SDL `gamepad-input` check.
+   The portable fixture also runs as `gex_input_mapping_test.elf` on real
+   SH4/KOS in the supplied headless Flycast. Require exit zero.
+5. Rebuild the normal game and package a new manual CDI; an already running
+   emulator still executes its old disc. Preserve that live test until the
+   user is ready to restart, rather than replacing a mounted CDI in place.

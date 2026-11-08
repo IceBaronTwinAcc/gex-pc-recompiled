@@ -79,11 +79,11 @@ void gex_gamepad_pump(void) {
             for (unsigned i = GEX_KEY_X; i < GEX_KEY_COUNT; ++i)
                 pad[i] = (mapped >> i) & 1;
         } else {
-            pad[4] = (buttons & (GEX_PAD_A | GEX_PAD_START)) != 0;
+            pad[4] = (buttons & GEX_PAD_A) != 0;
             pad[5] = (buttons & GEX_PAD_X) != 0;
             pad[6] = (buttons & GEX_PAD_B) != 0;
             pad[7] = (buttons & (GEX_PAD_Y | GEX_PAD_L | GEX_PAD_R)) != 0;
-            pad[8] = (buttons & GEX_PAD_BACK) != 0;
+            pad[8] = (buttons & (GEX_PAD_START | GEX_PAD_BACK)) != 0;
         }
     }
     publish();

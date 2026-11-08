@@ -37,6 +37,9 @@ size_t gex_vm_page_size(void);
 int gex_vm_map_file(void *address, size_t bytes, int file, uint64_t offset,
                     int writable, int copy);
 uint32_t gex_flat_vm_reserve(uint32_t address, uint32_t bytes);
+/* Reserve-only ranges require commit before access. Recommit preserves data. */
+uint32_t gex_flat_vm_reserve_only(uint32_t address, uint32_t bytes);
+uint32_t gex_flat_vm_commit(uint32_t address, uint32_t bytes);
 void gex_flat_vm_release(uint32_t address, uint32_t bytes);
 void gex_flat_vm_zero(uint32_t address, uint32_t bytes);
 

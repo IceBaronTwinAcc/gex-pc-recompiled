@@ -51,6 +51,8 @@ def main():
             browser = playwright.chromium.launch(headless=True, args=["--mute-audio"])
             try:
                 page = browser.new_page()
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'getGamepads', {value: () => []});")
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(url)

@@ -9,6 +9,7 @@ const uint32_t recomp_dispatch_count = 0;
 static int failures;
 void test_audio_render(uint8_t *output, int bytes);
 void test_audio_write_lead(gex_audio_voice *voice, uint32_t frames);
+const uint8_t *test_audio_pcm(gex_audio_voice *voice);
 
 static void expect(int condition, const char *description) {
     if (!condition) {
@@ -35,6 +36,8 @@ static void guest_buffers(void) {
     args[0] = desc; args[1] = result; args[2] = 0;
     expect(!method(device, 3, 3, args), "create native-backed U8 mono guest buffer");
     uint32_t original = MEM32(result);
+    expect(test_audio_pcm(buf_of(original)->voice) == buf_of(original)->data,
+           "guest voice borrows PCM without a second allocation");
     args[0] = 0; args[1] = 128; args[2] = result; args[3] = result + 4;
     args[4] = result + 8; args[5] = result + 12; args[6] = 2;
     expect(!method(original, 11, 7, args), "lock entire guest buffer");
@@ -45,6 +48,8 @@ static void guest_buffers(void) {
     args[0] = original; args[1] = result;
     expect(!method(device, 5, 2, args), "duplicate guest sample storage with independent native playback");
     uint32_t duplicate = MEM32(result);
+    expect(test_audio_pcm(buf_of(duplicate)->voice) == buf_of(original)->data,
+           "duplicate borrows the same PCM without another sample allocation");
     args[0] = args[1] = args[2] = 0;
     expect(!method(original, 12, 3, args), "start guest one-shot");
     int16_t output[32 * 2];
@@ -102,6 +107,22 @@ static void guest_buffers(void) {
 }
 int main(void) {
     recomp_host_init();
+    uint8_t source[4] = {192, 160, 144, 128};
+    gex_audio_voice *copy = gex_audio_voice_create(source, 4, 44100, 1, 8);
+    expect(copy && test_audio_pcm(copy) != source, "copying voice retains independent PCM");
+    source[0] = 128;
+    expect(copy && test_audio_pcm(copy)[0] == 192, "caller changes do not affect copying voices");
+    gex_audio_voice_destroy(copy);
+    gex_audio_voice *shared = gex_audio_voice_create_shared(source, 4, 44100, 1, 8);
+    expect(shared && test_audio_pcm(shared) == source, "shared voice retains the supplied storage");
+    uint8_t update = 176;
+    if (shared) gex_audio_voice_update(shared, 1, &update, 1);
+    expect(source[1] == 176, "shared update changes the caller-owned storage");
+    if (shared) gex_audio_voice_update(shared, 1, source + 1, 1);
+    gex_audio_voice_destroy(shared);
+    source[0] = 192;
+    expect(!gex_audio_voice_create_shared(NULL, 4, 44100, 1, 8),
+           "shared voices require caller-owned PCM");
     expect(hle_audio_stream_open(0, 2) == -1, "reject zero sample rate");
     expect(hle_audio_stream_open(44100, 3) == -1, "reject unsupported channel count");
     int id = hle_audio_stream_open(44100, 1);

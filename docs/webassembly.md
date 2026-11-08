@@ -45,7 +45,9 @@ the existing header-based server path, browser startup failures, and software
 renderer selection when Chromium can obtain a WebGPU adapter. The test also
 checks that the bundled project logo loads. The WebGPU check uses Chromium's
 test-only SwiftShader flags. To verify both intro AVI movies finish decoding and
-playback, run `python tests/wasm_movies.py --game-dir /path/to/Gex`.
+playback, run `python tests/wasm_movies.py --game-dir /path/to/Gex`. That
+headless test hides physical gamepads from its browser so concurrent manual
+play cannot cancel the movies or exit the guest.
 
 For a branch-based GitHub Pages site, place the generated HTML at the branch
 root as `index.html`, alongside `gex_recomp.js`, `gex_recomp.wasm`,

@@ -10,7 +10,7 @@ struct gex_audio_voice {
     gex_native_voice *native;
     uint8_t *pcm;
     uint32_t frames;
-    int block, playing, looping;
+    int block, playing, looping, owns_pcm;
     float left, right;
 };
 static gex_mutex audio_lock = GEX_MUTEX_INIT;
@@ -85,7 +85,7 @@ static void destroy(gex_audio_voice *v) {
     if (!*link) hle_fatal("destroying unknown audio voice");
     *link = v->next;
     gex_native_voice_destroy(v->native);
-    free(v->pcm);
+    if (v->owns_pcm) free(v->pcm);
     free(v);
 }
 void gex_audio_close(void) {
@@ -108,8 +108,8 @@ void gex_audio_close(void) {
     master = 1;
     gex_mutex_unlock(&audio_lock);
 }
-gex_audio_voice *gex_audio_voice_create(const void *pcm, uint32_t frames,
-                                       int rate, int channels, int bits) {
+static gex_audio_voice *create_voice(const void *pcm, uint8_t *shared, uint32_t frames,
+                                    int rate, int channels, int bits) {
     if (!frames || rate <= 0 || (channels != 1 && channels != 2) ||
         (bits != 8 && bits != 16) || (uint64_t)frames * channels * (bits / 8) > SIZE_MAX) {
         fprintf(stderr, "[audio] invalid PCM voice format\n");
@@ -121,10 +121,13 @@ gex_audio_voice *gex_audio_voice_create(const void *pcm, uint32_t frames,
     v->frames = frames;
     v->block = channels * (bits / 8);
     v->left = v->right = 1;
-    v->pcm = malloc((size_t)frames * v->block);
+    v->owns_pcm = !shared;
+    v->pcm = shared ? shared : malloc((size_t)frames * v->block);
     if (!v->pcm) { free(v); fprintf(stderr, "[audio] cannot allocate PCM\n"); return NULL; }
-    if (pcm) memcpy(v->pcm, pcm, (size_t)frames * v->block);
-    else memset(v->pcm, bits == 8 ? 128 : 0, (size_t)frames * v->block);
+    if (!shared) {
+        if (pcm) memcpy(v->pcm, pcm, (size_t)frames * v->block);
+        else memset(v->pcm, bits == 8 ? 128 : 0, (size_t)frames * v->block);
+    }
     gex_mutex_lock(&audio_lock);
     v->native = gex_native_voice_create(v->pcm, frames, rate, channels, bits);
     if (v->native) {
@@ -132,8 +135,17 @@ gex_audio_voice *gex_audio_voice_create(const void *pcm, uint32_t frames,
         gex_native_voice_gain(v->native, master, master);
     }
     gex_mutex_unlock(&audio_lock);
-    if (!v->native) { free(v->pcm); free(v); return NULL; }
+    if (!v->native) { if (v->owns_pcm) free(v->pcm); free(v); return NULL; }
     return v;
+}
+gex_audio_voice *gex_audio_voice_create(const void *pcm, uint32_t frames,
+                                       int rate, int channels, int bits) {
+    return create_voice(pcm, NULL, frames, rate, channels, bits);
+}
+gex_audio_voice *gex_audio_voice_create_shared(uint8_t *pcm, uint32_t frames,
+                                              int rate, int channels, int bits) {
+    if (!pcm) { fprintf(stderr, "[audio] missing shared PCM storage\n"); return NULL; }
+    return create_voice(NULL, pcm, frames, rate, channels, bits);
 }
 void gex_audio_voice_destroy(gex_audio_voice *v) {
     if (!v) return;
@@ -143,7 +155,8 @@ void gex_audio_voice_update(gex_audio_voice *v, uint32_t at, const void *pcm, ui
     if (!v || at > v->frames || n > v->frames - at || (!pcm && n))
         hle_fatal("invalid PCM update");
     gex_mutex_lock(&audio_lock);
-    memcpy(v->pcm + (size_t)at * v->block, pcm, (size_t)n * v->block);
+    uint8_t *destination = v->pcm + (size_t)at * v->block;
+    if (destination != pcm && n) memcpy(destination, pcm, (size_t)n * v->block);
     gex_native_voice_update(v->native, at, n);
     gex_mutex_unlock(&audio_lock);
 }

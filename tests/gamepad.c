@@ -69,7 +69,7 @@ int main(void) {
     static const struct { int button; uint32_t vk; } buttons[] = {
         {SDL_CONTROLLER_BUTTON_A, 'X'}, {SDL_CONTROLLER_BUTTON_B, 'C'},
         {SDL_CONTROLLER_BUTTON_X, 'Z'}, {SDL_CONTROLLER_BUTTON_Y, 'V'},
-        {SDL_CONTROLLER_BUTTON_START, 'X'}, {SDL_CONTROLLER_BUTTON_BACK, 0x1B},
+        {SDL_CONTROLLER_BUTTON_START, 0x1B}, {SDL_CONTROLLER_BUTTON_BACK, 0x1B},
         {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 'V'}, {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 'V'},
         {SDL_CONTROLLER_BUTTON_DPAD_LEFT, 0x25}, {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x27},
         {SDL_CONTROLLER_BUTTON_DPAD_UP, 0x26}, {SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x28}
@@ -78,6 +78,7 @@ int main(void) {
         CHECK(!SDL_JoystickSetVirtualButton(joystick, buttons[i].button, 1));
         gex_gamepad_pump();
         CHECK(key(buttons[i].vk) == 0x8001);
+        if (buttons[i].button == SDL_CONTROLLER_BUTTON_START) CHECK(!key('X'));
         gex_gamepad_pump();
         CHECK(key(buttons[i].vk) == 0x8000);
         CHECK(!SDL_JoystickSetVirtualButton(joystick, buttons[i].button, 0));
@@ -142,14 +143,15 @@ int main(void) {
     CHECK(!SDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_START, 1));
     gex_gamepad_pump();
     CHECK(key('X') == 0x8001);
+    CHECK(key(0x1B) == 0x8001);
     CHECK(!key(0x13));
     CHECK(!SDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_A, 0));
     gex_gamepad_pump();
-    CHECK(key('X') == 0x8000 && !key(0x13));
+    CHECK(!key('X') && key(0x1B) == 0x8000 && !key(0x13));
     CHECK(hle_screen_key_hook(SDL_SCANCODE_X, 1));
     CHECK(!SDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_START, 0));
     gex_gamepad_pump();
-    CHECK(key('X') == 0x8000 && !key(0x13));
+    CHECK(key('X') == 0x8001 && !key(0x1B) && !key(0x13));
     CHECK(hle_screen_key_hook(SDL_SCANCODE_X, 0));
     CHECK(!key('X') && !key(0x13));
     CHECK(!hle_screen_key_hook(SDL_SCANCODE_F1, 1));

@@ -1,5 +1,22 @@
 #include <stdarg.h>
+#include <kos.h>
+#include <dc/sound/sound.h>
+#include <dc/sound/aica_comm.h>
+#include <dc/spu.h>
+#include <dc/g2bus.h>
+#include "arm/aica_cmd_iface.h"
+static uint32_t delayed_operation;
+static int delayed_command(void *packet, uint32_t size) {
+    aica_cmd_t *cmd = packet;
+    aica_channel_t *ch = (aica_channel_t *)cmd->cmd_data;
+    if (cmd->cmd == AICA_CMD_CHAN && delayed_operation &&
+        (ch->cmd & AICA_CH_CMD_MASK) == delayed_operation)
+        cmd->timestamp = g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CLOCK) + 200;
+    return snd_sh4_to_aica(packet, size);
+}
+#define snd_sh4_to_aica delayed_command
 #include "../src/platform/dreamcast/audio.c"
+#undef snd_sh4_to_aica
 
 KOS_INIT_FLAGS(INIT_DEFAULT);
 static int failures;
@@ -182,8 +199,9 @@ static void check_pending_starts(void) {
     memset(pcm, 192, sizeof pcm);
     gex_native_voice *v = gex_native_voice_create(pcm, sizeof pcm, 22050, 1, 8);
     if (!v) abort();
-    unsigned missed = 0;
-    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+    unsigned missed = 0, wraps = 0;
+    uint32_t previous_head = queue_read(offsetof(aica_queue_t, head));
+    for (unsigned attempt = 0; attempt < 128; ++attempt) {
         gex_native_voice_seek(v, 0);
         thd_sleep(attempt % 11 + 1);
         gex_native_voice_play(v, 0);
@@ -201,13 +219,57 @@ static void check_pending_starts(void) {
             EXPECT(v->played > 0);
         }
         gex_native_voice_stop(v);
+        uint32_t head = queue_read(offsetof(aica_queue_t, head));
+        if (head < previous_head) ++wraps;
+        previous_head = head;
     }
-    printf("AICA pending starts: %u/32 missed\n", missed);
-    EXPECT(missed == 0);
+    printf("AICA pending starts: %u/128 missed, %u queue wraps\n", missed, wraps);
+    EXPECT(missed == 0 && wraps > 0);
     gex_native_voice_destroy(v);
+}
+static void check_deferred_commands(void) {
+    const uint32_t frames = 2205;
+    uint8_t pcm[2205 * 2];
+    memset(pcm, 192, sizeof pcm);
+    for (int channels = 1; channels <= 2; ++channels) {
+        gex_native_voice *v = gex_native_voice_create(pcm, frames, 22050, channels, 8);
+        if (!v) abort();
+        delayed_operation = AICA_CH_CMD_START;
+        gex_native_voice_play(v, 0);
+        delayed_operation = 0;
+        while (timer_us_gettime64() - v->started < 6000) thd_pass();
+        gex_native_audio_poll();
+        EXPECT(v->playing && v->played == 0);
+        gex_native_voice_gain(v, 0.25f, 0.75f);
+        gex_native_voice_rate(v, 22050);
+        thd_sleep(60);
+        gex_native_audio_poll();
+        EXPECT(v->playing && v->played > 0 && v->played < frames);
+        thd_sleep(80);
+        gex_native_voice_destroy(v);
+        v = gex_native_voice_create(pcm, frames, 22050, channels, 8);
+        if (!v) abort();
+        gex_native_voice_play(v, 0);
+        thd_sleep(20);
+        gex_native_audio_poll();
+        EXPECT(v->playing);
+        if (v->channel[0] >= 0) {
+            int channel[2] = {v->channel[0], v->channel[1]};
+            for (int c = 0; c < channels; ++c)
+                EXPECT(snd_is_playing((unsigned)channel[c]));
+            delayed_operation = AICA_CH_CMD_STOP;
+            gex_native_voice_stop(v);
+            delayed_operation = 0;
+            for (int c = 0; c < channels; ++c)
+                EXPECT(!snd_is_playing((unsigned)channel[c]));
+        }
+        thd_sleep(80);
+        gex_native_voice_destroy(v);
+    }
 }
 int main(void) {
     if (!gex_native_audio_open()) return 1;
+    check_deferred_commands();
     check_pending_starts();
     check_uploads();
     check_large_uploads();

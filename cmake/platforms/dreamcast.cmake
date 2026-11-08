@@ -45,6 +45,9 @@ set(GEX_RUNTIME_PLATFORM_SOURCES src/platform/dreamcast/runtime.c
     src/platform/dreamcast/filesystem.c src/platform/dreamcast/memory.c
     src/platform/dreamcast/audio.c src/platform/dreamcast/font.c
     src/platform/dreamcast/screen.c)
+set_property(SOURCE src/platform/dreamcast/audio.c tests/dreamcast_audio.c
+    APPEND PROPERTY INCLUDE_DIRECTORIES "$ENV{KOS_BASE}/kernel/arch/dreamcast/sound"
+    "$ENV{KOS_BASE}/kernel/arch/dreamcast/include/dc/sound")
 add_compile_definitions(RECOMP_FLAT_MEMORY RECOMP_UNALIGNED_MEMORY HLE_GUEST_STACK_SIZE=131072
     HLE_MAX_WINDOWS=32 HLE_MAX_MENUS=8 HLE_MAX_DC=64
     HLE_MAX_FONTS=16 HLE_MAX_GOBJ=128 HLE_MAX_DIBS=64)
@@ -78,5 +81,8 @@ if(BUILD_TESTING)
         "${PCRECOMP_DIR}/runtime/win32hle" "${PCRECOMP_DIR}/runtime/recomp32")
     add_executable(gex_aica_test tests/dreamcast_audio.c)
     target_include_directories(gex_aica_test PRIVATE src
+        "${PCRECOMP_DIR}/runtime/win32hle" "${PCRECOMP_DIR}/runtime/recomp32")
+    add_executable(gex_vm_test tests/dreamcast_memory.c)
+    target_include_directories(gex_vm_test PRIVATE src
         "${PCRECOMP_DIR}/runtime/win32hle" "${PCRECOMP_DIR}/runtime/recomp32")
 endif()

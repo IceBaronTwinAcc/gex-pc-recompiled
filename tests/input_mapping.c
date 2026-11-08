@@ -32,7 +32,7 @@ int main(void) {
     CHECK(!gex_gamepad_init(1));
     snapshot.focused = snapshot.connected = 1;
     static const struct { uint32_t button, key; } mapping[] = {
-        {GEX_PAD_A, 'X'}, {GEX_PAD_START, 'X'}, {GEX_PAD_B, 'C'},
+        {GEX_PAD_A, 'X'}, {GEX_PAD_START, 0x1B}, {GEX_PAD_B, 'C'},
         {GEX_PAD_X, 'Z'}, {GEX_PAD_Y, 'V'}, {GEX_PAD_L, 'V'},
         {GEX_PAD_R, 'V'}, {GEX_PAD_BACK, 0x1B},
         {GEX_PAD_LEFT, 0x25}, {GEX_PAD_RIGHT, 0x27},
@@ -43,6 +43,7 @@ int main(void) {
         snapshot.buttons = mapping[i].button;
         gex_gamepad_pump();
         CHECK(held[mapping[i].key] && presses[mapping[i].key] == old_presses + 1);
+        if (mapping[i].button == GEX_PAD_START) CHECK(!held['X']);
         unsigned old_events = event_count;
         gex_gamepad_pump();
         CHECK(event_count == old_events);
@@ -50,6 +51,15 @@ int main(void) {
         gex_gamepad_pump();
         CHECK(!held[mapping[i].key]);
     }
+    snapshot.buttons = GEX_PAD_A | GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(held['X'] && held[0x1B]);
+    snapshot.buttons = GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(!held['X'] && held[0x1B]);
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    CHECK(!held['X'] && !held[0x1B]);
     snapshot.x = 16000;
     gex_gamepad_pump();
     CHECK(!held[0x27]);

@@ -45,10 +45,10 @@ uses Chromium's test-only SwiftShader flags.
 For a branch-based GitHub Pages site, place the generated HTML at the branch
 root as `index.html`, alongside `gex_recomp.js`, `gex_recomp.wasm`,
 `gex-coi-serviceworker.js`, and `.nojekyll`; configure Pages to publish that
-branch's root. The Wasm binary contains translated game code, so confirm that
-you have permission to distribute it before publishing. Never include the
-original game installation. After rebuilding, refresh all four generated
-files together. To check the packaged site on a headerless project subpath:
+branch's root. Permission to distribute the translated game code in this
+project's public Pages build has been confirmed. Never include the original
+game installation. After rebuilding, refresh all four generated files
+together. To check the packaged site on a headerless project subpath:
 
 ```sh
 python tests/wasm_coi.py --web-dir . --html index.html --webgpu

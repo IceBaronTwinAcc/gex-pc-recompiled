@@ -49,7 +49,9 @@ static void audio(unsigned channel);
 static int save(void);
 
 uint32_t gex_options_platform(void) {
-#if defined(__ANDROID__)
+#if defined(__EMSCRIPTEN__)
+    return GEX_OPTIONS_WEB;
+#elif defined(__ANDROID__)
     return GEX_OPTIONS_ANDROID;
 #elif defined(_WIN32)
     return GEX_OPTIONS_WINDOWS;

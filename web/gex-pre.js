@@ -8,6 +8,49 @@ var gexQueuedFiles = null;
 var gexMenuChoiceAddress = 0;
 var gexMenuStack = [];
 
+function gexReportSaveStorage(error) {
+  if (!error) return;
+  var message = "Browser saves and settings could not be stored: " +
+    (error.message || String(error)) +
+    ". They may be lost when this page closes.";
+  if (typeof postMessage === "function")
+    postMessage({type: "gex-save-storage", message: message, error: true});
+}
+
+function gexStartSaveStorage() {
+  addRunDependency("gex-save-data");
+  try {
+    FS.mkdirTree("/save");
+    if (typeof IDBFS === "undefined") throw new Error("IndexedDB filesystem support is unavailable");
+    var databaseName = Module.gexSaveDatabaseName ||
+      ("gex-recomp-saves:" + new URL(".", globalThis.location.href).pathname);
+    var getDatabase = IDBFS.getDB;
+    IDBFS.getDB = function (name, callback) {
+      return getDatabase.call(IDBFS, name === "/save" ? databaseName : name, callback);
+    };
+    var syncDatabase = IDBFS.syncfs;
+    IDBFS.syncfs = function (mount, populate, callback) {
+      return syncDatabase.call(IDBFS, mount, populate, function (error) {
+        gexReportSaveStorage(error);
+        callback(error);
+      });
+    };
+    FS.mount(IDBFS, {autoPersist: true}, "/save");
+    FS.syncfs(true, function (error) {
+      if (error) {
+        try { FS.unmount("/save"); } catch (unmountError) {
+          console.error("[saves] cannot disable failed browser storage:", unmountError);
+        }
+        gexReportSaveStorage(error);
+      }
+      removeRunDependency("gex-save-data");
+    });
+  } catch (error) {
+    gexReportSaveStorage(error);
+    removeRunDependency("gex-save-data");
+  }
+}
+
 function gexPickerEnabled(enabled) {
   document.getElementById("choose-folder").disabled = !enabled;
   document.getElementById("remember-game").disabled = !enabled;
@@ -180,6 +223,7 @@ Module.preRun = Module.preRun || [];
 Module.preRun.push(function () {
   addRunDependency(gexDataDependency);
   gexFileSystemReady = true;
+  gexStartSaveStorage();
   gexCheckStoredGame();
 });
 

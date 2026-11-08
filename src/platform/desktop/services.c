@@ -40,17 +40,16 @@ int gex_host_settings_path(char *path, size_t size) {
 #if defined(__EMSCRIPTEN__)
     const char *directory = "/save";
     if (gex_directory_create(directory) && gex_fs_error() != GEX_IO_EXISTS) {
-        fprintf(stderr, "[gex] cannot create browser session settings directory: %s\n",
+        fprintf(stderr, "[gex] cannot create browser save directory: %s\n",
                 gex_fs_error_text());
         return -1;
     }
     int length = snprintf(path, size, "%s/settings.reg", directory);
     if (length < 0 || (size_t)length >= size) {
-        fprintf(stderr, "[gex] browser session settings path is too long\n");
+        fprintf(stderr, "[gex] browser settings path is too long\n");
         return -1;
     }
-    fprintf(stderr, "[gex] browser settings are session-only\n");
-    return 1;
+    return 0;
 #else
 #if defined(__APPLE__) || defined(__ANDROID__)
     const char *root = getenv("XDG_DATA_HOME");

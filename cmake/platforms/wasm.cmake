@@ -37,6 +37,7 @@ add_link_options(
     -sALLOW_MEMORY_GROWTH=1
     -sSTACK_SIZE=33554432
     -Wl,--global-base=16777216
+    -lidbfs.js
     -sENVIRONMENT=web,worker
     "--shell-file=${PROJECT_SOURCE_DIR}/web/shell.html"
     "--pre-js=${PROJECT_SOURCE_DIR}/web/gex-pre.js"

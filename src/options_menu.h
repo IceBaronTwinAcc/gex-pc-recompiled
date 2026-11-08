@@ -9,7 +9,8 @@ enum gex_options_platform {
     GEX_OPTIONS_MACOS = 1u << 2,
     GEX_OPTIONS_ANDROID = 1u << 3,
     GEX_OPTIONS_DREAMCAST = 1u << 4,
-    GEX_OPTIONS_ALL = (1u << 5) - 1
+    GEX_OPTIONS_WEB = 1u << 5,
+    GEX_OPTIONS_ALL = (1u << 6) - 1
 };
 
 uint32_t gex_options_platform(void);

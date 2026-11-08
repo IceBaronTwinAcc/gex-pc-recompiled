@@ -68,9 +68,17 @@ The browser copy uses disk space, is subject to storage quotas and may be
 removed when browser data is cleared or storage is evicted. If saving fails,
 the page reports the error and offers a session-only import. The runtime still
 loads the files into WebAssembly memory on every visit; browser/device memory
-limits can prevent startup. Saved game files do not persist settings or saves.
+limits can prevent startup.
 With Playwright installed, `python tests/wasm_storage.py` exercises import,
-browser restart, removal, session-only use and storage failures.
+browser restart, removal, session-only use, storage failures, and restoring
+settings and password decks before game startup. For a branch-root Pages site,
+use `python tests/wasm_storage.py --web-dir . --html index.html`.
+
+Password decks, options and settings are enabled in the browser build. They are
+stored in a separate IndexedDB filesystem on this device, scoped to the site
+path. Browser storage can be cleared or evicted, and private browsing may block
+it; the page reports storage failures. Original game files, saves and settings
+remain local and are never uploaded.
 
 The browser OpenAL mix uses fixed headroom (about 8.5 dB quieter) so effects
 can overlap music without routinely ducking it. A fast peak limiter and guard
@@ -117,15 +125,11 @@ browser mix without playing audio.
   headless test, not the user's browser settings.
 - AVI playback is not implemented. Movie open requests still require the
   selected installation's movie files; playback is skipped by default.
-- Settings and save-path files use temporary browser memory. They are not
-  persisted across reloads. The browser target does not enable the desktop
-  password-save/options screens.
 - No font files are bundled. The Wasm font lookup can use matching TTF files
   present in the selected `Gex/Fonts`, `Gex/fonts`, or `Gex` tree; missing
   fonts can leave guest-rendered text unavailable.
 - This is a desktop-browser prototype, not an Android/browser-mobile package.
-  Touch controls, persistent installation import and optimized GPU rendering
-  are not included.
+  Touch controls and optimized GPU rendering are not included.
 
 ## Extending the port
 
@@ -141,8 +145,9 @@ the guest-address memory layout is implemented in
 `src/platform/hle/flat_memory.c`, and file reads use the Emscripten branch in
 `src/platform/linux/virtual_memory.c`.
 
-Treat browser persistence, streamed game-data access, movies, fonts and
-hardware rendering as separate follow-up projects. Preserve the guest API
-contract and platform interface ownership rules in
+Treat streamed game-data access, movies, fonts and hardware rendering as
+separate follow-up projects. Browser saves and settings use the existing
+filesystem interfaces backed by IndexedDB. Preserve the guest API contract and
+platform interface ownership rules in
 [porting and maintaining platform backends](response.md). A successful
 Emscripten compile alone does not establish browser startup or gameplay.

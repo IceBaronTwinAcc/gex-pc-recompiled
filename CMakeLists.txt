@@ -534,7 +534,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
             RENAME org.gexrecomp.app.png)
     endforeach()
 endif()
-if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
+if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_WEB) AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
     target_compile_definitions(gex_game PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
     target_compile_definitions(gex_recomp PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
     add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h"
@@ -551,7 +551,7 @@ if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
         target_link_libraries(gex_graphics_guest_test PRIVATE gex_saves)
         target_link_libraries(gex_frame_timing_test PRIVATE gex_saves)
     endif()
-    if(BUILD_TESTING)
+    if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
         add_executable(gex_password_saves_test tests/password_saves.c src/guest_runtime.c
             src/graphics_guest.c src/renderer_headless.c)
         target_link_libraries(gex_password_saves_test PRIVATE

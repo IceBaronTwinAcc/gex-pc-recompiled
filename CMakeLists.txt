@@ -457,7 +457,8 @@ if(GEX_PLATFORM_WEB)
         SUFFIX ".html" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/web")
     set_property(TARGET gex_recomp APPEND PROPERTY LINK_DEPENDS
         "${PROJECT_SOURCE_DIR}/web/shell.html" "${PROJECT_SOURCE_DIR}/web/gex-pre.js"
-        "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js")
+        "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
+        "${PROJECT_SOURCE_DIR}/web/gex-audio.js")
     add_custom_command(TARGET gex_recomp POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"

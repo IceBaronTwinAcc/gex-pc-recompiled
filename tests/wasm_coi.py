@@ -71,11 +71,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--web-dir", type=Path, default=Path("build/wasm/web"))
     parser.add_argument("--game-dir", type=Path, default=Path("Gex"))
+    parser.add_argument("--html", default="gex_recomp.html")
     parser.add_argument("--webgpu", action="store_true")
     args = parser.parse_args()
     web_dir = args.web_dir.resolve()
     game_dir = args.game_dir.resolve()
-    for path in (web_dir / "gex_recomp.html", web_dir / "gex-coi-serviceworker.js", game_dir / "GEX.exe"):
+    for path in (web_dir / args.html, web_dir / "gex-coi-serviceworker.js", game_dir / "GEX.exe"):
         if not path.is_file():
             parser.error(f"required file not found: {path}")
 
@@ -86,7 +87,7 @@ def main():
     server.isolated = False
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}{PREFIX}gex_recomp.html"
+    url = f"http://127.0.0.1:{server.server_port}{PREFIX}{args.html}"
     try:
         with urlopen(url, timeout=5) as response:
             assert response.headers.get("Cross-Origin-Opener-Policy") is None
@@ -109,13 +110,15 @@ def main():
                     assert page.evaluate("typeof SharedArrayBuffer") == "function"
                     assert page.evaluate("!!navigator.serviceWorker.controller")
                     assert page.evaluate("fetch('missing-asset').then(r => r.status)") == 404
-                    html = PREFIX + "gex_recomp.html"
+                    html = PREFIX + args.html
                     script = PREFIX + "gex_recomp.js"
                     assert server.requests.count(html) >= 2, server.requests
                     assert server.requests.index(script) > server.requests.index(html, server.requests.index(html) + 1), server.requests
                     page.reload()
                     wait_ready(page)
                     run_game(page, game_dir, expected)
+                    assert PREFIX + "gex_recomp.wasm" in server.requests
+                    assert not any(path.startswith(PREFIX + "Gex/") for path in server.requests)
                     if errors:
                         raise AssertionError(errors)
                     print(f"headerless subpath, reload and {expected}: PASS")

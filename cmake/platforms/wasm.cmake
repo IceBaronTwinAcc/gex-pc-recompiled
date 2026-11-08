@@ -39,7 +39,8 @@ add_link_options(
     -Wl,--global-base=16777216
     -sENVIRONMENT=web,worker
     "--shell-file=${PROJECT_SOURCE_DIR}/web/shell.html"
-    "--pre-js=${PROJECT_SOURCE_DIR}/web/gex-pre.js")
+    "--pre-js=${PROJECT_SOURCE_DIR}/web/gex-pre.js"
+    "--js-library=${PROJECT_SOURCE_DIR}/web/gex-audio.js")
 
 if(GEX_ENABLE_BGFX_RENDERER)
     add_link_options(

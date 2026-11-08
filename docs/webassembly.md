@@ -41,6 +41,18 @@ With Python Playwright and its Chromium browser installed, run
 the existing header-based server path and browser startup failures. The
 optional WebGPU check uses Chromium's test-only SwiftShader flags.
 
+For a branch-based GitHub Pages site, place the generated HTML at the branch
+root as `index.html`, alongside `gex_recomp.js`, `gex_recomp.wasm`,
+`gex-coi-serviceworker.js`, and `.nojekyll`; configure Pages to publish that
+branch's root. The Wasm binary contains translated game code, so confirm that
+you have permission to distribute it before publishing. Never include the
+original game installation. After rebuilding, refresh all four generated
+files together. To check the packaged site on a headerless project subpath:
+
+```sh
+python tests/wasm_coi.py --web-dir . --html index.html --webgpu
+```
+
 The page asks for one game directory using the browser's directory picker.
 Files are read in the page and copied to the Wasm virtual filesystem at `/Gex`;
 the selection must contain `GEX.exe` at its root and be no larger than 1 GiB.
@@ -59,6 +71,12 @@ loads the files into WebAssembly memory on every visit; browser/device memory
 limits can prevent startup. Saved game files do not persist settings or saves.
 With Playwright installed, `python tests/wasm_storage.py` exercises import,
 browser restart, removal, session-only use and storage failures.
+
+The browser OpenAL mix uses fixed headroom (about 8.5 dB quieter) so effects
+can overlap music without routinely ducking it. A fast peak limiter and guard
+protect unusually loud mixes. Native OpenAL builds retain their existing output
+limiter. With Playwright installed, `python tests/wasm_audio.py` measures the
+browser mix without playing audio.
 
 ## Initial port scope and limitations
 

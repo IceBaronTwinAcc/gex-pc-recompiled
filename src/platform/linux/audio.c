@@ -31,6 +31,9 @@ struct gex_native_voice {
 static ALCdevice *device;
 static ALCcontext *context;
 static gex_native_voice *voices;
+#ifdef __EMSCRIPTEN__
+extern int gex_web_audio_enable_limiter(void);
+#endif
 #ifdef __ANDROID__
 static int lifecycle_audio(void *unused, SDL_Event *event) {
     (void)unused;
@@ -57,14 +60,14 @@ int gex_native_audio_open(void) {
     device = alcOpenDevice(NULL);
     if (!device) { fprintf(stderr, "[audio] OpenAL device unavailable\n"); return 0; }
     ALCint attributes[5];
-    int count = 0, limiter = 0;
-#ifdef ALC_SOFT_output_limiter
-    limiter = alcIsExtensionPresent(device, "ALC_SOFT_output_limiter");
+    int count = 0;
+#if defined(ALC_SOFT_output_limiter) && !defined(__EMSCRIPTEN__)
+    int limiter = alcIsExtensionPresent(device, "ALC_SOFT_output_limiter");
     if (limiter) {
         attributes[count++] = ALC_OUTPUT_LIMITER_SOFT;
         attributes[count++] = ALC_TRUE;
     } else fprintf(stderr, "[audio] OpenAL output limiter unavailable; overlapping voices may clip\n");
-#else
+#elif !defined(__EMSCRIPTEN__)
     fprintf(stderr, "[audio] OpenAL headers lack output limiter support; overlapping voices may clip\n");
 #endif
 #ifdef ALC_SOFT_HRTF
@@ -82,7 +85,17 @@ int gex_native_audio_open(void) {
     }
     alDistanceModel(AL_NONE);
     check("initialize");
-#ifdef ALC_SOFT_output_limiter
+#ifdef __EMSCRIPTEN__
+    if (!gex_web_audio_enable_limiter()) {
+        fprintf(stderr, "[audio] cannot initialize the browser output limiter\n");
+        alcMakeContextCurrent(NULL);
+        alcDestroyContext(context); alcCloseDevice(device);
+        context = NULL; device = NULL;
+        return 0;
+    }
+    fprintf(stderr, "[audio] browser output limiter enabled\n");
+#endif
+#if defined(ALC_SOFT_output_limiter) && !defined(__EMSCRIPTEN__)
     if (limiter) {
         ALCint enabled = ALC_FALSE;
         alcGetIntegerv(device, ALC_OUTPUT_LIMITER_SOFT, 1, &enabled);

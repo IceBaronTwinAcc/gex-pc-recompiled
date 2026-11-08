@@ -52,6 +52,17 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static int g_external_window;
+#ifdef __EMSCRIPTEN__
+static int g_web_output_width, g_web_output_height;
+static int g_web_output_captured;
+static int g_web_fullscreen_pending;
+static int capture_web_output(void) {
+    if (g_web_output_captured) return 0;
+    if (SDL_GetRendererOutputSize(g_ren, &g_web_output_width, &g_web_output_height)) return -1;
+    g_web_output_captured = 1;
+    return 0;
+}
+#endif
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
 static pthread_t g_video_thread;                         /* SDL's video calls stay on the thread that opened it */
 #ifdef GEX_NO_DIRECTDRAW
@@ -241,8 +252,23 @@ int gex_video_display(int mode, char *error, size_t size) {
         return -1;
     }
 #endif
-    Uint32 flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
+#ifdef __EMSCRIPTEN__
+    if (g_win && mode != GEX_DISPLAY_WINDOWED && !g_web_output_captured) {
+        g_web_fullscreen_pending = 1;
+        gex_prefs.display = mode;
+        settings_changed();
+        return 0;
+    }
+    g_web_fullscreen_pending = 0;
+#endif
+    Uint32 flags;
+#ifdef __EMSCRIPTEN__
+    /* Desktop fullscreen stretches SDL's canvas backing to the browser viewport. */
+    flags = mode == GEX_DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN;
+#else
+    flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
         mode == GEX_DISPLAY_EXCLUSIVE ? SDL_WINDOW_FULLSCREEN : 0;
+#endif
     if (g_win && SDL_SetWindowFullscreen(g_win, flags)) {
         snprintf(error, size, "Display change failed: %s", SDL_GetError());
         return -1;
@@ -254,6 +280,12 @@ int gex_video_display(int mode, char *error, size_t size) {
 }
 
 int gex_video_desktop(int *width, int *height) {
+#ifdef __EMSCRIPTEN__
+    /* Embedded browser viewports are not reliable display-aspect sources. */
+    *width = 1280;
+    *height = 720;
+    return 0;
+#else
     if (!g_win) { *width = 320; *height = 240; return 0; }
     int display = SDL_GetWindowDisplayIndex(g_win);
     SDL_DisplayMode mode;
@@ -263,6 +295,24 @@ int gex_video_desktop(int *width, int *height) {
     }
     *width = mode.w; *height = mode.h;
     return 0;
+#endif
+}
+
+int gex_video_migrate_saved_resolution(int *width, int *height) {
+#ifdef __EMSCRIPTEN__
+    if (!width || !height || *width <= 0 || *height <= 0 ||
+        (int64_t)*width * 9 >= (int64_t)*height * 16)
+        return 0;
+    int desktop_width, desktop_height;
+    if (gex_video_desktop(&desktop_width, &desktop_height) ||
+        gex_preferences_default_size(desktop_width, desktop_height, width, height))
+        return -1;
+    return 1;
+#else
+    (void)width;
+    (void)height;
+    return 0;
+#endif
 }
 
 /* window points -> game pixels, clamped to the picture */
@@ -303,6 +353,19 @@ static void present(void) {
     initial_window_size(w, h);
 #else
     if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
+#endif
+#ifdef __EMSCRIPTEN__
+    if (g_ren && !g_web_output_captured) {
+        if (capture_web_output())
+            hle_fatal("SDL renderer output size: %s", SDL_GetError());
+    }
+    if (g_web_fullscreen_pending) {
+        Uint32 flags = SDL_WINDOW_FULLSCREEN;
+        if (SDL_SetWindowFullscreen(g_win, flags))
+            hle_fatal("Display change failed: %s", SDL_GetError());
+        g_fullscreen = 1;
+        g_web_fullscreen_pending = 0;
+    }
 #endif
     uint32_t now = hle_ticks_ms();
     g_src_w = w, g_src_h = h;
@@ -819,7 +882,19 @@ void hle_screen_pump(void) {
             break;
         }
         case SDL_WINDOWEVENT:
-            if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) g_menu_depth = 0;   /* placed for the old size */
+            if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                g_menu_depth = 0;                         /* placed for the old size */
+#ifdef __EMSCRIPTEN__
+                int output_width, output_height;
+                if (SDL_GetRendererOutputSize(g_ren, &output_width, &output_height))
+                    hle_fatal("SDL renderer output size: %s", SDL_GetError());
+                /* Fullscreen can enlarge SDL's software canvas backing store; keep the windowed pixel size. */
+                if (g_web_output_width > 0 &&
+                    (output_width != g_web_output_width || output_height != g_web_output_height)) {
+                    SDL_SetWindowSize(g_win, g_web_output_width, g_web_output_height);
+                }
+#endif
+            }
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_EXPOSED) g_shown_seq = ~0u;
             break;
         default: break;
@@ -856,11 +931,15 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
     hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
+    Uint32 window_flags = SDL_WINDOW_RESIZABLE;
+#ifndef __EMSCRIPTEN__
+    window_flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     if (gex_app_video_init() != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
     g_win = gex_app_window(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
-                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+                             window_flags | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
 #ifdef __EMSCRIPTEN__
     /* In a browser the game runs on a worker thread and the canvas belongs
@@ -874,6 +953,10 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     if (!g_ren) g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
 #endif
     if (!g_ren) { fprintf(stderr, "[screen] renderer: %s\n", SDL_GetError()); return -1; }
+#ifdef __EMSCRIPTEN__
+    g_web_output_captured = 0;
+    g_web_fullscreen_pending = 0;
+#endif
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_ShowCursor(SDL_DISABLE);                         /* the game draws its own */
     hle_cursor_hook = warp;

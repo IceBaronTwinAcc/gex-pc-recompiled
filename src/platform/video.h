@@ -6,5 +6,6 @@
 int gex_video_display(int mode, char *error, size_t size);
 int gex_video_display_count(void);
 int gex_video_desktop(int *width, int *height);
+int gex_video_migrate_saved_resolution(int *width, int *height);
 
 #endif

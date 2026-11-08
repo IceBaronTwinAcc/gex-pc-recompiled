@@ -10,6 +10,11 @@ int gex_video_display(int mode, char *error, size_t size) {
     return -1;
 }
 int gex_video_desktop(int *width, int *height) { *width = 640; *height = 480; return 0; }
+int gex_video_migrate_saved_resolution(int *width, int *height) {
+    (void)width;
+    (void)height;
+    return 0;
+}
 
 int (*hle_screen_key_hook)(int, int);
 int (*hle_screen_cursor_hook)(void);

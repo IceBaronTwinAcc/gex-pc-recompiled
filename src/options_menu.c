@@ -308,6 +308,12 @@ int gex_options_load(void) {
             gex_prefs.renderer = fallback;
             gex_prefs.api = GEX_API_AUTO;
         }
+        int saved_width = gex_prefs.width, saved_height = gex_prefs.height;
+        int migrated = gex_video_migrate_saved_resolution(&gex_prefs.width, &gex_prefs.height);
+        if (migrated < 0) goto invalid;
+        if (migrated)
+            fprintf(stderr, "[options] migrated unsupported saved resolution %dx%d to %dx%d\n",
+                    saved_width, saved_height, gex_prefs.width, gex_prefs.height);
     }
     for (unsigned i = 0; i < GEX_ACTION_COUNT; ++i)
         if (gex_controls_bind(i, 0, gex_prefs.bindings[i].key, gex_prefs.bindings[i].scan) ||

@@ -101,11 +101,26 @@ browser mix without playing audio.
   different renderer settings. WebGPU availability does not affect backend
   selection. If browser settings contain a renderer that this build does not
   support, the options loader resets it to the available software renderer.
+- SDL's browser canvas does not use a high-DPI backing buffer. The page follows
+  the backing buffer's aspect ratio in windowed mode and scales the
+  logical-resolution software output to the page and fullscreen viewport,
+  avoiding an unnecessary per-frame CPU upscale for high-DPI screens.
+  The Web build uses a stable 16:9 default instead of deriving the game
+  resolution from an embedded browser viewport's arbitrary dimensions.
+  Older saved resolutions narrower than 16:9 are migrated to that default.
+  Fullscreen resizes keep the original backing size; CSS scales it to the
+  viewport instead of asking the software renderer to redraw at screen size.
+  SDL uses aspect-preserving fullscreen on Web, and delays a saved fullscreen
+  mode until the initial backing size is established.
+  The fullscreen canvas uses `object-fit: contain` within the viewport, so
+  widescreen output remains fully visible without being stretched or clipped.
 - With Python Playwright, a running Web server and a local game installation,
   run `python tests/wasm_renderer_selection.py --webgpu` to verify software
   selection both with WebGPU disabled and with Chromium's test adapter
   available. The adapter check uses test-only SwiftShader flags in a headless
   browser; it does not depend on the user's browser settings.
+  Add `--firefox` (and install Playwright's Firefox browser if needed) to include
+  a headless Firefox check for fullscreen canvas backing-size stability.
 - AVI playback is not implemented. Movie open requests still require the
   selected installation's movie files; playback is skipped by default.
 - No font files are bundled. The Wasm font lookup can use matching TTF files

@@ -13,7 +13,13 @@
     button:hover, button:focus-visible { background: #385b83; outline: 2px solid #91c5ff; }
     #status { min-height: 2.5rem; margin: .75rem 0; white-space: pre-wrap; }
     #game { position: relative; background: #000; }
-    #canvas { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; outline: none; }
+    #canvas { display: block; width: 100%; height: auto; aspect-ratio: auto; object-fit: contain; outline: none; }
+    #canvas:fullscreen {
+      width: 100vw !important;
+      height: 100vh !important;
+      object-fit: contain !important;
+      background: #000;
+    }
     #menu-backdrop { position: absolute; inset: 0; display: none; place-items: center; padding: 1rem; background: #0009; }
     #menu-backdrop[aria-hidden="false"] { display: grid; }
     #menu-panel { width: min(28rem, 100%); max-height: 90%; overflow: auto; padding: 1rem; border: 1px solid #71839b; border-radius: .5rem; background: #171d27; box-shadow: 0 1rem 3rem #000a; }

@@ -27,6 +27,7 @@
 #include <stdatomic.h>
 #include <emscripten.h>
 #include <emscripten/threading.h>
+#include "platform/wasm/fullscreen.h"
 #endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -261,18 +262,20 @@ int gex_video_display(int mode, char *error, size_t size) {
     }
     g_web_fullscreen_pending = 0;
 #endif
-    Uint32 flags;
 #ifdef __EMSCRIPTEN__
-    /* Desktop fullscreen stretches SDL's canvas backing to the browser viewport. */
-    flags = mode == GEX_DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN;
+    int result = g_win ? gex_wasm_set_fullscreen(mode != GEX_DISPLAY_WINDOWED) : 0;
+    if (result) {
+        snprintf(error, size, "Browser display change failed (%d)", result);
+        return -1;
+    }
 #else
-    flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
+    Uint32 flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
         mode == GEX_DISPLAY_EXCLUSIVE ? SDL_WINDOW_FULLSCREEN : 0;
-#endif
     if (g_win && SDL_SetWindowFullscreen(g_win, flags)) {
         snprintf(error, size, "Display change failed: %s", SDL_GetError());
         return -1;
     }
+#endif
     g_fullscreen = mode != GEX_DISPLAY_WINDOWED;
     gex_prefs.display = mode;
     settings_changed();
@@ -360,9 +363,8 @@ static void present(void) {
             hle_fatal("SDL renderer output size: %s", SDL_GetError());
     }
     if (g_web_fullscreen_pending) {
-        Uint32 flags = SDL_WINDOW_FULLSCREEN;
-        if (SDL_SetWindowFullscreen(g_win, flags))
-            hle_fatal("Display change failed: %s", SDL_GetError());
+        int result = gex_wasm_set_fullscreen(1);
+        if (result) hle_fatal("Browser display change failed (%d)", result);
         g_fullscreen = 1;
         g_web_fullscreen_pending = 0;
     }
@@ -938,8 +940,11 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     if (gex_app_video_init() != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
+#ifndef __EMSCRIPTEN__
+    if (fullscreen) window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+#endif
     g_win = gex_app_window(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
-                             window_flags | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+                             window_flags);
     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
 #ifdef __EMSCRIPTEN__
     /* In a browser the game runs on a worker thread and the canvas belongs
@@ -955,7 +960,7 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     if (!g_ren) { fprintf(stderr, "[screen] renderer: %s\n", SDL_GetError()); return -1; }
 #ifdef __EMSCRIPTEN__
     g_web_output_captured = 0;
-    g_web_fullscreen_pending = 0;
+    g_web_fullscreen_pending = fullscreen != 0;
 #endif
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_ShowCursor(SDL_DISABLE);                         /* the game draws its own */
@@ -973,6 +978,13 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
 void hle_screen_close(void) {
     if (g_win && !pthread_equal(pthread_self(), g_video_thread))
         hle_fatal("SDL screen shutdown on a non-owner thread");
+#ifdef __EMSCRIPTEN__
+    if (g_win) {
+        int result = gex_wasm_set_fullscreen(0);
+        if (result) fprintf(stderr, "[video] Browser display change failed (%d)\n", result);
+    }
+    g_web_fullscreen_pending = 0;
+#endif
     hle_gdi_window_hook = NULL;
     hle_cursor_hook = NULL;
     hle_set_pump_hook(NULL);

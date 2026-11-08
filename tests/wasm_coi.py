@@ -62,9 +62,16 @@ def run_game(page, game_dir, expected):
     if f"[renderer] selected {expected} packet backend" not in log or "[win32hle] FATAL:" in log:
         raise AssertionError(log)
     page.wait_for_function(
-        "() => document.querySelector('#status').textContent === 'Gex is running.'",
+        "() => ['Gex is running.', 'Click the game window for sound.'].includes("
+        "document.querySelector('#status').textContent)",
         timeout=30000,
     )
+    if page.locator("#status").text_content() == "Click the game window for sound.":
+        page.locator("#canvas").click(position={"x": 100, "y": 100})
+        page.wait_for_function(
+            "() => document.querySelector('#status').textContent === 'Gex is running.'",
+            timeout=30000,
+        )
 
 
 def main():
@@ -76,7 +83,9 @@ def main():
     args = parser.parse_args()
     web_dir = args.web_dir.resolve()
     game_dir = args.game_dir.resolve()
-    for path in (web_dir / args.html, web_dir / "gex-coi-serviceworker.js", game_dir / "GEX.exe"):
+    for path in (web_dir / args.html, web_dir / "gex-coi-serviceworker.js",
+                 web_dir / "GexRecompLogo.png", web_dir / "licenses/FFmpeg.txt",
+                 game_dir / "GEX.exe"):
         if not path.is_file():
             parser.error(f"required file not found: {path}")
 
@@ -106,6 +115,11 @@ def main():
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url)
+                    page.wait_for_function(
+                        "() => { const logo = document.querySelector('#project-logo'); "
+                        "return logo && logo.complete && logo.naturalWidth > 0; }",
+                        timeout=10000,
+                    )
                     wait_ready(page)
                     if require_webgpu and not page.evaluate("""async () => {
                         if (!navigator.gpu) return false;
@@ -123,6 +137,7 @@ def main():
                     wait_ready(page)
                     run_game(page, game_dir, "software")
                     assert PREFIX + "gex_recomp.wasm" in server.requests
+                    assert PREFIX + "GexRecompLogo.png" in server.requests
                     assert not any(path.startswith(PREFIX + "Gex/") for path in server.requests)
                     if errors:
                         raise AssertionError(errors)

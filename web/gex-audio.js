@@ -1,4 +1,22 @@
 addToLibrary({
+  gex_web_audio_playback_ready__deps: ['$AL'],
+  gex_web_audio_playback_ready__proxy: 'sync',
+  gex_web_audio_playback_ready: () => {
+    const ctx = AL.currentCtx;
+    if (!ctx || !ctx.audioCtx || ctx.audioCtx.state === 'closed') return -1;
+    if (ctx.audioCtx.state !== 'running') {
+      if (!Module.gexAudioWaiting) {
+        Module.gexAudioWaiting = true;
+        window.gexSetStatus('Click the game window for sound.');
+      }
+      return 0;
+    }
+    if (Module.gexAudioWaiting) {
+      Module.gexAudioWaiting = false;
+      window.gexSetStatus('Gex is running.');
+    }
+    return 1;
+  },
   gex_web_audio_enable_limiter__deps: ['$AL'],
   gex_web_audio_enable_limiter__proxy: 'sync',
   gex_web_audio_enable_limiter: () => {

@@ -439,6 +439,7 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[renderer] selected %s packet backend\n", renderer_names[hardware_renderer]);
     if (!headless && gex_gamepad_init(0)) goto renderer_failed;
+    if (!headless && gex_host_prepare_playback()) goto renderer_failed;
     started = gex_host_ticks_ms();
     if (smoke_seconds) gex_renderer_observe(observe_frame);
     hle_set_pump_hook(monitor);

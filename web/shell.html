@@ -11,6 +11,7 @@
     button, input { font: inherit; }
     button { border: 1px solid #6f8db4; border-radius: .35rem; padding: .65rem 1rem; color: inherit; background: #263a55; cursor: pointer; }
     button:hover, button:focus-visible { background: #385b83; outline: 2px solid #91c5ff; }
+    #project-logo { display: block; width: min(300px, 80vw); height: auto; }
     #status { min-height: 2.5rem; margin: .75rem 0; white-space: pre-wrap; }
     #game { position: relative; background: #000; }
     #canvas { display: block; width: 100%; height: auto; aspect-ratio: auto; object-fit: contain; outline: none; }
@@ -32,9 +33,9 @@
   </style>
 </head>
 <body>
-  <h1>Gex Recompiled</h1>
+  <h1><img id="project-logo" src="GexRecompLogo.png" alt="Gex Recompiled"></h1>
   <p>Select the folder containing your authorized Gex PC installation. The files stay on this device and are not uploaded to a server. A browser-storage copy can be reused on later visits.</p>
-  <p class="warning">This experimental build requires a modern desktop browser. AVI movies are skipped; saves and settings are stored in this browser.</p>
+  <p class="warning">This experimental build requires a modern desktop browser. Supported AVI movies play in-browser; saves and settings are stored here.</p>
   <div>
     <button id="choose-folder" type="button" disabled>Choose game folder</button>
     <input id="game-folder" type="file" webkitdirectory directory multiple hidden>

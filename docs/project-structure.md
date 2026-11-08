@@ -105,7 +105,7 @@ route; do not assume every HLE path applies to it.
 | Guest graphics and packet semantics | `src/graphics_guest.c`, `src/raster.c`, `src/renderer.c` | Hooks in `tools/graphics_rewrite.py`; backend contracts in `src/renderer.h` and `src/packet_gpu.h`. |
 | Host presentation / GPU backend | `src/platform/desktop/renderer.c`, `src/platform/desktop/packet_gpu.c`, `src/platform/dreamcast/packet_gpu.c` | Backend selector `src/platform/packet_gpu_select.c`; shared GL and bgfx implementations under `src/platform/gl/` and `src/platform/bgfx/`. |
 | Movie playback | `src/movie.c`, `src/movie_decoder.h`, `src/platform/desktop/movie_decoder.c` | Dreamcast movie I/O/pixels under `src/platform/dreamcast/`; `tests/movie*`. |
-| Audio, host services, filesystem | `src/platform/audio.h`, `src/platform/audio.c`, `src/platform/filesystem.h`, `src/platform/host.h` | SDL host services in `src/platform/desktop/`, POSIX host operations in `src/platform/linux/`, and target implementations under `windows/` and `dreamcast/`; pcrecomp Win32 HLE semantics. |
+| Audio, host services, filesystem | `src/platform/audio.h`, `src/platform/audio.c`, `src/platform/filesystem.h`, `src/platform/host.h` | SDL host services in `src/platform/desktop/`, POSIX host operations in `src/platform/linux/`, and target implementations under `windows/` and `dreamcast/`; Web playback permission before guest execution in `src/platform/wasm/playback.c`; pcrecomp Win32 HLE semantics. |
 | Dreamcast VMU LCD | `src/platform/dreamcast/services.c` | `src/platform/dreamcast/vmu_image.xbm` when present; [flycast-testing.md](flycast-testing.md). VMU save persistence is not implemented. |
 | Game import or launcher UI | `src/platform/desktop/game_install.c` and desktop pickers in `src/platform/desktop/`; Android import in `android/src/org/gexrecomp/app/` | `tests/game_install.*`, `tests/folder_picker.*`, `tests/test_android_import.py`. |
 | Gameplay smoke checks | `src/autoplay.c`, `src/gameplay.c`, `src/main.c` | `tests/autoplay.c`, `tests/gameplay.c`; testing skill. |
@@ -132,7 +132,7 @@ prove image correctness or gameplay. Use appropriate external scanout evidence.
 | Windows MSVC native32 | `cmake/platforms/windows.cmake`; separate native32 runtime | `src/platform/windows/main.c`; requires MSVC x86 / `-A Win32`. Not interchangeable with MinGW HLE. |
 | Android | Desktop/HLE manifest with Android-specific branches and `src/platform/android/` entry/font helpers | `android/`, `tools/build-android.sh`, `tools/package-android.py`. |
 | Dreamcast | `cmake/platforms/dreamcast.cmake`, KallistiOS services in `src/platform/dreamcast/` | `cmake/toolchains/dreamcast.cmake`, `tools/build-dreamcast.sh`, `tools/test-dreamcast.sh`. |
-| WebAssembly (experimental) | `cmake/platforms/wasm.cmake`, Wasm font/movie helpers under `src/platform/wasm/`, and Emscripten branches in desktop/Linux/HLE sources; browser shell/import in `web/` | `tools/build-wasm.sh`, `tools/serve-wasm.py`, [WebAssembly guide](webassembly.md). |
+| WebAssembly (experimental) | `cmake/platforms/wasm.cmake`, Wasm font support under `src/platform/wasm/`, and Emscripten branches in desktop/Linux/HLE sources; browser shell/import in `web/` | `tools/build-wasm.sh`, `tools/serve-wasm.py`, [WebAssembly guide](webassembly.md). |
 
 `GEX_PLATFORM_FILE` selects the manifest. `GEX_RENDERER_BACKEND_SOURCE`,
 `GEX_MOVIE_DECODER_SOURCE`, and `GEX_ENABLE_*_RENDERER` affect selected
@@ -144,6 +144,8 @@ external Flycast source checkout, not this project's runtime.
 
 ## Tests and verification
 
+For a general, step-by-step investigation process, use
+[debugging](debugging.md).
 For missing prerequisites, stale caches, or missing tests, use
 [build and test troubleshooting](build-test-troubleshooting.md).
 For drawing and presentation problems, use

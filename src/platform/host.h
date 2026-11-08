@@ -18,6 +18,8 @@ int gex_host_skip_movies_by_default(void);
 /* 0: writable persistent path; 1: explicitly session-only; -1: host error. */
 int gex_host_settings_path(char *path, size_t size);
 void gex_host_install_diagnostics(void);
+/* Wait for host playback permission before guest timers start; 0: ready, -1: error. */
+int gex_host_prepare_playback(void);
 int gex_host_screenshot(const char *path, const uint8_t *pixels,
                         int width, int height, int pitch);
 

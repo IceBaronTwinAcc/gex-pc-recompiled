@@ -7,6 +7,9 @@
 #include "win32hle.h"
 #include "platform/host.h"
 #include "platform/filesystem.h"
+#ifdef __EMSCRIPTEN__
+#include "platform/wasm/playback.h"
+#endif
 
 uint32_t gex_host_ticks_ms(void) { return SDL_GetTicks(); }
 void gex_host_delay(uint32_t milliseconds) { SDL_Delay(milliseconds); }
@@ -28,9 +31,11 @@ int gex_host_working_directory(char *path, size_t size) {
     return -1;
 }
 
-int gex_host_skip_movies_by_default(void) {
+int gex_host_skip_movies_by_default(void) { return 0; }
+
+int gex_host_prepare_playback(void) {
 #ifdef __EMSCRIPTEN__
-    return 1;
+    return gex_wasm_prepare_playback();
 #else
     return 0;
 #endif

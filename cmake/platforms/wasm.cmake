@@ -21,12 +21,44 @@ set(GEX_HOST_SOURCES src/platform/desktop/services.c
 set(GEX_LAUNCHER_SOURCES src/main.c src/platform_shims.c src/movie.c
     src/autoplay.c src/gameplay.c src/gamepad.c)
 set(GEX_DEFAULT_RENDERER "${PROJECT_SOURCE_DIR}/src/platform/desktop/renderer.c")
-set(GEX_DEFAULT_MOVIE_DECODER "${PROJECT_SOURCE_DIR}/src/platform/wasm/movie_decoder.c")
+set(GEX_DEFAULT_MOVIE_DECODER "${PROJECT_SOURCE_DIR}/src/platform/desktop/movie_decoder.c")
+if(GEX_MOVIE_DECODER_SOURCE STREQUAL
+   "${PROJECT_SOURCE_DIR}/src/platform/wasm/movie_decoder.c")
+    set(GEX_MOVIE_DECODER_SOURCE "${GEX_DEFAULT_MOVIE_DECODER}" CACHE FILEPATH
+        "C source implementing src/movie_decoder.h (defaults to desktop FFmpeg)" FORCE)
+endif()
+set(GEX_WASM_FFMPEG_ROOT "${PROJECT_SOURCE_DIR}/.deps/wasm-ffmpeg" CACHE PATH
+    "Prefix containing the minimal WebAssembly FFmpeg build")
+
+function(gex_configure_movie_decoder target source)
+    if("${source}" STREQUAL "${GEX_DEFAULT_MOVIE_DECODER}")
+        set(ffmpeg_libraries
+            "${GEX_WASM_FFMPEG_ROOT}/lib/libavformat.a"
+            "${GEX_WASM_FFMPEG_ROOT}/lib/libavcodec.a"
+            "${GEX_WASM_FFMPEG_ROOT}/lib/libswscale.a"
+            "${GEX_WASM_FFMPEG_ROOT}/lib/libavutil.a")
+        foreach(path IN LISTS ffmpeg_libraries)
+            if(NOT EXISTS "${path}")
+                message(FATAL_ERROR
+                    "Missing ${path}; build WebAssembly FFmpeg with tools/build-wasm.sh.")
+            endif()
+        endforeach()
+        if(NOT EXISTS "${GEX_WASM_FFMPEG_ROOT}/include/libavcodec/avcodec.h" OR
+           NOT EXISTS "${GEX_WASM_FFMPEG_ROOT}/licenses/FFmpeg.txt")
+            message(FATAL_ERROR
+                "Incomplete WebAssembly FFmpeg install; run tools/build-wasm.sh.")
+        endif()
+        target_include_directories(${target} PRIVATE "${GEX_WASM_FFMPEG_ROOT}/include")
+        target_link_libraries(${target} PUBLIC ${ffmpeg_libraries})
+    endif()
+endfunction()
 
 include("${PROJECT_SOURCE_DIR}/cmake/runtime-core.cmake")
 set(GEX_RUNTIME_PLATFORM_SOURCES
     src/platform/linux/runtime.c src/platform/linux/filesystem.c
     src/platform/linux/virtual_memory.c src/platform/wasm/font_path.c
+    src/platform/wasm/fullscreen.c
+    src/platform/wasm/playback.c
     src/platform/hle/flat_memory.c src/platform/linux/audio.c
     src/platform/desktop/font.c src/platform/desktop/screen.c
     src/platform/desktop/present.c)

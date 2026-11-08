@@ -8,6 +8,114 @@ var gexQueuedFiles = null;
 var gexMenuChoiceAddress = 0;
 var gexMenuStack = [];
 
+if (ENVIRONMENT_IS_WEB && new URL(window.location.href).searchParams.get("trace") === "1") {
+  var gexTraceEndpoint = null;
+  var gexTracePort = new URL(window.location.href).searchParams.get("tracePort");
+  if (gexTracePort !== null) {
+    if (window.location.protocol !== "http:" ||
+        !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname) ||
+        !/^\d+$/.test(gexTracePort) || Number(gexTracePort) < 1 || Number(gexTracePort) > 65535)
+      throw new Error("tracePort requires a local HTTP page and a valid loopback port");
+    gexTraceEndpoint = new URL("/trace", window.location.href);
+    gexTraceEndpoint.port = gexTracePort;
+    gexTraceEndpoint.search = "";
+  }
+  var gexTrace = {
+    writes: 0, changes: 0, lastWrite: null, lastHash: null,
+    maxGapMs: 0, maxWriteMs: 0, image: null, resizes: []
+  };
+  var gexTracePutImageData = CanvasRenderingContext2D.prototype.putImageData;
+  CanvasRenderingContext2D.prototype.putImageData = function () {
+    if (this.canvas !== Module.canvas)
+      return gexTracePutImageData.apply(this, arguments);
+    var start = performance.now();
+    var result = gexTracePutImageData.apply(this, arguments);
+    var writeMs = performance.now() - start;
+    var image = arguments[0];
+    var hash = 2166136261;
+    var step = Math.max(4, Math.floor(image.data.length / 1024 / 4) * 4);
+    for (var i = 0; i < image.data.length; i += step) {
+      hash = Math.imul(hash ^ image.data[i], 16777619);
+      hash = Math.imul(hash ^ image.data[i + 1], 16777619);
+      hash = Math.imul(hash ^ image.data[i + 2], 16777619);
+    }
+    hash >>>= 0;
+    if (hash !== gexTrace.lastHash) ++gexTrace.changes;
+    gexTrace.lastHash = hash;
+    if (gexTrace.lastWrite !== null)
+      gexTrace.maxGapMs = Math.max(gexTrace.maxGapMs, start - gexTrace.lastWrite);
+    gexTrace.lastWrite = start;
+    gexTrace.maxWriteMs = Math.max(gexTrace.maxWriteMs, writeMs);
+    gexTrace.image = [image.width, image.height];
+    ++gexTrace.writes;
+    return result;
+  };
+  var gexTraceObserver = new MutationObserver(function (records) {
+    for (var record of records) {
+      if (gexTrace.resizes.length < 20)
+        gexTrace.resizes.push({
+          atMs: Math.round(performance.now()), attribute: record.attributeName,
+          old: record.oldValue, value: Module.canvas.getAttribute(record.attributeName)
+        });
+    }
+  });
+  gexTraceObserver.observe(Module.canvas, {
+    attributes: true, attributeOldValue: true, attributeFilter: ["width", "height", "style"]
+  });
+  var gexTracePrevious = performance.now();
+  var gexTraceSamples = 0;
+  var gexTraceTimer = window.setInterval(function () {
+    var now = performance.now();
+    var canvas = Module.canvas;
+    var rect = canvas.getBoundingClientRect();
+    var context = typeof AL === "undefined" ? null : AL.currentCtx;
+    var style = getComputedStyle(canvas);
+    var snapshot = {
+      trace: "browser", sample: ++gexTraceSamples,
+      intervalMs: Math.round(now - gexTracePrevious),
+      visibility: document.visibilityState,
+      fullscreen: document.fullscreenElement === canvas,
+      viewport: [innerWidth, innerHeight], dpr: devicePixelRatio,
+      backing: [canvas.width, canvas.height],
+      rect: [rect.x, rect.y, rect.width, rect.height].map(Math.round),
+      image: gexTrace.image,
+      css: {width: style.width, height: style.height, objectFit: style.objectFit},
+      writes: gexTrace.writes, changes: gexTrace.changes,
+      maxGapMs: Math.round(gexTrace.maxGapMs),
+      maxWriteMs: Math.round(gexTrace.maxWriteMs),
+      sinceWriteMs: gexTrace.lastWrite === null ? null : Math.round(now - gexTrace.lastWrite),
+      resizes: gexTrace.resizes,
+      audio: context ? {
+        state: context.audioCtx.state, time: context.audioCtx.currentTime,
+        sources: Object.values(context.sources).map(function (source) {
+          return {state: source.state, queued: source.bufQueue.length,
+                  scheduled: source.audioQueue.length, processed: source.bufsProcessed};
+        })
+      } : null
+    };
+    window.gexLog(JSON.stringify(snapshot));
+    if (gexTraceEndpoint) {
+      snapshot.runtime = document.getElementById("output").textContent.split("\n")
+        .filter(function (line) { return !line.startsWith('{"trace":"browser"'); }).slice(-40);
+      fetch(gexTraceEndpoint.href, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(snapshot), signal: AbortSignal.timeout(2000)
+      }).then(function (response) {
+        if (!response.ok) throw new Error("browser trace HTTP " + response.status);
+      }).catch(function (error) { console.error("[trace] loopback collection failed:", error); });
+    }
+    gexTracePrevious = now;
+    gexTrace.writes = gexTrace.changes = 0;
+    gexTrace.maxGapMs = gexTrace.maxWriteMs = 0;
+    gexTrace.resizes = [];
+    if (gexTraceSamples === 30) {
+      clearInterval(gexTraceTimer);
+      gexTraceObserver.disconnect();
+      CanvasRenderingContext2D.prototype.putImageData = gexTracePutImageData;
+    }
+  }, 2000);
+}
+
 function gexReportSaveStorage(error) {
   if (!error) return;
   var message = "Browser saves and settings could not be stored: " +

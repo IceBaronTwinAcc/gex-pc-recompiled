@@ -453,16 +453,26 @@ endif()
 target_include_directories(gex_recomp PRIVATE "${PCRECOMP_DIR}/runtime/recomp32")
 target_sources(gex_recomp PRIVATE src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
 if(GEX_PLATFORM_WEB)
+    set(GEX_WEB_LOGO "${PROJECT_SOURCE_DIR}/docs/GexRecompLogo.png")
+    set(GEX_WEB_FFMPEG_LICENSE "${GEX_WASM_FFMPEG_ROOT}/licenses/FFmpeg.txt")
     set_target_properties(gex_recomp PROPERTIES
         SUFFIX ".html" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/web")
     set_property(TARGET gex_recomp APPEND PROPERTY LINK_DEPENDS
         "${PROJECT_SOURCE_DIR}/web/shell.html" "${PROJECT_SOURCE_DIR}/web/gex-pre.js"
         "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
-        "${PROJECT_SOURCE_DIR}/web/gex-audio.js")
+        "${PROJECT_SOURCE_DIR}/web/gex-audio.js" "${GEX_WEB_LOGO}"
+        "${GEX_WEB_FFMPEG_LICENSE}")
     add_custom_command(TARGET gex_recomp POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
             "$<TARGET_FILE_DIR:gex_recomp>/gex-coi-serviceworker.js"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GEX_WEB_LOGO}" "$<TARGET_FILE_DIR:gex_recomp>/GexRecompLogo.png"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "$<TARGET_FILE_DIR:gex_recomp>/licenses"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GEX_WEB_FFMPEG_LICENSE}"
+            "$<TARGET_FILE_DIR:gex_recomp>/licenses/FFmpeg.txt"
         VERBATIM)
 endif()
 if(EMSCRIPTEN AND GEX_ENABLE_BGFX_RENDERER)

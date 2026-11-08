@@ -18,16 +18,8 @@ args=(
     -DGEX_ENABLE_OPENGL_RENDERER=OFF
     -DGEX_ENABLE_PVR_RENDERER=OFF
     -DGEX_ENABLE_GLDC_RENDERER=OFF
-    -DGEX_ENABLE_BGFX_RENDERER=ON
+    -DGEX_ENABLE_BGFX_RENDERER=OFF
 )
-bgfx_deps="$PWD/.deps/bgfx-build/_deps"
-if [[ -d "$bgfx_deps/bgfx-src" && -d "$bgfx_deps/bx-src" && -d "$bgfx_deps/bimg-src" ]]; then
-    args+=(
-        "-DBGFX_DIR=$bgfx_deps/bgfx-src"
-        "-DBX_DIR=$bgfx_deps/bx-src"
-        "-DBIMG_DIR=$bgfx_deps/bimg-src"
-    )
-fi
 if command -v ninja >/dev/null 2>&1; then
     args=(-G Ninja "${args[@]}")
 fi

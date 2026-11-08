@@ -1,8 +1,8 @@
 # WebAssembly build
 
 The Emscripten target is an experimental browser port using the HLE runtime,
-SDL input and OpenAL's browser audio backend. It supports the software packet
-renderer and an optional bgfx/WebGPU packet renderer.
+SDL input, OpenAL's browser audio backend and the software packet renderer.
+GPU packet renderers, including bgfx/WebGPU, are disabled for this target.
 Generated game code still comes from the checked-in pcrecomp workflow; the
 original game installation remains user-supplied data.
 
@@ -11,7 +11,7 @@ original game installation remains user-supplied data.
 Install and activate the Emscripten SDK, with `emcc`, `emcmake`, CMake, Ninja,
 Python 3 and Node.js available on `PATH`. Generate `src/recomp/gen/` first if
 it is absent, following [development.md](development.md#generate-the-c-sources).
-Prepare bgfx and its host shader compiler with `tools/build-bgfx.sh`, then build:
+Then build:
 
 ```sh
 tools/build-wasm.sh
@@ -38,8 +38,9 @@ with the embedder policy.
 
 With Python Playwright and its Chromium browser installed, run
 `python tests/wasm_coi.py --webgpu` to check a headerless project subpath,
-the existing header-based server path and browser startup failures. The
-optional WebGPU check uses Chromium's test-only SwiftShader flags.
+the existing header-based server path, browser startup failures, and software
+renderer selection when Chromium can obtain a WebGPU adapter. The WebGPU check
+uses Chromium's test-only SwiftShader flags.
 
 For a branch-based GitHub Pages site, place the generated HTML at the branch
 root as `index.html`, alongside `gex_recomp.js`, `gex_recomp.wasm`,
@@ -95,34 +96,16 @@ browser mix without playing audio.
   browser/device memory limits may prevent startup.
 - The game runs on an Emscripten worker. Shared-memory workers require
   cross-origin isolation, provided by server headers or the service worker.
-- The standard build includes both packet renderers. It checks for a usable
-  WebGPU adapter and device before selecting bgfx, or selects the software
-  renderer when that check fails. The choice is logged. bgfx requires compute,
-  which WebGL 2 does not provide. Its dedicated worker owns the transferred
-  OffscreenCanvas and WebGPU resources; the software path uses SDL instead.
-  Builds can still exclude either renderer explicitly, for example:
-
-  ```sh
-  tools/build-wasm.sh build/wasm-bgfx \
-    -DGEX_ENABLE_BGFX_RENDERER=ON \
-    -DGEX_ENABLE_SOFTWARE_RENDERER=OFF
-  ```
-
-  The bgfx-enabled build uses Asyncify for WebGPU adapter/device
-  initialization and worker event-loop yields. CMake applies the checked-in
-  WebGPU fixes to the pinned bgfx source, and rejects incompatible sources.
-  WebGPU support depends on the browser and GPU. A bgfx-only build cannot fall
-  back to software. If bgfx initialization fails after the availability check,
-  the error is reported rather than silently switching renderers.
-  On Linux, Firefox may leave WebGPU disabled by default. In Firefox 159, setting
-  `dom.webgpu.enabled` to `true` in `about:config` enabled WebGPU in an isolated
-  test profile; availability still depends on the adapter and driver. This is
-  an advanced browser preference and may expose experimental functionality.
-- With Python Playwright and its Chromium browser installed, a running Web
-  server and a local game installation can be checked with
-  `python tests/wasm_renderer_selection.py --webgpu`. The optional `--webgpu`
-  check uses Chromium's unsafe WebGPU and SwiftShader flags in an isolated
-  headless test, not the user's browser settings.
+- The WebAssembly build always enables the software packet renderer and
+  disables OpenGL, PVR, GLdc and bgfx, even when an existing CMake cache has
+  different renderer settings. WebGPU availability does not affect backend
+  selection. If browser settings contain a renderer that this build does not
+  support, the options loader resets it to the available software renderer.
+- With Python Playwright, a running Web server and a local game installation,
+  run `python tests/wasm_renderer_selection.py --webgpu` to verify software
+  selection both with WebGPU disabled and with Chromium's test adapter
+  available. The adapter check uses test-only SwiftShader flags in a headless
+  browser; it does not depend on the user's browser settings.
 - AVI playback is not implemented. Movie open requests still require the
   selected installation's movie files; playback is skipped by default.
 - No font files are bundled. The Wasm font lookup can use matching TTF files
@@ -145,8 +128,8 @@ the guest-address memory layout is implemented in
 `src/platform/hle/flat_memory.c`, and file reads use the Emscripten branch in
 `src/platform/linux/virtual_memory.c`.
 
-Treat streamed game-data access, movies, fonts and hardware rendering as
-separate follow-up projects. Browser saves and settings use the existing
+Treat streamed game-data access, movies and fonts as separate follow-up
+projects. Browser saves and settings use the existing
 filesystem interfaces backed by IndexedDB. Preserve the guest API contract and
 platform interface ownership rules in
 [porting and maintaining platform backends](response.md). A successful

@@ -2,6 +2,14 @@ if(NOT EMSCRIPTEN)
     message(FATAL_ERROR "The WebAssembly backend requires the Emscripten toolchain.")
 endif()
 
+# The browser build intentionally uses SDL's software packet renderer only,
+# overriding renderer options left in an existing build directory.
+set(GEX_ENABLE_SOFTWARE_RENDERER ON CACHE BOOL "Build CPU packet rasterization" FORCE)
+set(GEX_ENABLE_OPENGL_RENDERER OFF CACHE BOOL "Build OpenGL packet rasterization" FORCE)
+set(GEX_ENABLE_PVR_RENDERER OFF CACHE BOOL "Build Dreamcast PVR packet rasterization" FORCE)
+set(GEX_ENABLE_GLDC_RENDERER OFF CACHE BOOL "Build portable fixed-function GLdc packet rasterization" FORCE)
+set(GEX_ENABLE_BGFX_RENDERER OFF CACHE BOOL "Build portable bgfx packet rasterization" FORCE)
+
 set(GEX_PLATFORM_RUNTIME hle)
 set(GEX_PLATFORM_DESKTOP_TESTS OFF)
 set(GEX_PLATFORM_SDL ON)
@@ -42,13 +50,5 @@ add_link_options(
     "--shell-file=${PROJECT_SOURCE_DIR}/web/shell.html"
     "--pre-js=${PROJECT_SOURCE_DIR}/web/gex-pre.js"
     "--js-library=${PROJECT_SOURCE_DIR}/web/gex-audio.js")
-
-if(GEX_ENABLE_BGFX_RENDERER)
-    add_link_options(
-        -sOFFSCREENCANVAS_SUPPORT=1
-        # Transfer only when bgfx starts; SDL software presentation needs the page canvas.
-        "-sOFFSCREENCANVASES_TO_PTHREAD=\"\""
-        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL")
-endif()
 
 set(GEX_PLATFORM_WEB ON)

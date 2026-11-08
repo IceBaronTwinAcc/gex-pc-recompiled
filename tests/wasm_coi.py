@@ -93,11 +93,11 @@ def main():
             assert response.headers.get("Cross-Origin-Opener-Policy") is None
             assert response.headers.get("Cross-Origin-Embedder-Policy") is None
         with sync_playwright() as playwright:
-            cases = [("software", ["--disable-webgpu"])]
+            cases = [("WebGPU disabled", ["--disable-webgpu"], False)]
             if args.webgpu:
-                cases.append(("bgfx", ["--enable-unsafe-webgpu", "--use-angle=swiftshader",
-                                       "--enable-features=Vulkan"]))
-            for expected, flags in cases:
+                cases.append(("WebGPU available", ["--enable-unsafe-webgpu", "--use-angle=swiftshader",
+                                                   "--enable-features=Vulkan"], True))
+            for label, flags, require_webgpu in cases:
                 server.requests.clear()
                 browser = playwright.chromium.launch(headless=True, args=["--mute-audio", *flags])
                 try:
@@ -107,6 +107,11 @@ def main():
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url)
                     wait_ready(page)
+                    if require_webgpu and not page.evaluate("""async () => {
+                        if (!navigator.gpu) return false;
+                        return !!(await navigator.gpu.requestAdapter());
+                    }"""):
+                        raise AssertionError("Chromium's WebGPU adapter is unavailable")
                     assert page.evaluate("typeof SharedArrayBuffer") == "function"
                     assert page.evaluate("!!navigator.serviceWorker.controller")
                     assert page.evaluate("fetch('missing-asset').then(r => r.status)") == 404
@@ -116,12 +121,12 @@ def main():
                     assert server.requests.index(script) > server.requests.index(html, server.requests.index(html) + 1), server.requests
                     page.reload()
                     wait_ready(page)
-                    run_game(page, game_dir, expected)
+                    run_game(page, game_dir, "software")
                     assert PREFIX + "gex_recomp.wasm" in server.requests
                     assert not any(path.startswith(PREFIX + "Gex/") for path in server.requests)
                     if errors:
                         raise AssertionError(errors)
-                    print(f"headerless subpath, reload and {expected}: PASS")
+                    print(f"headerless subpath, reload and {label}: software PASS")
                 finally:
                     browser.close()
 

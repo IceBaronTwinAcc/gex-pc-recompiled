@@ -134,7 +134,7 @@ def alter_saved_game(page, add_invalid):
     }""", add_invalid)
 
 
-def save_fixtures():
+def save_fixtures(renderer=0):
     settings = ["HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Version=dword:0x1"]
     keys = [(0x43, 0x2E), (0x43, 0x2E), (0x5A, 0x2C), (0x58, 0x2D),
             (0x56, 0x2F), (0x1B, 0x01), (0x58, 0x2D), (0x43, 0x2E)]
@@ -149,7 +149,7 @@ def save_fixtures():
         for index in range(3)
     )
     settings.extend((
-        "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Renderer=dword:0x0",
+        f"HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Renderer=dword:0x{renderer:x}",
         "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\API=dword:0x0",
         "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Display=dword:0x0",
         "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Width=dword:0x140",
@@ -212,8 +212,8 @@ def verify_save_database(page, settings, passwords):
         db.close();
       }
     }""")
-    assert actual["settings"] == list(settings.encode("utf-8"))
-    assert actual["passwords"] == list(passwords)
+    assert actual["settings"] == list(settings.encode("utf-8")), actual
+    assert actual["passwords"] == list(passwords), actual
 
 
 def main():
@@ -257,6 +257,27 @@ def main():
             print("initial import persisted locally: PASS")
 
             settings, passwords = save_fixtures()
+            old_webgpu_settings, old_webgpu_passwords = save_fixtures(renderer=4)
+            context = open_browser()
+            try:
+                page = context.pages[0]
+                page.goto(url.rsplit("/", 1)[0] + "/seed")
+                seed_save_files(page, old_webgpu_settings, old_webgpu_passwords, 1)
+                verify_save_database(page, old_webgpu_settings, old_webgpu_passwords)
+            finally:
+                context.close()
+
+            context = open_browser()
+            try:
+                page = context.pages[0]
+                page.goto(url)
+                wait_log(page, "[options] saved renderer 4 is unavailable in this build; using renderer 0")
+                wait_game(page)
+                verify_save_database(page, old_webgpu_settings, old_webgpu_passwords)
+            finally:
+                context.close()
+            print("saved WebGPU renderer falls back to software: PASS")
+
             invalid_settings = (
                 "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Version=dword:0x1\n"
             )

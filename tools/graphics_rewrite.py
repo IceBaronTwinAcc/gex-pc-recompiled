@@ -42,7 +42,8 @@ SCREEN_HOOKS = {
     "    RECOMP_ENTER(0x004451E0u);": (
         "    if (gex_graphics_native_operation(0x4451E0)) { esp += 4; return; }\n"
         "    gex_graphics_atlas_access(MEM32(esp + 4));"),
-    "    RECOMP_ENTER(0x00440850u);": "    gex_graphics_transition_begin();",
+    "    RECOMP_CALL(sub_00440930); /* 0x004408D6: call 0x440930 */":
+        "    gex_graphics_transition_begin();",
     "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x004408BD: ret  */":
         "    gex_graphics_transition_end();",
     "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x00440921: ret  */":
@@ -116,6 +117,9 @@ PLAYER_DRAWS = (
 
 
 def rewrite_graphics(text):
+    text = text.replace(
+        "    RECOMP_ENTER(0x00440850u);\n    gex_graphics_transition_begin();",
+        "    RECOMP_ENTER(0x00440850u);")
     for address in PLAYER_DRAWS:
         text = re.sub(
             rf"RECOMP_CALL\((?:sub_00441150|gex_graphics_draw_player_sprite)\);"

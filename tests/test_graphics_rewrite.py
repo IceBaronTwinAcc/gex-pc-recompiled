@@ -63,6 +63,30 @@ class GraphicsRewriteTests(unittest.TestCase):
             self.assertIn(ordered, result)
             self.assertIn(ordered, generated)
 
+    def test_death_transition_layout_begins_at_animation(self):
+        source = (
+            "void sub_00440850(void) {\n"
+            "    RECOMP_ENTER(0x00440850u);\n"
+            "    gex_graphics_transition_begin();\n"
+            "    RECOMP_CALL(sub_0040AA60);\n"
+            "    RECOMP_CALL(sub_0040A990);\n"
+            "    RECOMP_CALL(sub_0041ECD0);\n"
+            "    RECOMP_CALL(sub_00440930); /* 0x004408D6: call 0x440930 */\n"
+            "    RECOMP_CALL(sub_00440A30);\n"
+            "}\n"
+        )
+        result = rewrite_graphics(source)
+        hook = ("    gex_graphics_transition_begin();\n"
+                "    RECOMP_CALL(sub_00440930); /* 0x004408D6: call 0x440930 */")
+        self.assertIn(hook, result)
+        self.assertNotIn(
+            "RECOMP_ENTER(0x00440850u);\n    gex_graphics_transition_begin();",
+            result)
+        self.assertEqual(result.count("gex_graphics_transition_begin();"), 1)
+        self.assertLess(result.index("RECOMP_CALL(sub_0040A990)"),
+                        result.index("gex_graphics_transition_begin();"))
+        self.assertEqual(result, rewrite_graphics(result))
+
     def test_hud_draws_are_scoped_and_idempotent(self):
         self.assertEqual({address for address, anchor in HUD_DRAWS.items() if anchor == 2},
                          {0x41B929, 0x41B996})

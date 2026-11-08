@@ -58,6 +58,9 @@ def main():
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(args.url, wait_until="load")
+                page.wait_for_function("() => !document.querySelector('#remember-game').disabled",
+                                       timeout=45000)
+                page.locator("#remember-game").uncheck()
                 page.locator("#game-folder").set_input_files(str(game_dir))
                 page.wait_for_function(
                     """expected => {

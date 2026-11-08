@@ -27,11 +27,13 @@
 </head>
 <body>
   <h1>Gex Recompiled</h1>
-  <p>Select the folder containing your authorized Gex PC installation. The files are read locally by this page and are not uploaded to a server. They are kept in browser memory for this session; reload requires selecting the folder again.</p>
+  <p>Select the folder containing your authorized Gex PC installation. The files stay on this device and are not uploaded to a server. A browser-storage copy can be reused on later visits.</p>
   <p class="warning">This experimental build requires a modern desktop browser. AVI movies are skipped; settings are session-only.</p>
   <div>
     <button id="choose-folder" type="button" disabled>Choose game folder</button>
     <input id="game-folder" type="file" webkitdirectory directory multiple hidden>
+    <label><input id="remember-game" type="checkbox" checked disabled> Remember game files on this device</label>
+    <button id="forget-game" type="button" disabled>Remove saved game files</button>
     <button id="fullscreen" type="button">Fullscreen</button>
   </div>
   <div id="status" role="status" aria-live="polite">Choose your game folder to start.</div>
@@ -78,11 +80,16 @@
     document.getElementById("game-folder").addEventListener("change", function (event) {
       var files = event.target.files;
       if (!files || !files.length) return;
+      files = Array.from(files);
+      event.target.value = "";
       var importFiles = function () {
         if (Module.gexImportGameFiles) Module.gexImportGameFiles(files);
         else window.setTimeout(importFiles, 100);
       };
       importFiles();
+    });
+    document.getElementById("forget-game").addEventListener("click", function () {
+      if (Module.gexForgetSavedGame) Module.gexForgetSavedGame();
     });
     document.getElementById("fullscreen").addEventListener("click", function () {
       var canvas = document.getElementById("canvas");
@@ -99,12 +106,6 @@
       function startRuntime() {
         window.gexSetStatus("Starting the WebAssembly runtime.");
         var script = document.getElementById("runtime-script").content.firstElementChild.cloneNode(true);
-        script.onload = function () {
-          if (!window.gexRuntimeStopped) {
-            document.getElementById("choose-folder").disabled = false;
-            window.gexSetStatus("Choose your game folder to start.");
-          }
-        };
         script.onerror = function () {
           window.gexSetStatus("Could not load the WebAssembly runtime script.", true);
         };

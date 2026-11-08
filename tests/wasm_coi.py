@@ -47,6 +47,9 @@ def wait_ready(page):
 
 
 def run_game(page, game_dir, expected):
+    page.locator("#remember-game").wait_for(state="visible")
+    page.wait_for_function("() => !document.querySelector('#remember-game').disabled", timeout=45000)
+    page.locator("#remember-game").uncheck()
     page.locator("#game-folder").set_input_files(str(game_dir))
     page.wait_for_function(
         """expected => {

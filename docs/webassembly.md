@@ -44,10 +44,21 @@ optional WebGPU check uses Chromium's test-only SwiftShader flags.
 The page asks for one game directory using the browser's directory picker.
 Files are read in the page and copied to the Wasm virtual filesystem at `/Gex`;
 the selection must contain `GEX.exe` at its root and be no larger than 1 GiB.
-The files are not uploaded or embedded in the build output. Import is
-session-only and consumes WebAssembly memory; reload the page and select the
-folder again to restart. Select the folder containing the game files, not a
-parent containing unrelated directories.
+The files are not uploaded or embedded in the build output. By default, the
+page also saves a copy in IndexedDB on this device and restores it on later
+visits to the same site and directory. Select the folder containing the game
+files, not a parent containing unrelated directories. Uncheck **Remember game
+files on this device** for a session-only import. **Remove saved game files**
+removes the browser copy without changing the original installation; reload
+to select a different folder.
+
+The browser copy uses disk space, is subject to storage quotas and may be
+removed when browser data is cleared or storage is evicted. If saving fails,
+the page reports the error and offers a session-only import. The runtime still
+loads the files into WebAssembly memory on every visit; browser/device memory
+limits can prevent startup. Saved game files do not persist settings or saves.
+With Playwright installed, `python tests/wasm_storage.py` exercises import,
+browser restart, removal, session-only use and storage failures.
 
 ## Initial port scope and limitations
 

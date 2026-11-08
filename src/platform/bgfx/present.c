@@ -7,6 +7,7 @@
 void hle_screen_device_window(void *window);
 static SDL_Window *window;
 static int video;
+static int window_width, window_height;
 
 static int open_renderer(int headless, char *error, size_t size) {
     if (hle_screen_open("Gex - bgfx", 0, 1)) {
@@ -32,6 +33,7 @@ static int open_renderer(int headless, char *error, size_t size) {
             snprintf(error, size, "bgfx window creation: %s", SDL_GetError());
             return -1;
         }
+        SDL_GetWindowSizeInPixels(window, &window_width, &window_height);
         hle_screen_device_window(window);
     }
     return gex_bgfx_open(window, error, size);
@@ -46,7 +48,13 @@ static int configure(const gex_render_frame *frame, char *error, size_t size) {
 
 static int present(const gex_render_frame *frame, char *error, size_t size) {
     int width = frame->width, height = frame->height;
-    if (window) SDL_GetWindowSizeInPixels(window, &width, &height);
+    if (window) {
+#ifdef __EMSCRIPTEN__
+        width = window_width; height = window_height;
+#else
+        SDL_GetWindowSizeInPixels(window, &width, &height);
+#endif
+    }
     return gex_bgfx_present(frame, width, height, error, size);
 }
 
@@ -57,13 +65,20 @@ static int pump(char *error, size_t size) {
 }
 
 static void shutdown_renderer(void) {
+#ifndef __EMSCRIPTEN__
     gex_packet_gpu_shutdown_bgfx();
+#endif
     hle_gdi_window_surface(NULL, 0, 0, 0, 0);
     hle_screen_close();
     SDL_DestroyWindow(window);
     window = NULL;
     if (video) SDL_QuitSubSystem(SDL_INIT_VIDEO);
     video = 0;
+#ifdef __EMSCRIPTEN__
+    /* SDL can queue canvas resizes during shutdown; its owning worker must
+     * remain alive until the window and video subsystem have been destroyed. */
+    gex_packet_gpu_shutdown_bgfx();
+#endif
 }
 
 const gex_renderer_backend *gex_bgfx_renderer(void) {

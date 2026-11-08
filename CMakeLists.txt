@@ -44,7 +44,7 @@ if(NOT EXISTS "${GEX_PLATFORM_FILE}")
     message(FATAL_ERROR "Platform manifest does not exist: ${GEX_PLATFORM_FILE}")
 endif()
 include("${GEX_PLATFORM_FILE}")
-if(GEX_PLATFORM_DESKTOP_TESTS)
+if(GEX_PLATFORM_SDL)
     set(GEX_APP_ICON_HEADER "${CMAKE_CURRENT_BINARY_DIR}/app_icon_data.h")
     add_custom_command(OUTPUT "${GEX_APP_ICON_HEADER}"
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/app_icon.py"
@@ -53,7 +53,7 @@ if(GEX_PLATFORM_DESKTOP_TESTS)
     add_library(gex_app_icon STATIC src/platform/desktop/app_icon.c "${GEX_APP_ICON_HEADER}")
     target_include_directories(gex_app_icon PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(gex_app_icon PRIVATE ${GEX_PLATFORM_LIBRARIES})
-    if(BUILD_TESTING)
+    if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
         add_executable(gex_app_icon_test tests/app_icon.c "${GEX_APP_ICON_HEADER}")
         target_include_directories(gex_app_icon_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
         target_link_libraries(gex_app_icon_test PRIVATE gex_app_icon ${GEX_PLATFORM_LIBRARIES})
@@ -79,8 +79,8 @@ endif()
 if(GEX_ENABLE_GLDC_RENDERER AND NOT (GEX_PVR_AVAILABLE OR GEX_PLATFORM_DESKTOP_TESTS))
     message(FATAL_ERROR "GLdc requires the Dreamcast or SDL desktop platform.")
 endif()
-if(GEX_ENABLE_BGFX_RENDERER AND NOT GEX_PLATFORM_DESKTOP_TESTS)
-    message(FATAL_ERROR "bgfx currently requires the SDL desktop platform.")
+if(GEX_ENABLE_BGFX_RENDERER AND NOT GEX_PLATFORM_SDL)
+    message(FATAL_ERROR "bgfx currently requires an SDL-based platform.")
 endif()
 if(NOT GEX_ENABLE_SOFTWARE_RENDERER AND NOT GEX_ENABLE_OPENGL_RENDERER AND NOT GEX_ENABLE_PVR_RENDERER AND NOT GEX_ENABLE_GLDC_RENDERER AND NOT GEX_ENABLE_BGFX_RENDERER)
     message(FATAL_ERROR "At least one packet renderer must be enabled.")
@@ -452,6 +452,22 @@ endif()
 
 target_include_directories(gex_recomp PRIVATE "${PCRECOMP_DIR}/runtime/recomp32")
 target_sources(gex_recomp PRIVATE src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
+if(GEX_PLATFORM_WEB)
+    set_target_properties(gex_recomp PROPERTIES
+        SUFFIX ".html" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/web")
+    set_property(TARGET gex_recomp APPEND PROPERTY LINK_DEPENDS
+        "${PROJECT_SOURCE_DIR}/web/shell.html" "${PROJECT_SOURCE_DIR}/web/gex-pre.js"
+        "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js")
+    add_custom_command(TARGET gex_recomp POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
+            "$<TARGET_FILE_DIR:gex_recomp>/gex-coi-serviceworker.js"
+        VERBATIM)
+endif()
+if(EMSCRIPTEN AND GEX_ENABLE_BGFX_RENDERER)
+    # emdawnwebgpu requires Asyncify for bgfx's TimedWaitAny initialization.
+    target_link_options(gex_recomp PRIVATE -sASYNCIFY=1)
+endif()
 target_link_libraries(gex_recomp PRIVATE gex_game gex_renderer gex_host)
 target_link_libraries(gex_recomp PRIVATE gex_packet_gpu)
 if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_RUNTIME STREQUAL "native32") AND NOT ANDROID)
@@ -550,7 +566,7 @@ if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
                 src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
             target_compile_definitions(gex_options_screens_test PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
             target_link_libraries(gex_options_screens_test PRIVATE
-                gex_game gex_saves gex_renderer_backend gex_movie_decoder)
+                gex_game gex_saves gex_renderer_backend gex_movie_decoder gex_packet_gpu)
             set(GEX_OPTIONS_TEST_BACKENDS "")
             if(GEX_ENABLE_SOFTWARE_RENDERER)
                 list(APPEND GEX_OPTIONS_TEST_BACKENDS software)
@@ -574,7 +590,7 @@ if(GEX_PLATFORM_DESKTOP_TESTS AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
                 src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
             target_compile_definitions(gex_save_handoff_test PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
             target_link_libraries(gex_save_handoff_test PRIVATE
-                gex_game gex_saves gex_renderer_backend gex_movie_decoder)
+                gex_game gex_saves gex_renderer_backend gex_movie_decoder gex_packet_gpu)
             add_test(NAME save-handoff COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/save_handoff.py"
                 "$<TARGET_FILE:gex_save_handoff_test>" "$<TARGET_FILE:gex_password_saves_test>"

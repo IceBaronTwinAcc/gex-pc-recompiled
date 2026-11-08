@@ -153,16 +153,22 @@ cannot present them or consume pending presentation state.
 
 ## Platform boundaries
 
+For a step-by-step porting and maintenance workflow, see
+[porting and maintaining platform backends](response.md).
+
 The guest's Windows API names and calling conventions remain compatibility
 contracts, not dependencies on a Windows host. Do not remove those contracts
 or rewrite generated game code to port the game.
 
 Shared project sources under `src/` use C11, the guest compatibility contracts,
-and the interfaces below. Linux/POSIX primitives live under `src/platform/linux/`,
-Windows primitives under `src/platform/windows/`, and shared SDL/FFmpeg services
-under `src/platform/desktop/`. `src/platform/hle/` holds shared guest-memory
-adapters. The Linux directory also retains the validated macOS POSIX branches;
-macOS uses these shared implementations rather than a separate backend.
+and the interfaces below. SDL desktop services, presentation and import logic
+live in `src/platform/desktop/`; Linux host runtime, filesystem, virtual memory
+and OpenAL audio live in `src/platform/linux/`. Windows, Android and Dreamcast
+implementations remain in their corresponding target directories. Some shared
+desktop/Linux files contain target-specific branches for macOS, Android and
+WebAssembly, selected by the platform manifest and compiler definitions.
+Graphics API integrations have their own backend directories, and
+`src/platform/hle/` holds guest-memory adapters.
 Executable identity checking uses portable streaming SHA-256, with no crypto
 library or movie-decoder dependency.
 
@@ -249,11 +255,11 @@ No wildcard adds new upstream HLE implementations to a backend.
 
 **Remaining target porting work:** implement the backend interfaces and a manifest
 for the target; no guest compatibility source-group rewrite is required for host
-operations. Linux, macOS ARM64, macOS x86-64 through Rosetta and the MinGW executable under Wine have been exercised. The desktop sources
-are not a WebAssembly backend; no browser backend is supplied. The Dreamcast
-manifest reuses the same guest compatibility sources with a different memory
-backend and compact stack/table limits. Desktop defaults remain a 4 GiB virtual
-reservation and a 4 MiB guest stack per thread.
+operations. Linux, macOS ARM64, macOS x86-64 through Rosetta and the MinGW executable under Wine have been exercised. The experimental WebAssembly target reuses SDL
+software presentation and HLE guest services; its browser startup and gameplay
+still need validation. The Dreamcast manifest reuses the same guest compatibility
+sources with a different memory backend and compact stack/table limits. Desktop
+defaults remain a 4 GiB virtual reservation and a 4 MiB guest stack per thread.
 The native32 backend deliberately retains its own Windows launcher and real
 Windows guest imports; it currently supplies only allocation from `host.h`,
 not the complete desktop launcher-service interface.
@@ -920,9 +926,9 @@ platform calls on their owning thread, and copy pixels if retaining them
 asynchronously. Failed configuration must leave the previous target usable.
 Observers and screenshots read the core framebuffer independently of a backend.
 
-The default desktop backend is `src/platform/desktop/renderer.c`. It uses the existing
-SDL scaling/input presenter through its framebuffer transport; this transport
-also serves legacy GDI window drawing, but has no DirectDraw calls. The
+The default SDL backend is `src/platform/desktop/renderer.c`. It uses the
+existing SDL scaling/input presenter; this presenter also serves legacy GDI
+window drawing, but has no DirectDraw calls. The
 memory-only backend, `src/renderer_headless.c`, needs no graphics API. For
 example:
 
@@ -1010,6 +1016,9 @@ write failures are reported and returned to the guest. The Windows native32
 host continues to use the real Windows registry.
 
 ### Three-deck password saves
+
+For the menu structure, code ownership and coordinated edit recipes, see
+[in-game menus](in-game-menus.md).
 
 The title dispatcher can open the modal menu from the guest worker rather than
 the SDL owner thread. Its wait releases the guest-machine lock through
@@ -1162,7 +1171,9 @@ existing atomic `settings.reg` store. Existing retail audio switches and keyboar
 bindings are migrated on first use; the retail guest keeps canonical action keys,
 while the host applies the independent physical bindings. Exit/back from
 categories flushes pending settings. A failed flush leaves the menu open with
-an error and allows retry.
+an error and allows retry. If a saved renderer is not compiled into the current
+build, Options selects the first available renderer and resets its API to Auto,
+preserving the other saved settings.
 
 The `password-decks` test uses the real lifted encoder, writes a checkpoint,
 restarts in a separate process, and restores through the retail initializer.
@@ -1178,9 +1189,10 @@ Options cases check category navigation, slider limits, music-track restoration,
 independent keyboard/gamepad capture, conflicts, canonical retail input,
 separate-process reload, persistence failure/retry and submenu Exit.
 `options-screens` enters Options through the real title callback on software and
-bgfx, captures every category, exercises a dragged slider, and returns through
-the title fades. Input tests cover remapping, Pause versus Jump, context changes,
-and releasing the key that opened binding capture.
+bgfx, captures every category, exercises a dragged slider, returns through
+the title fades, and checks fallback when a saved renderer is absent from the
+build. Input tests cover remapping, Pause versus Jump, context changes, and
+releasing the key that opened binding capture.
 
 The legacy MSVC native32 host and Dreamcast retain their original menu/password
 flow. The new hooks are compile-gated out on both; Dreamcast currently has no
@@ -1188,6 +1200,10 @@ VMU persistence. Its future backend can reuse the three-slot password format
 without coupling VMU storage to SDL or cabinet rendering.
 
 ## Other targets
+
+The experimental browser build uses Emscripten and the software renderer.
+See [WebAssembly build](webassembly.md) for toolchain setup, the isolated
+development server, user-supplied game-data loading and current limitations.
 
 ### Android
 

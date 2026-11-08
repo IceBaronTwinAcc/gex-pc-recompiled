@@ -23,15 +23,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef __EMSCRIPTEN__
+#include <stdatomic.h>
+#include <emscripten.h>
+#include <emscripten/threading.h>
+#endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include "win32hle.h"
 #include "platform/desktop/app_icon.h"
 #include "platform/video.h"
 #include "preferences.h"
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
 
 #define WM_MOUSEMOVE   0x0200u
 #define WM_LBUTTONDOWN 0x0201u
@@ -289,18 +291,6 @@ static void to_game(int x, int y, int *gx, int *gy) {
     if (*gy >= h) *gy = h - 1;
 }
 
-#ifdef __EMSCRIPTEN__
-static void web_present(const uint16_t *fb, int w, int h, int dx, int dy, int dw, int dh, int mode, int cw, int ch) {
-    MAIN_THREAD_ASYNC_EM_ASM({ if (Module['ra2Present']) Module['ra2Present']($0, $1, $2, $3, $4, $5, $6, $7, $8, $9); },
-                             fb, w, h, dx, dy, dw, dh, mode, cw, ch);
-}
-static void web_menu(int open) {
-    static int was = -1;
-    if (open == was) return;
-    was = open;
-    MAIN_THREAD_ASYNC_EM_ASM({ if (Module['ra2Menu']) Module['ra2Menu']($0); }, open);
-}
-#endif
 static void present(void) {
     if ((g_win || g_ren) && !pthread_equal(pthread_self(), g_video_thread)) return;
     const uint8_t *px;
@@ -321,47 +311,6 @@ static void present(void) {
     g_shown_seq = seq, g_last_present = now;
     if (hle_screen_frame_hook) hle_screen_frame_hook(px, w, h, pitch, bpp);
     if (!g_ren) return;
-#ifdef __EMSCRIPTEN__
-    /* The page draws the frame with WebGL on its own thread (index.html's
-     * ra2Present): SDL's software renderer scaled it on this thread and
-     * handed the whole window's pixels over, which took longer than the
-     * game's frame, so the game never went idle. The frame goes as RGB565
-     * in one of two buffers (the page reads it later); the place in the
-     * window is this thread's, so the mouse maps the same way. SDL still
-     * draws the host's menu (F10), over which the page's canvas hides. */
-    if (bpp == 16) {
-        int ww, wh;
-        SDL_GetRendererOutputSize(g_ren, &ww, &wh);
-        if ((long long)ww * h > (long long)wh * w) g_dst.h = wh, g_dst.w = (int)((long long)wh * w / h);
-        else g_dst.w = ww, g_dst.h = (int)((long long)ww * h / w);
-        if (g_mode == 4) {
-            int k = ww / w < wh / h ? ww / w : wh / h;
-            if (k < 1) k = 1;
-            g_dst.w = w * k, g_dst.h = h * k;
-        }
-        g_dst.x = (ww - g_dst.w) / 2, g_dst.y = (wh - g_dst.h) / 2;
-        if (g_menu_depth) {                              /* SDL's picture and menu: the page's canvas steps aside */
-            web_menu(1);
-        } else {
-            static uint16_t *fb[2];
-            static size_t fbn;
-            static int which;
-            if (fbn < (size_t)w * h) {
-                free(fb[0]); free(fb[1]);
-                fbn = (size_t)w * h;
-                fb[0] = (uint16_t *)malloc(fbn * 2), fb[1] = (uint16_t *)malloc(fbn * 2);
-            }
-            which ^= 1;
-            uint16_t *dst = fb[which];
-            if (dst) {
-                for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, px + (size_t)y * pitch, (size_t)w * 2);
-                web_menu(0);
-                web_present(dst, w, h, g_dst.x, g_dst.y, g_dst.w, g_dst.h, g_mode, ww, wh);
-            }
-            return;
-        }
-    }
-#endif
     int hd = 0, ov = 0, ovx = 0, ovy = 0, ovw = 0, ovh = 0;
     if (bpp == 16 && hle_screen_overlay_hook) {        /* 1x base scaled on the GPU + an Nx overlay */
         if (g_ov_n < (size_t)w * h * 9) {              /* sized for the largest scale (3x) */
@@ -474,6 +423,16 @@ static void present(void) {
     }
     if (g_menu_depth) menu_draw();
     SDL_RenderPresent(g_ren);
+#ifdef __EMSCRIPTEN__
+    static int web_presented;
+    if (!web_presented) {
+        web_presented = 1;
+        MAIN_THREAD_ASYNC_EM_ASM({
+            if (document.getElementById("status").textContent === "Game files loaded. Starting Gex...")
+                window.gexSetStatus("Gex is running.");
+        });
+    }
+#endif
 }
 
 /* Who shows the cursor. A DirectDraw game draws its own into the picture, so
@@ -707,12 +666,11 @@ int hle_screen_desktop(int *w, int *h) {
     return 1;
 }
 #ifdef __EMSCRIPTEN__
-/* In a browser the page draws the menu (index.html's ra2PopupMenu), as HTML
- * at the mouse: SDL's own, drawn with its software renderer, took longer
- * than a frame to show, and the game then never went idle to read a key.
+/* The browser displays the menu as HTML so the game thread can continue
+ * pumping SDL while the user makes a selection.
  * The items go over as JSON; the page writes the choice (0: none yet, -1:
  * closed) into g_web_choice, and the pump calls chosen() on this thread. */
-static volatile int g_web_choice;
+static _Atomic int g_web_choice;
 static void (*g_web_chosen)(int id);
 static char g_web_menu_json[16384];
 static size_t json_item(char *out, size_t n, const hle_menu_item_t *it) {
@@ -745,17 +703,23 @@ void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)
     }
     g_web_menu_json[k++] = ']';
     g_web_menu_json[k] = 0;
-    g_web_choice = 0, g_web_chosen = chosen;
-    MAIN_THREAD_ASYNC_EM_ASM({ if (Module['ra2PopupMenu']) Module['ra2PopupMenu'](UTF8ToString($0), $1); else HEAP32[$1 >> 2] = -1; },
-                             g_web_menu_json, &g_web_choice);
+    atomic_store(&g_web_choice, 0);
+    g_web_chosen = chosen;
+    MAIN_THREAD_ASYNC_EM_ASM({
+        if (Module['gexPopupMenu'])
+            Module['gexPopupMenu'](UTF8ToString($0), $1);
+        else
+            Atomics.store(HEAP32, $1 >> 2, -1);
+    }, g_web_menu_json, &g_web_choice);
 }
 int hle_screen_menu_open(void) { return g_web_chosen != NULL; }
 static void web_menu_poll(void) {
-    if (!g_web_chosen || !g_web_choice) return;
-    int id = g_web_choice;
+    int choice = atomic_load(&g_web_choice);
+    if (!g_web_chosen || !choice) return;
     void (*cb)(int) = g_web_chosen;
-    g_web_choice = 0, g_web_chosen = NULL;
-    if (id > 0) cb(id);
+    atomic_store(&g_web_choice, 0);
+    g_web_chosen = NULL;
+    if (choice > 0) cb(choice);
 }
 #endif
 #ifndef __EMSCRIPTEN__
@@ -785,9 +749,6 @@ void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)
 }
 #endif
 
-#ifdef __EMSCRIPTEN__
-#include <emscripten/threading.h>
-#endif
 int g_input_trace;                                         /* a host's --inputtrace */
 void hle_screen_pump(void) {
     if (g_win && !pthread_equal(pthread_self(), g_video_thread)) return;

@@ -55,7 +55,7 @@ int gex_raster_enable_gpu(gex_raster *r, const gex_packet_gpu *gpu) {
     char error[512] = {0};
     if (!gpu || r->gpu) return -1;
     if (gpu->native && (!gpu->native->clear || !gpu->native->copy || !gpu->native->blit ||
-        !gpu->native->present || !gpu->native->bind || !gpu->native->polygon || !gpu->native->movie)) {
+        !gpu->native->present || !gpu->native->bind || !gpu->native->movie)) {
         fprintf(stderr, "[packet-gpu] incomplete GPU-owned target operations\n");
         return -1;
     }
@@ -154,12 +154,30 @@ void gex_raster_fill(gex_raster *r, int x, int y, int width, int height, unsigne
         r->cpu_newer = r->guest_newer = 1;
         return;
     }
-    gex_gpu_vertex v[] = {{x, y, 0, 0}, {x + width, y, 0, 0},
-                         {x, y + height, 0, 0}, {x + width, y + height, 0, 0}};
     gex_gpu_material m = {.opcode = 0x60, .rgb = rgb};
     char error[512] = {0};
-    if (r->gpu->native->polygon(r->device, v, 0, 0, r->width, r->height,
-                                &m, error, sizeof error)) gpu_fail(error);
+    if (r->gpu->native->polygon) {
+        gex_gpu_vertex v[] = {{x, y, 0, 0}, {x + width, y, 0, 0},
+                             {x, y + height, 0, 0}, {x + width, y + height, 0, 0}};
+        if (r->gpu->native->polygon(r->device, v, 0, 0, r->width, r->height,
+                                    &m, error, sizeof error)) gpu_fail(error);
+    } else {
+        int left = maximum(0, x), top = maximum(0, y);
+        int right = minimum(r->width, x + width), bottom = minimum(r->height, y + height);
+        if (left >= right || top >= bottom) return;
+        size_t count = (size_t)(bottom - top);
+        gex_gpu_span *spans = malloc(count * sizeof *spans);
+        if (!spans) gpu_fail("cannot allocate GPU fill coverage");
+        for (size_t i = 0; i < count; ++i)
+            spans[i] = (gex_gpu_span){.x = left, .y = top + (int)i,
+                                      .count = right - left, .scale = 1};
+        if (r->gpu->draw(r->device, spans, count, &m, error, sizeof error)) {
+            free(spans);
+            gpu_fail(error);
+        }
+        free(spans);
+        r->gpu_newer = r->guest_newer = 1;
+    }
 }
 
 void gex_raster_movie(gex_raster *r, const uint8_t *pixels, int width, int height, int pitch) {
@@ -568,7 +586,7 @@ static void raster_packet_decode(gex_raster *r, const uint8_t *p, const gex_rast
     }
     int x0 = maximum(0, left + offset_x), x1 = minimum(width, right + offset_x);
     int y0 = maximum(0, top - 8 + offset_y), y1 = minimum(height, bottom - 8 + offset_y);
-    if (gex_raster_gpu_owned(r)) {
+    if (gex_raster_gpu_owned(r) && r->gpu->native->polygon) {
         int scale = s->pixel_scale ? s->pixel_scale : 1;
         int ox = s->pixel_scale ? s->offset_x : r->fitted.width ? r->fitted.x : 0;
         int oy = r->fitted.width ? r->fitted.y : 0;

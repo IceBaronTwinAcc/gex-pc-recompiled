@@ -49,11 +49,10 @@ if [[ ! -f "$prefix/lib/pkgconfig/libavcodec.pc" ]]; then
 fi
 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
 export PKG_CONFIG_PATH=
-cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+tools/build-bgfx.sh "$build" \
     -DCMAKE_TOOLCHAIN_FILE="$root/cmake/toolchains/mingw64.cmake" \
     -DCMAKE_FIND_ROOT_PATH="$prefix" -DCMAKE_PREFIX_PATH="$prefix" \
     -DPython3_EXECUTABLE="$root/.venv/bin/python"
-cmake --build "$build" --parallel "$jobs"
 cp "$prefix"/bin/*.dll "$build/"
 pthread_dll="$(x86_64-w64-mingw32-gcc -print-file-name=libwinpthread-1.dll)"
 if [[ ! -f "$pthread_dll" ]]; then

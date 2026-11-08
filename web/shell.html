@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Gex Recompiled</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #10131a; color: #eef2f8; }
+    body { margin: 0 auto; max-width: 1100px; padding: 1.25rem; }
+    button, input { font: inherit; }
+    button { border: 1px solid #6f8db4; border-radius: .35rem; padding: .65rem 1rem; color: inherit; background: #263a55; cursor: pointer; }
+    button:hover, button:focus-visible { background: #385b83; outline: 2px solid #91c5ff; }
+    #status { min-height: 2.5rem; margin: .75rem 0; white-space: pre-wrap; }
+    #game { position: relative; background: #000; }
+    #canvas { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; outline: none; }
+    #menu-backdrop { position: absolute; inset: 0; display: none; place-items: center; padding: 1rem; background: #0009; }
+    #menu-backdrop[aria-hidden="false"] { display: grid; }
+    #menu-panel { width: min(28rem, 100%); max-height: 90%; overflow: auto; padding: 1rem; border: 1px solid #71839b; border-radius: .5rem; background: #171d27; box-shadow: 0 1rem 3rem #000a; }
+    #menu-items { display: grid; gap: .4rem; }
+    #menu-items button { display: flex; justify-content: space-between; gap: 1rem; text-align: left; }
+    #menu-items small { color: #b7c3d2; }
+    #log { margin-top: 1rem; }
+    #output { max-height: 14rem; overflow: auto; white-space: pre-wrap; color: #c3ceda; font: .8rem ui-monospace, monospace; }
+    .warning { color: #ffd27b; }
+  </style>
+</head>
+<body>
+  <h1>Gex Recompiled</h1>
+  <p>Select the folder containing your authorized Gex PC installation. The files are read locally by this page and are not uploaded to a server. They are kept in browser memory for this session; reload requires selecting the folder again.</p>
+  <p class="warning">This experimental build requires a modern desktop browser. AVI movies are skipped; settings are session-only.</p>
+  <div>
+    <button id="choose-folder" type="button" disabled>Choose game folder</button>
+    <input id="game-folder" type="file" webkitdirectory directory multiple hidden>
+    <button id="fullscreen" type="button">Fullscreen</button>
+  </div>
+  <div id="status" role="status" aria-live="polite">Choose your game folder to start.</div>
+  <div id="game">
+    <canvas id="canvas" tabindex="0" aria-label="Gex game display"></canvas>
+    <div id="menu-backdrop" aria-hidden="true">
+      <section id="menu-panel" role="dialog" aria-modal="true" aria-label="Game menu">
+        <button id="menu-back" type="button" hidden>Back</button>
+        <div id="menu-items"></div>
+        <button id="menu-close" type="button">Close</button>
+      </section>
+    </div>
+  </div>
+  <details id="log">
+    <summary>Runtime log</summary>
+    <pre id="output"></pre>
+  </details>
+  <script>
+    var Module = {
+      canvas: document.getElementById("canvas"),
+      arguments: ["--data", "/Gex"],
+      print: function (text) { window.gexLog(text); },
+      printErr: function (text) { window.gexLog(text); },
+      onAbort: function (reason) {
+        window.gexRuntimeStopped = true;
+        document.getElementById("choose-folder").disabled = true;
+        window.gexSetStatus(window.gexFatalError || "The WebAssembly runtime stopped: " + reason, true);
+      }
+    };
+    window.gexSetStatus = function (text, warning) {
+      var status = document.getElementById("status");
+      status.textContent = text;
+      status.className = warning ? "warning" : "";
+    };
+    window.gexLog = function (text) {
+      var output = document.getElementById("output");
+      output.textContent += text + "\n";
+      output.scrollTop = output.scrollHeight;
+      if (text.startsWith("[win32hle] FATAL: ")) window.gexFatalError = text;
+    };
+    document.getElementById("choose-folder").addEventListener("click", function () {
+      document.getElementById("game-folder").click();
+    });
+    document.getElementById("game-folder").addEventListener("change", function (event) {
+      var files = event.target.files;
+      if (!files || !files.length) return;
+      var importFiles = function () {
+        if (Module.gexImportGameFiles) Module.gexImportGameFiles(files);
+        else window.setTimeout(importFiles, 100);
+      };
+      importFiles();
+    });
+    document.getElementById("fullscreen").addEventListener("click", function () {
+      var canvas = document.getElementById("canvas");
+      if (canvas.requestFullscreen) canvas.requestFullscreen();
+      canvas.focus();
+    });
+    document.getElementById("menu-close").addEventListener("click", function () {
+      if (Module.gexChooseMenu) Module.gexChooseMenu(-1);
+    });
+  </script>
+  <template id="runtime-script">{{{ SCRIPT }}}</template>
+  <script>
+    (async function () {
+      function startRuntime() {
+        window.gexSetStatus("Starting the WebAssembly runtime.");
+        var script = document.getElementById("runtime-script").content.firstElementChild.cloneNode(true);
+        script.onload = function () {
+          if (!window.gexRuntimeStopped) {
+            document.getElementById("choose-folder").disabled = false;
+            window.gexSetStatus("Choose your game folder to start.");
+          }
+        };
+        script.onerror = function () {
+          window.gexSetStatus("Could not load the WebAssembly runtime script.", true);
+        };
+        document.body.appendChild(script);
+      }
+      if (window.crossOriginIsolated) {
+        startRuntime();
+        return;
+      }
+      if (!window.isSecureContext || !("serviceWorker" in navigator)) {
+        window.gexSetStatus("Cross-origin isolation requires HTTPS or localhost and service worker support.", true);
+        return;
+      }
+      if (navigator.serviceWorker.controller) {
+        window.gexSetStatus("The service worker could not enable cross-origin isolation. Check browser settings or hosting headers.", true);
+        return;
+      }
+      window.gexSetStatus("Preparing browser isolation; the page will reload.");
+      try {
+        var controlled = new Promise(function (resolve) {
+          navigator.serviceWorker.addEventListener("controllerchange", resolve, {once: true});
+        });
+        await navigator.serviceWorker.register("gex-coi-serviceworker.js");
+        if (!navigator.serviceWorker.controller) {
+          await Promise.race([
+            controlled,
+            new Promise(function (_, reject) {
+              window.setTimeout(function () { reject(new Error("service worker activation timed out")); }, 10000);
+            })
+          ]);
+        }
+        window.location.reload();
+      } catch (error) {
+        window.gexSetStatus("Could not enable cross-origin isolation: " + error.message, true);
+      }
+    })();
+  </script>
+</body>
+</html>

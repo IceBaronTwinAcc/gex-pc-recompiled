@@ -233,6 +233,14 @@ static void options_input_test(void) {
 static void options_test(const char *mode, const char *settings) {
     CHECK(!hle_reg_load(settings));
     CHECK(!gex_options_load());
+    if (!strcmp(mode, "options-incompatible-read")) {
+        int fallback = 0;
+        while (fallback < 5 && !gex_renderer_available(fallback)) ++fallback;
+        CHECK(!gex_renderer_available(2));
+        CHECK(fallback < 5 && gex_prefs.renderer == fallback);
+        CHECK(gex_prefs.api == GEX_API_AUTO);
+        return;
+    }
     if (!strcmp(mode, "options-read")) {
         int next = 0;
         for (int i = 1; i < 5; ++i)

@@ -1,6 +1,7 @@
 #include <kos.h>
 #include <arch/mmu.h>
 #include <dc/pvr.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -754,6 +755,69 @@ static void fragmented_alpha_regression(const gex_packet_gpu *gpu, int remap) {
     gpu->destroy(copy); gpu->destroy(t);
 }
 
+static void fragmented_feedback_regression(const gex_packet_gpu *gpu) {
+    const gex_gpu_native_ops *native = gpu->native;
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR fragmented feedback target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    native->bind(t, atlas, 0);
+    native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    EXPECT(!native->clear(t, error, sizeof error));
+    const unsigned pages[] = {8, 9, 10, 15};
+    gex_gpu_material material = {256, 0, 0x64, 0x808080, atlas, table};
+    for (unsigned i = 0; i < 4; ++i) {
+        unsigned at = pages[i] * 128 + 240 * 2048;
+        put(at, 0x801f);
+        put(at + 2, 0x3e0);
+        material.page = 256 | pages[i];
+        float x = 10 + i * 5;
+        gex_gpu_vertex cell[] = {{x, 50, 0, 240}, {x + 3, 50, 3, 240},
+                                 {x, 51, 0, 241}, {x + 3, 51, 3, 241}};
+        EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material,
+                               error, sizeof error));
+    }
+
+    struct { pvr_ptr_t hole, guard; } blocks[512] = {{0}};
+    const size_t hole_bytes = 96 * 1024;
+    unsigned count = 0;
+    while (count < 512 && pvr_mem_available() > hole_bytes + 128) {
+        blocks[count].hole = pvr_mem_malloc(hole_bytes);
+        blocks[count].guard = pvr_mem_malloc(32);
+        if (!blocks[count].hole || !blocks[count].guard) {
+            EXPECT(0);
+            if (blocks[count].hole) pvr_mem_free(blocks[count].hole);
+            if (blocks[count].guard) pvr_mem_free(blocks[count].guard);
+            break;
+        }
+        ++count;
+    }
+    for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].hole);
+    size_t available = pvr_mem_available();
+    EXPECT(count > 2 && available > 256 * 1024);
+
+    material.page = 256;
+    material.opcode = 0x2c;
+    gex_gpu_vertex feedback_quad[] = {{200, 10, 0, 180}, {204, 10, 4, 180},
+                                      {200, 14, 0, 184}, {204, 14, 4, 184}};
+    int result = native->polygon(t, feedback_quad, 0, 0, 320, 240,
+                                &material, error, sizeof error);
+    EXPECT(!result);
+    if (result)
+        printf("PVR fragmented feedback free=%lu: %s\n",
+               (unsigned long)available, error);
+    else
+        printf("PVR fragmented feedback snapshot: PASS (free=%lu)\n",
+               (unsigned long)available);
+
+    for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].guard);
+    gpu->destroy(t);
+}
+
 static void presentation_pacing_regression(const gex_packet_gpu *gpu) {
     const gex_gpu_native_ops *native = gpu->native;
     char error[256] = {0};
@@ -909,6 +973,28 @@ static void texture_refresh_regression(const gex_packet_gpu *gpu) {
     gpu->destroy(copy); gpu->destroy(t);
 }
 
+static int fragmented_feedback_requested(void) {
+    FILE *config = fopen("/cd/gex-test.cfg", "r");
+    if (!config) {
+        if (errno == ENOENT) return 0;
+        fprintf(stderr, "PVR test: cannot read test mode: %s\n", strerror(errno));
+        return -1;
+    }
+    char args[1024];
+    int valid = fgets(args, sizeof args, config) && strchr(args, '\n');
+    if (fclose(config)) valid = 0;
+    if (!valid) {
+        fprintf(stderr, "PVR test: invalid test mode file\n");
+        return -1;
+    }
+    char *save, *token = strtok_r(args, " \r\n\t", &save);
+    while (token) {
+        if (!strcmp(token, "--fragmented-feedback")) return 1;
+        token = strtok_r(NULL, " \r\n\t", &save);
+    }
+    return 0;
+}
+
 int main(void) {
     mmu_init_basic();
     EXPECT(!mmu_page_map_static(0x400000, (uintptr_t)atlas & 0x1fffffff,
@@ -922,6 +1008,19 @@ int main(void) {
     char error[128] = {0};
     unsigned initial_scheduler_hz = thd_get_hz();
     const gex_packet_gpu *gpu = gex_packet_gpu_get();
+    int fragmented_feedback = fragmented_feedback_requested();
+    if (fragmented_feedback < 0) {
+        mmu_shutdown_basic();
+        return 64;
+    }
+    if (fragmented_feedback) {
+        fragmented_feedback_regression(gpu);
+        mmu_shutdown_basic();
+        printf("Dreamcast PVR fragmented feedback regression: %s (%d failures)\n",
+               failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    fragmented_feedback_regression(gpu);
     /* Compatibility regressions explicitly exercise the diagnostic readback
      * contract. Production PVR targets use the native operations below. */
     gex_packet_gpu compatibility = *gpu;

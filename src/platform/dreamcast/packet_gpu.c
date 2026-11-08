@@ -167,6 +167,7 @@ static struct pvr_work {
     unsigned polygons, prepared, reused, headers, same_headers;
     unsigned palette_entries, same_palette_entries, remap_lookups, remap_checks;
     unsigned resolves, preservation, captures, snapshots, writes, refresh_bytes;
+    unsigned allocation_retries;
     unsigned page_builds, remap_builds;
     unsigned page_lookups, page_checks;
     unsigned palette_drains, texture_refreshes;
@@ -226,7 +227,7 @@ static void report_profile(void) {
                 "cpu_max_polygons=%u cpu_max_remaps=%u cpu_max_pages=%u cpu_max_refresh=%u cpu_max_drains=%u "
                 "over_budget=%u polygons=%u prepared=%u reused=%u headers=%u same_headers=%u "
                 "palette=%u same_palette=%u remap_lookups=%u remap_checks=%u resolves=%u preserve=%u "
-                "captures=%u snapshots=%u writes=%u compared=%lu discarded=%lu "
+                "captures=%u snapshots=%u writes=%u alloc_retries=%u compared=%lu discarded=%lu "
                 "page_builds=%u remap_builds=%u page_lookups=%u page_checks=%u refresh=%u "
                 "prepare_cpu=%llu texture_cpu=%llu remap_cpu=%llu flush_cpu=%llu "
                 "flush_us=%llu capture_cpu=%llu capture_us=%llu packet_cpu=%llu polygon_cpu=%llu "
@@ -251,7 +252,8 @@ static void report_profile(void) {
                 w->polygons, w->prepared, w->reused, w->headers,
                 w->same_headers, w->palette_entries, w->same_palette_entries,
                 w->remap_lookups, w->remap_checks, w->resolves, w->preservation,
-                w->captures, w->snapshots, w->writes, (unsigned long)w->compared_bytes,
+                w->captures, w->snapshots, w->writes, w->allocation_retries,
+                (unsigned long)w->compared_bytes,
                 (unsigned long)w->discarded_bytes, w->page_builds, w->remap_builds,
                 w->page_lookups, w->page_checks,
                 w->refresh_bytes, (unsigned long long)w->prepare_cpu,
@@ -1091,19 +1093,25 @@ static int reserve_texture(texture *t, size_t storage, char *error, size_t size)
     return 0;
 }
 
-static pvr_ptr_t allocate_texture(texture *protected, size_t bytes, char *error, size_t size) {
+static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
+                                  const char *purpose, unsigned key,
+                                  unsigned variant, unsigned flags,
+                                  char *error, size_t size) {
     unsigned reclaimed = 0;
     for (;;) {
         pvr_ptr_t memory = pvr_mem_malloc(bytes);
         if (memory) {
             if (reclaimed)
-                fprintf(stderr, "[packet-gpu] recovered %lu-byte VRAM allocation after %u cache evictions\n",
-                        (unsigned long)bytes, reclaimed);
+                fprintf(stderr, "[packet-gpu] recovered %lu-byte VRAM allocation "
+                        "purpose=%s key=%x variant=%x flags=%x after %u cache evictions\n",
+                        (unsigned long)bytes, purpose, key, variant, flags, reclaimed);
             return memory;
         }
+        WORK(allocation_retries, 1);
         if (!reclaimed)
-            fprintf(stderr, "[packet-gpu] reclaiming VRAM after allocation failure: request=%lu cache=%lu free=%lu\n",
-                    (unsigned long)bytes, (unsigned long)cache_bytes,
+            fprintf(stderr, "[packet-gpu] reclaiming VRAM after allocation failure: "
+                    "purpose=%s key=%x variant=%x flags=%x request=%lu cache=%lu free=%lu\n",
+                    purpose, key, variant, flags, (unsigned long)bytes, (unsigned long)cache_bytes,
                     (unsigned long)pvr_mem_available());
         if (evict_texture(protected, bytes, error, size)) {
             pvr_mem_stats();
@@ -1220,11 +1228,14 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
         t->source_bytes = source_bytes;
         t->storage = storage;
         cache_bytes += storage;
-        t->source = allocate_texture(t, source_bytes, error, size);
+        t->source = allocate_texture(t, source_bytes, "page-source", m->page,
+                                     m->rgb, m->opcode, error, size);
         if (t->source)
-            t->image[0] = allocate_texture(t, bytes, error, size);
+            t->image[0] = allocate_texture(t, bytes, "page-image", m->page,
+                                           m->rgb, m->opcode, error, size);
         if (t->image[0] && masked)
-            t->image[1] = allocate_texture(t, bytes, error, size);
+            t->image[1] = allocate_texture(t, bytes, "page-alpha", m->page,
+                                           m->rgb, m->opcode, error, size);
         if (!t->source || !t->image[0] || (masked && !t->image[1])) {
             release_texture(t);
             return NULL;
@@ -1258,8 +1269,11 @@ static texture *texture_region(const gex_gpu_material *m, int raw, int u0, int u
     /* Opaque and alpha draws share one source and opaque image. Create the
      * two alpha passes lazily, without modifying an image in a queued draw. */
     if (reserve_texture(t, t->bytes * 2, error, size)) return NULL;
-    pvr_ptr_t unmasked = allocate_texture(t, t->bytes, error, size);
-    pvr_ptr_t masked = unmasked ? allocate_texture(t, t->bytes, error, size) : NULL;
+    pvr_ptr_t unmasked = allocate_texture(t, t->bytes, "page-alpha", m->page,
+                                          m->rgb, m->opcode, error, size);
+    pvr_ptr_t masked = unmasked ? allocate_texture(t, t->bytes, "page-alpha",
+                                                   m->page, m->rgb, m->opcode,
+                                                   error, size) : NULL;
     if (!unmasked || !masked) {
         if (unmasked) pvr_mem_free(unmasked);
         if (masked) pvr_mem_free(masked);
@@ -1603,7 +1617,8 @@ static remap_texture *remapped_region_impl(const gex_gpu_material *m, int u0, in
         release_remap(oldest);
     }
     if (reserve_texture(NULL, bytes, error, size)) return NULL;
-    victim->image = allocate_texture(NULL, bytes, error, size);
+    victim->image = allocate_texture(NULL, bytes, "remap", m->page,
+                                     m->clut, m->opcode, error, size);
     if (!victim->image) return NULL;
     WORK(remap_builds, 1);
     for (unsigned y = 0; y < dimension; y += 2)
@@ -2020,6 +2035,9 @@ static int native_present(void *data, char *error, size_t size) {
             reports[report_count].max_work = timing.max_work;
             reports[report_count].work = work;
             ++report_count;
+            if (work.allocation_retries || timing.over_budget >= 5)
+                report_profile();
+            report_count = 0;
         } else {
             ++dropped_reports;
         }
@@ -2147,8 +2165,10 @@ static uint32_t polygon_header(const gex_gpu_material *m, draw_texture tx, int b
 static int snapshot_picture(unsigned plane, char *error, size_t size) {
     WORK(snapshots, 1);
     target *t = pictures[plane];
-    if (!feedback[plane]) feedback[plane] = pvr_mem_malloc(TW * TH * 2);
-    if (!feedback[plane]) return fail(error, size, "cannot allocate GPU framebuffer feedback snapshot");
+    if (!feedback[plane])
+        feedback[plane] = allocate_texture(NULL, TW * TH * 2, "feedback",
+                                           plane, 0, 0, error, size);
+    if (!feedback[plane]) return -1;
     if (pvr_wait_ready()) return hardware_fail(error, size, "PVR feedback wait failed");
     uint32_t w = TW, h = TH;
     pvr_poly_cxt_t c;

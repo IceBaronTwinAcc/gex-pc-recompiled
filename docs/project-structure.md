@@ -30,7 +30,7 @@ There are two distinct codebases:
 | `AGENTS.md` | Repository-wide agent instructions. | Read first; protected-document rules apply. |
 | `CMakeLists.txt` | Root targets, options, platform selection, and CTest registrations. | Check target/condition wiring when adding source or tests. |
 | `src/` | Shared launcher, guest integration, menus, graphics, audio-facing logic, and interfaces. | Prefer these sources for game-specific behavior. |
-| `src/platform/` | Platform contracts and concrete host implementations. | Preserve shared interface semantics across implementations. |
+| `src/platform/` | Platform contracts, SDL desktop implementations (`desktop/`), host-specific implementations (`linux/`, `windows/`, `dreamcast/`), and graphics backends (`bgfx/`, `gl/`). | Follow the existing source layout and platform manifest; several files retain target-specific branches for macOS, Android, and WebAssembly. |
 | `src/recomp/gen/` | Generated lift, dispatch, and declarations. | Ignored output: **do not hand-edit**. Change generation/rewrites and regenerate when needed. |
 | `cmake/` | Platform manifests, toolchains, runtime source groups, and renderer dependency wiring. | A manifest selects implementations; a toolchain selects compiler/target. |
 | `config/` | Tracked lift metadata and game-asset hashes; locally generated analysis files are ignored. | Treat hashes and lift inputs as compatibility contracts, not defaults to silently replace. |
@@ -99,15 +99,15 @@ route; do not assume every HLE path applies to it.
 | --- | --- | --- |
 | Guest startup, dispatch, callbacks | `src/main.c`, `src/guest_runtime.c`, `src/platform_shims.c` | `pcrecomp/runtime/win32hle/`; generated `recomp_dispatch.c`. |
 | Original executable and assets | `src/identity.c`, `src/sha256.c`, `src/platform/desktop/game_install.c` | `config/game-assets.sha256`, `tools/game_asset_manifest.py`; Android `GameData.java`. |
-| Save slots and title handoff | `src/save_menu.c`, `src/save_store.c` | `tools/save_rewrite.py`, `src/platform/filesystem.h`, `tests/password_saves.*`, `tests/save_handoff.*`. |
-| Options and settings | `src/options_menu.c`, `src/preferences.c` | Host settings path in `src/platform/host.h`; `tests/options_screens.*`. |
+| Save slots and title handoff | `src/save_menu.c`, `src/save_store.c` | `tools/save_rewrite.py`, `src/platform/filesystem.h`, `tests/password_saves.*`, `tests/save_handoff.*`; [in-game menus](in-game-menus.md). |
+| Options and settings | `src/options_menu.c`, `src/preferences.c` | Host settings path in `src/platform/host.h`; `tests/options_screens.*`; [in-game menus](in-game-menus.md). |
 | Input and controller mapping | `src/gamepad.c`, `src/platform/input.h`, relevant `src/platform/*/input.c` | `tests/gamepad.c`, `tests/input_mapping.c`. |
 | Guest graphics and packet semantics | `src/graphics_guest.c`, `src/raster.c`, `src/renderer.c` | Hooks in `tools/graphics_rewrite.py`; backend contracts in `src/renderer.h` and `src/packet_gpu.h`. |
 | Host presentation / GPU backend | `src/platform/desktop/renderer.c`, `src/platform/desktop/packet_gpu.c`, `src/platform/dreamcast/packet_gpu.c` | Backend selector `src/platform/packet_gpu_select.c`; shared GL and bgfx implementations under `src/platform/gl/` and `src/platform/bgfx/`. |
 | Movie playback | `src/movie.c`, `src/movie_decoder.h`, `src/platform/desktop/movie_decoder.c` | Dreamcast movie I/O/pixels under `src/platform/dreamcast/`; `tests/movie*`. |
-| Audio, host services, filesystem | `src/platform/audio.h`, `src/platform/audio.c`, `src/platform/filesystem.h`, `src/platform/host.h` | Implementations in the selected `src/platform/{linux,windows,dreamcast,desktop}/`; pcrecomp Win32 HLE semantics. |
+| Audio, host services, filesystem | `src/platform/audio.h`, `src/platform/audio.c`, `src/platform/filesystem.h`, `src/platform/host.h` | SDL host services in `src/platform/desktop/`, POSIX host operations in `src/platform/linux/`, and target implementations under `windows/` and `dreamcast/`; pcrecomp Win32 HLE semantics. |
 | Dreamcast VMU LCD | `src/platform/dreamcast/services.c` | `src/platform/dreamcast/vmu_image.xbm` when present; [flycast-testing.md](flycast-testing.md). VMU save persistence is not implemented. |
-| Game import or launcher UI | `src/platform/desktop/game_install.c`, `src/platform/desktop/folder_picker.c`, `android/src/org/gexrecomp/app/` | `tests/game_install.*`, `tests/folder_picker.*`, `tests/test_android_import.py`. |
+| Game import or launcher UI | `src/platform/desktop/game_install.c` and desktop pickers in `src/platform/desktop/`; Android import in `android/src/org/gexrecomp/app/` | `tests/game_install.*`, `tests/folder_picker.*`, `tests/test_android_import.py`. |
 | Gameplay smoke checks | `src/autoplay.c`, `src/gameplay.c`, `src/main.c` | `tests/autoplay.c`, `tests/gameplay.c`; testing skill. |
 
 The guest compatibility API is not a direct dependency on a Windows host:
@@ -127,11 +127,12 @@ prove image correctness or gameplay. Use appropriate external scanout evidence.
 | Target | Manifest and implementation | Entry/build helpers |
 | --- | --- | --- |
 | Linux desktop | `cmake/platforms/desktop.cmake`; `src/platform/desktop/`, `src/platform/linux/`, `src/platform/hle/` | Root CMake; `src/main.c`. SDL, FFmpeg and host dependencies are discovered by the manifest. |
-| macOS | Desktop manifest and shared desktop/POSIX sources, including macOS branches | `cmake/toolchains/macos*.cmake`, `tools/build-macos.sh`, `tools/package-macos.py`; bundle configuration lives in build tooling. |
-| Windows 64-bit MinGW HLE | `cmake/platforms/mingw.cmake`; shared desktop and `src/platform/windows/` | `cmake/toolchains/mingw64.cmake`, `tools/build-mingw.sh`. |
+| macOS | Desktop manifest with macOS branches in the desktop/Linux implementations and the macOS folder picker | `cmake/toolchains/macos*.cmake`, `tools/build-macos.sh`, `tools/package-macos.py`; bundle configuration lives in build tooling. |
+| Windows 64-bit MinGW HLE | `cmake/platforms/mingw.cmake`; desktop SDL sources and `src/platform/windows/` | `cmake/toolchains/mingw64.cmake`, `tools/build-mingw.sh`. |
 | Windows MSVC native32 | `cmake/platforms/windows.cmake`; separate native32 runtime | `src/platform/windows/main.c`; requires MSVC x86 / `-A Win32`. Not interchangeable with MinGW HLE. |
-| Android | Desktop/HLE manifest with Android-specific source selection | `android/`, `src/platform/android/`, `tools/build-android.sh`, `tools/package-android.py`. |
+| Android | Desktop/HLE manifest with Android-specific branches and `src/platform/android/` entry/font helpers | `android/`, `tools/build-android.sh`, `tools/package-android.py`. |
 | Dreamcast | `cmake/platforms/dreamcast.cmake`, KallistiOS services in `src/platform/dreamcast/` | `cmake/toolchains/dreamcast.cmake`, `tools/build-dreamcast.sh`, `tools/test-dreamcast.sh`. |
+| WebAssembly (experimental) | `cmake/platforms/wasm.cmake`, Wasm font/movie helpers under `src/platform/wasm/`, and Emscripten branches in desktop/Linux/HLE sources; browser shell/import in `web/` | `tools/build-wasm.sh`, `tools/serve-wasm.py`, [WebAssembly guide](webassembly.md). |
 
 `GEX_PLATFORM_FILE` selects the manifest. `GEX_RENDERER_BACKEND_SOURCE`,
 `GEX_MOVIE_DECODER_SOURCE`, and `GEX_ENABLE_*_RENDERER` affect selected
@@ -149,6 +150,8 @@ For drawing and presentation problems, use
 [renderer debugging](renderer-debugging.md).
 For platform-specific build outputs, helper effects and test evidence, use
 [platform builds and tests](platform-build-testing.md).
+For adding platforms, extracting host backends, and maintaining ports, use
+[porting and maintaining platform backends](response.md).
 
 `tests/` contains C test executables plus Python drivers and unit tests;
 some similarly named `.c` and `.py` files work together. `CMakeLists.txt` and

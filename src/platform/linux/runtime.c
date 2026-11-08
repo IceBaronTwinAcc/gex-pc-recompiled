@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <string.h>
 #include <time.h>
 #include "platform/runtime.h"
@@ -54,8 +53,7 @@ uint32_t gex_runtime_process_id(void) { return (uint32_t)getpid(); }
 
 int gex_runtime_executable_path(char *out, size_t size) {
 #ifdef __EMSCRIPTEN__
-    struct stat status;
-    const char *path = stat("/opfs/save", &status) == 0 ? "/opfs/save/ra2" : "/save/ra2";
+    const char *path = "/Gex/GEX.exe";
     if (strlen(path) >= size) return 0;
     strcpy(out, path);
 #elif defined(__APPLE__)

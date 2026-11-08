@@ -14,6 +14,7 @@ int gex_host_screensaver(void);
 void gex_host_set_screensaver(int enabled);
 int gex_host_enter_directory(const char *path);
 int gex_host_working_directory(char *path, size_t size);
+int gex_host_skip_movies_by_default(void);
 /* 0: writable persistent path; 1: explicitly session-only; -1: host error. */
 int gex_host_settings_path(char *path, size_t size);
 void gex_host_install_diagnostics(void);

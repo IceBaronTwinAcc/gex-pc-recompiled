@@ -38,6 +38,25 @@ void gex_options_test_pump(void) {
         hle_exit(0);
         return;
     }
+    if (step == 21) {
+        if (gex_host_ticks_ms() - step_started < 350) return;
+        capture_screen("controls-capture-keyboard");
+        check(!gex_options_key(0x1B), "cancel keyboard capture");
+        check(!gex_options_key(0x27), "select gamepad binding");
+        check(!gex_options_key('X'), "start gamepad capture");
+        step = 22;
+        step_started = gex_host_ticks_ms();
+        return;
+    }
+    if (step == 22) {
+        if (gex_host_ticks_ms() - step_started < 350) return;
+        capture_screen("controls-capture-gamepad");
+        check(!gex_options_key(0x1B), "cancel gamepad capture");
+        down(3);
+        step = 3;
+        step_started = gex_host_ticks_ms();
+        return;
+    }
     if (!step) {
         if (MEM32(0x4A2964) != 63 || scene_frames < 75) return;
         uint32_t controller = 0;
@@ -85,7 +104,10 @@ void gex_options_test_pump(void) {
         check(!gex_options_pointer(60, 65), "open Controls");
     } else if (step == 2) {
         capture_screen("controls");
-        down(3);
+        check(!gex_options_key('X'), "start keyboard capture");
+        step = 21;
+        step_started = gex_host_ticks_ms();
+        return;
     } else if (step == 3) {
         capture_screen("controls-middle");
         down(3);

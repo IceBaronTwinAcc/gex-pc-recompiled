@@ -1,0 +1,36 @@
+diff --git a/src/renderer_webgpu.cpp b/src/renderer_webgpu.cpp
+--- a/src/renderer_webgpu.cpp
++++ b/src/renderer_webgpu.cpp
+@@ -290,7 +290,11 @@ namespace bgfx { namespace wgpu
+ 		{ WGPUTextureFormat_R16Float,             WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // R16F
+ 		{ WGPUTextureFormat_R16Snorm,             WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // R16S
+ 		{ WGPUTextureFormat_R32Sint,              WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // R32I
++#if BX_PLATFORM_EMSCRIPTEN
++		{ WGPUTextureFormat_R32Uint,              WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Uint,              false, { $_, $_, $_, $_ } }, // R32U
++#else
+ 		{ WGPUTextureFormat_R32Uint,              WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // R32U
++#endif
+ 		{ WGPUTextureFormat_R32Float,             WGPUTextureFormat_Undefined,           WGPUTextureSampleType_UnfilterableFloat, false, { $_, $_, $_, $_ } }, // R32F
+ 		{ WGPUTextureFormat_RG8Unorm,             WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // RG8
+ 		{ WGPUTextureFormat_RG8Sint,              WGPUTextureFormat_Undefined,           WGPUTextureSampleType_Float,             true,  { $_, $_, $_, $_ } }, // RG8I
+@@ -3206,6 +3210,8 @@ WGPU_IMPORT
+ 
+ 		void preReset()
+ 		{
++			// Bind groups cache layouts that the reset invalidates.
++			invalidateBindGroupCache();
+ 			m_renderPipelineCache.invalidate();
+ 
+ 			m_frameBuffers.each([](FrameBufferWGPU& _frameBuffer) { _frameBuffer.preReset(); });
+@@ -6748,7 +6754,11 @@ WGPU_IMPORT
+ 	{
+ 		m_result.reset();
+ 
++#if BX_PLATFORM_EMSCRIPTEN
++		m_supported = false;
++#else
+ 		m_supported = isFeatureSupported(WGPUFeatureName_TimestampQuery);
++#endif
+ 
+ 		if (!m_supported)
+ 		{

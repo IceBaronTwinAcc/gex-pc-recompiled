@@ -293,9 +293,19 @@ int gex_options_load(void) {
             if (read_setting(settings_path, names[i], &value) != 1 || value > 8192) goto invalid;
             *values[i] = (int)value;
         }
-        if (!gex_renderer_available(gex_prefs.renderer) || gex_prefs.api >= GEX_API_COUNT ||
+        if (gex_prefs.renderer < 0 || gex_prefs.renderer >= 5 ||
+            gex_prefs.api >= GEX_API_COUNT ||
             gex_prefs.display > GEX_DISPLAY_EXCLUSIVE || gex_prefs.triple > 1 ||
             !gex_renderer_valid_size(gex_prefs.width, gex_prefs.height)) goto invalid;
+        if (!gex_renderer_available(gex_prefs.renderer)) {
+            int fallback = 0;
+            while (fallback < 5 && !gex_renderer_available(fallback)) ++fallback;
+            if (fallback == 5) goto invalid;
+            fprintf(stderr, "[options] saved renderer %d is unavailable in this build; using renderer %d\n",
+                    gex_prefs.renderer, fallback);
+            gex_prefs.renderer = fallback;
+            gex_prefs.api = GEX_API_AUTO;
+        }
     }
     for (unsigned i = 0; i < GEX_ACTION_COUNT; ++i)
         if (gex_controls_bind(i, 0, gex_prefs.bindings[i].key, gex_prefs.bindings[i].scan) ||
@@ -707,10 +717,12 @@ void gex_options_render(void) {
     }
     gex_graphics_menu_clip_end();
     body_scale = 0x9000;
-    if (save_error) text(39, 226, "Save failed", 0, 0);
-    else if (status[0]) text(22, 226, status, 0, 0);
-    else if (capturing) text(39, 226, binding_column ? "Press a gamepad button" : "Press a keyboard key", 0, 0);
-    else if (page == VIDEO && (gex_prefs.renderer != gex_prefs.active_renderer ||
+    if (save_error) text(39, 210, "Save failed", 0, 0);
+    else if (status[0]) text(22, 210, status, 0, 0);
+    else if (capturing) {
+        body_scale = 0x10000;
+        text(22, 200, binding_column ? "Press a button" : "Press a key", 0, 0);
+    } else if (page == VIDEO && (gex_prefs.renderer != gex_prefs.active_renderer ||
              (gex_prefs.renderer == 4 && gex_prefs.api != original_api))) {
         body_scale = 0x10000;
         text(22, 210, "Restart to apply", 0, 0);

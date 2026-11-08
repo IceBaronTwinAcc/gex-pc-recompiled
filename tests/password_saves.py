@@ -44,6 +44,14 @@ with tempfile.TemporaryDirectory(prefix="gex-passwords-") as work:
     run("operations", directory)
     run("options-write", directory)
     run("options-read", directory)
+    settings = directory / "settings.reg"
+    lines = settings.read_text().splitlines()
+    renderer_key = "HKEY_CURRENT_USER\\Software\\GexRecomp\\Options\\Renderer="
+    matching = [i for i, line in enumerate(lines) if line.startswith(renderer_key)]
+    assert len(matching) == 1, "saved renderer setting"
+    lines[matching[0]] = renderer_key + "dword:0x2"
+    settings.write_text("\n".join(lines) + "\n")
+    run("options-incompatible-read", directory)
     run("options-error", directory)
     run("options-close", directory)
     run("options-close-consumed", directory)

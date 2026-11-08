@@ -65,6 +65,12 @@ for backend in sys.argv[3:]:
         for name in ("categories", "controls", "video", "returned-title"):
             image = pixels(directory / (name + ".bmp"))
             assert len(green(image, 20, 310, 10, 230)) > 100, name
+        for name in ("controls-capture-keyboard", "controls-capture-gamepad"):
+            image_path = directory / (name + ".bmp")
+            prompt = green(pixels(image_path), 20, 210, 178, 220)
+            assert len(prompt) > 250, (backend, name, "visible full-size capture prompt")
+            top, bottom = min(y for x, y in prompt), max(y for x, y in prompt)
+            assert 178 <= top and bottom <= 220, (backend, name, "capture prompt fits footer", top, bottom)
         for page, captures in (
                 ("controls", ("controls-middle", "controls-menus", "controls-bottom",
                               "controls-wrap-bottom", "controls-wrap-top")),

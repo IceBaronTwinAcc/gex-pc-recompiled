@@ -9,6 +9,8 @@
 #include <alext.h>
 #endif
 #endif
+#include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -208,7 +210,13 @@ void gex_native_audio_poll(void) { for (gex_native_voice *v = voices; v; v = v->
 gex_audio_position gex_native_voice_position(gex_native_voice *v) {
     poll(v);
     ALint offset = 0;
-    if (v->playing) alGetSourcei(v->source[0], AL_SAMPLE_OFFSET, &offset);
+    if (v->playing) {
+        ALfloat sample_offset = 0;
+        alGetSourcef(v->source[0], AL_SAMPLE_OFFSET, &sample_offset);
+        if (isfinite(sample_offset) && sample_offset > 0 &&
+            sample_offset < (ALfloat)INT_MAX)
+            offset = (ALint)sample_offset;
+    }
     check("read cursor");
     uint32_t chunk = (uint32_t)(v->frequency / 200);
     if (!chunk) chunk = 1;

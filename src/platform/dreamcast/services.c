@@ -31,6 +31,8 @@ static void show_vmu_image(maple_device_t *dev) {
     vmufb_present(&fb, dev);
 }
 
+int gex_host_skip_movies_by_default(void) { return 0; }
+
 int gex_host_settings_path(char *path, size_t size) {
     if (size) path[0] = 0;
     fprintf(stderr, "[dreamcast] settings are session-only; VMU persistence is not implemented\n");

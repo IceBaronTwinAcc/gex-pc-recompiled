@@ -2,6 +2,57 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#if GEX_ENABLE_BGFX_RENDERER && GEX_ENABLE_SOFTWARE_RENDERER
+EM_ASYNC_JS(int, browser_webgpu_available, (void), {
+    if (typeof OffscreenCanvas === "undefined") {
+        console.warn("[renderer] OffscreenCanvas is unavailable; using software");
+        return 0;
+    }
+    if (!navigator.gpu) {
+        console.warn("[renderer] WebGPU is not available in this browser; using software");
+        return 0;
+    }
+    try {
+        const timed = async (promise, onLateValue) => {
+            let timer, expired = false;
+            const operation = Promise.resolve(promise).then(value => {
+                if (expired && onLateValue) onLateValue(value);
+                return value;
+            });
+            try {
+                return await Promise.race([operation, new Promise((resolve, reject) => {
+                    timer = setTimeout(() => {
+                        expired = true;
+                        reject(new Error("WebGPU request timed out"));
+                    }, 10000);
+                })]);
+            } finally {
+                clearTimeout(timer);
+            }
+        };
+        const adapter = await timed(navigator.gpu.requestAdapter({powerPreference: "high-performance"}));
+        if (!adapter) {
+            console.warn("[renderer] WebGPU returned no compatible adapter; using software");
+            return 0;
+        }
+        if (!adapter.features.has("indirect-first-instance")) {
+            console.warn("[renderer] WebGPU adapter lacks indirect-first-instance; using software");
+            return 0;
+        }
+        const device = await timed(
+            adapter.requestDevice({requiredFeatures: ["indirect-first-instance"]}),
+            lateDevice => lateDevice.destroy());
+        device.destroy();
+        return 1;
+    } catch (error) {
+        console.warn("[renderer] WebGPU adapter/device check failed; using software:", error);
+        return 0;
+    }
+});
+#endif
+#endif
 #include "host.h"
 #include "win32hle.h"
 #include "platform_shims.h"
@@ -153,9 +204,22 @@ static void early_gameplay_exit(int code) {
     _Exit(code ? code : 3);
 }
 
+#ifdef __EMSCRIPTEN__
+static void browser_game_exit(int code) {
+    (void)code;
+    gex_gamepad_shutdown();
+    gex_graphics_shutdown();
+    gex_renderer_shutdown();
+    MAIN_THREAD_ASYNC_EM_ASM({
+        window.gexSetStatus("Gex has exited. Reload the page to play again.");
+    });
+}
+#endif
+
 int main(int argc, char **argv) {
     const char *data = "Gex";
-    int headless = 0, trace = 0, check = 0, skip_movies = 0, explicit_data = 0;
+    int headless = 0, trace = 0, check = 0, explicit_data = 0;
+    int skip_movies = gex_host_skip_movies_by_default();
     const int default_renderer = GEX_ENABLE_PVR_RENDERER ? 2 : GEX_ENABLE_BGFX_RENDERER ? 4 :
                                  GEX_ENABLE_SOFTWARE_RENDERER ? 0 : GEX_ENABLE_GLDC_RENDERER ? 3 : 1;
     int hardware_renderer = default_renderer;
@@ -332,6 +396,22 @@ int main(int argc, char **argv) {
 #else
     (void)explicit_renderer; (void)explicit_size;
 #endif
+#if defined(__EMSCRIPTEN__) && GEX_ENABLE_BGFX_RENDERER && GEX_ENABLE_SOFTWARE_RENDERER
+    if (!explicit_renderer) {
+        int canvas_supported = MAIN_THREAD_EM_ASM_INT({
+            const canvas = document.getElementById("canvas");
+            return !!canvas && typeof canvas.transferControlToOffscreen === "function";
+        });
+        if (!canvas_supported) {
+            fprintf(stderr, "[renderer] OffscreenCanvas transfer unavailable; selecting software\n");
+            hardware_renderer = 0;
+        } else if (!browser_webgpu_available()) {
+            fprintf(stderr, "[renderer] WebGPU unavailable; selecting software "
+                            "(see browser console for adapter details)\n");
+            hardware_renderer = 0;
+        }
+    }
+#endif
     const gex_renderer_backend *renderer = gex_renderer_backend_get();
 #if GEX_ENABLE_BGFX_RENDERER
     if (hardware_renderer == 4) renderer = gex_bgfx_renderer();
@@ -364,6 +444,9 @@ int main(int argc, char **argv) {
     hle_set_pump_hook(monitor);
     monitor();
     if (verify_gameplay) hle_on_exit = early_gameplay_exit;
+#ifdef __EMSCRIPTEN__
+    else hle_on_exit = browser_game_exit;
+#endif
     rc = (int)recomp_host_run();
 #if GEX_ENABLE_PASSWORD_SAVES
     gex_save_shutdown();

@@ -6,6 +6,10 @@ set(GEX_BGFX_SHADERC "${PROJECT_SOURCE_DIR}/.deps/bgfx-build/bin/host/shaderc" C
 if(NOT EXISTS "${GEX_BGFX_CMAKE_DIR}/CMakeLists.txt" OR NOT EXISTS "${GEX_BGFX_SHADERC}")
     message(FATAL_ERROR "Prepare bgfx and its host shader compiler with tools/build-bgfx.sh")
 endif()
+if(EMSCRIPTEN)
+    set(BGFX_CONFIG_RENDERER_WEBGPU ON CACHE BOOL "" FORCE)
+    set(BGFX_CONFIG_MULTITHREADED OFF CACHE BOOL "" FORCE)
+endif()
 set(BGFX_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(BGFX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BGFX_BUILD_EXAMPLE_COMMON OFF CACHE BOOL "" FORCE)
@@ -17,6 +21,28 @@ else()
     set(BGFX_WITH_WAYLAND OFF CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${GEX_BGFX_CMAKE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/bgfx" EXCLUDE_FROM_ALL)
+if(EMSCRIPTEN)
+    find_package(Git REQUIRED)
+    set(gex_bgfx_webgpu_patch "${PROJECT_SOURCE_DIR}/cmake/patches/bgfx-webgpu.patch")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${gex_bgfx_webgpu_patch}")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${BGFX_DIR}" apply --reverse --check
+        "${gex_bgfx_webgpu_patch}" RESULT_VARIABLE gex_bgfx_patch_applied
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT gex_bgfx_patch_applied EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${BGFX_DIR}" apply --check
+            "${gex_bgfx_webgpu_patch}" RESULT_VARIABLE gex_bgfx_patch_check
+            ERROR_VARIABLE gex_bgfx_patch_error)
+        if(NOT gex_bgfx_patch_check EQUAL 0)
+            message(FATAL_ERROR "Cannot apply the WebGPU fixes to ${BGFX_DIR}: ${gex_bgfx_patch_error}")
+        endif()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${BGFX_DIR}" apply
+            "${gex_bgfx_webgpu_patch}" RESULT_VARIABLE gex_bgfx_patch_result
+            ERROR_VARIABLE gex_bgfx_patch_error)
+        if(NOT gex_bgfx_patch_result EQUAL 0)
+            message(FATAL_ERROR "Failed to apply WebGPU fixes: ${gex_bgfx_patch_error}")
+        endif()
+    endif()
+endif()
 if(ANDROID)
     target_link_libraries(bgfx PUBLIC EGL GLESv3 android log)
 endif()
@@ -30,7 +56,7 @@ if(MINGW)
     target_link_options(bgfx INTERFACE -static-libgcc -static-libstdc++)
 endif()
 
-if(ANDROID)
+if(ANDROID OR EMSCRIPTEN)
     set(gex_bgfx_default_gl es)
 else()
     set(gex_bgfx_default_gl desktop)
@@ -43,7 +69,15 @@ endif()
 if(ANDROID AND NOT GEX_BGFX_GL_FLAVOUR STREQUAL "es")
     message(FATAL_ERROR "Android requires GEX_BGFX_GL_FLAVOUR=es; Vulkan is bundled alongside it.")
 endif()
-if(NOT APPLE)
+if(EMSCRIPTEN)
+    target_compile_definitions(bgfx PRIVATE
+        BGFX_CONFIG_RENDERER_OPENGL=0
+        BGFX_CONFIG_RENDERER_OPENGLES=0
+        BGFX_CONFIG_RENDERER_VULKAN=0
+        BGFX_CONFIG_RENDERER_DIRECT3D11=0
+        BGFX_CONFIG_RENDERER_DIRECT3D12=0
+        BGFX_CONFIG_RENDERER_WEBGPU=1)
+elseif(NOT APPLE)
     if(GEX_BGFX_GL_FLAVOUR STREQUAL "es")
         set(gex_bgfx_gl 0)
         set(gex_bgfx_es 31)
@@ -62,6 +96,9 @@ endif()
 set(GEX_BGFX_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/bgfx-shaders")
 file(MAKE_DIRECTORY "${GEX_BGFX_SHADER_DIR}")
 set(gex_bgfx_profiles spirv metal glsl essl)
+if(EMSCRIPTEN)
+    list(APPEND gex_bgfx_profiles wgsl)
+endif()
 if(WIN32)
     list(APPEND gex_bgfx_profiles dxbc dxil)
 endif()
@@ -115,6 +152,30 @@ foreach(profile IN LISTS gex_bgfx_profiles)
     endforeach()
 endforeach()
 target_sources(gex_packet_gpu PRIVATE src/platform/bgfx/packet_gpu.c)
+if(EMSCRIPTEN)
+    add_custom_command(OUTPUT "${GEX_BGFX_SHADER_DIR}/cs_copy_wgsl.h"
+        COMMAND "${GEX_BGFX_SHADERC}"
+            -f "${PROJECT_SOURCE_DIR}/src/platform/bgfx/cs_copy.sc"
+            -o "${GEX_BGFX_SHADER_DIR}/cs_copy_wgsl.h"
+            --type compute --platform linux --profile wgsl
+            --bin2c gex_bgfx_cs_copy_wgsl -i "${BGFX_DIR}/src"
+            --varyingdef "${PROJECT_SOURCE_DIR}/src/platform/bgfx/varying.def.sc"
+        DEPENDS "${PROJECT_SOURCE_DIR}/src/platform/bgfx/cs_copy.sc"
+            "${PROJECT_SOURCE_DIR}/src/platform/bgfx/varying.def.sc" "${GEX_BGFX_SHADERC}"
+        VERBATIM)
+    target_sources(gex_packet_gpu PRIVATE "${GEX_BGFX_SHADER_DIR}/cs_copy_wgsl.h")
+    add_custom_command(OUTPUT "${GEX_BGFX_SHADER_DIR}/fs_present_packet_wgsl.h"
+        COMMAND "${GEX_BGFX_SHADERC}"
+            -f "${PROJECT_SOURCE_DIR}/src/platform/bgfx/fs_present_packet.sc"
+            -o "${GEX_BGFX_SHADER_DIR}/fs_present_packet_wgsl.h"
+            --type fragment --platform linux --profile wgsl
+            --bin2c gex_bgfx_fs_present_packet_wgsl -i "${BGFX_DIR}/src"
+            --varyingdef "${PROJECT_SOURCE_DIR}/src/platform/bgfx/varying.def.sc"
+        DEPENDS "${PROJECT_SOURCE_DIR}/src/platform/bgfx/fs_present_packet.sc"
+            "${PROJECT_SOURCE_DIR}/src/platform/bgfx/varying.def.sc" "${GEX_BGFX_SHADERC}"
+        VERBATIM)
+    target_sources(gex_packet_gpu PRIVATE "${GEX_BGFX_SHADER_DIR}/fs_present_packet_wgsl.h")
+endif()
 target_include_directories(gex_packet_gpu PRIVATE "${GEX_BGFX_SHADER_DIR}")
 target_link_libraries(gex_packet_gpu PRIVATE bgfx bx gex_renderer)
 

@@ -1,9 +1,16 @@
 #include <math.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL2/SDL_thread.h>
 #include <SDL2/SDL_syswm.h>
 #include <bgfx/c99/bgfx.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#include <emscripten/threading.h>
+#endif
 #include "platform/bgfx/backend.h"
 #include "packet_gpu.h"
 #include "preferences.h"
@@ -19,6 +26,13 @@
 #include "fs_present_metal.h"
 #include "fs_present_glsl.h"
 #include "fs_present_essl.h"
+#ifdef __EMSCRIPTEN__
+#include "cs_copy_wgsl.h"
+#include "cs_packet_wgsl.h"
+#include "fs_present_packet_wgsl.h"
+#include "vs_present_wgsl.h"
+#include "fs_present_wgsl.h"
+#endif
 #ifdef _WIN32
 #include "cs_packet_dxbc.h"
 #include "cs_packet_dxil.h"
@@ -38,12 +52,16 @@ typedef struct {
     uint32_t *transfer, *tails;
 } target;
 typedef enum { OPEN, CREATE, DESTROY, UPLOAD, DOWNLOAD, DRAW, MATERIAL, SUBMIT,
-               CONFIGURE, PRESENT, CAPTURE, STOP } operation;
+               CONFIGURE, PRESENT, CAPTURE, CLEAR, COPY, BLIT,
+               PRESENT_TARGET, MOVIE, STOP } operation;
 typedef struct {
     operation op;
     target *device;
-    int width, height, result;
+    target *source;
+    int width, height, x, y, pitch, key, result;
+    unsigned shade;
     const uint16_t *input;
+    const uint8_t *pixels;
     uint16_t *output;
     uint8_t *rgba;
     const gex_gpu_span *spans;
@@ -55,11 +73,16 @@ typedef struct {
     size_t size;
 } request;
 
+static int initialised, visible, thread_started;
+#ifdef __EMSCRIPTEN__
+static pthread_t thread;
+#else
 static SDL_Thread *thread;
+#endif
 static SDL_mutex *calls, *queue;
 static SDL_cond *work, *completed;
 static request *pending;
-static int done, initialised, visible;
+static int done, worker_executing;
 static bgfx_platform_data_t platform;
 static void *native_window, *native_display;
 #ifdef __ANDROID__
@@ -68,6 +91,11 @@ static SDL_Window *presentation_window;
 static int window_width, window_height;
 static int swap_buffers;
 static bgfx_program_handle_t program = {UINT16_MAX}, presenter = {UINT16_MAX};
+#ifdef __EMSCRIPTEN__
+static bgfx_program_handle_t copy_program = {UINT16_MAX}, packet_presenter = {UINT16_MAX};
+static bgfx_uniform_handle_t copy_source = {UINT16_MAX};
+static int web_presented;
+#endif
 static bgfx_uniform_handle_t parameters = {UINT16_MAX}, sampler = {UINT16_MAX};
 static bgfx_index_buffer_handle_t atlas_buffer = {UINT16_MAX}, table_buffer = {UINT16_MAX};
 static bgfx_vertex_buffer_handle_t vertices = {UINT16_MAX};
@@ -85,6 +113,7 @@ static unsigned batch_pixel_count, batch_node_count, batch_material_count;
 static unsigned queued;
 static int frame_width, frame_height;
 static int invoke_worker(request *r);
+static int invoke_api(request *r);
 #if GEX_PROFILE_RENDERER
 static unsigned profile_draws, profile_uploads, profile_resolves;
 static size_t profile_bytes;
@@ -114,11 +143,26 @@ typedef struct { const uint8_t *bytes; uint32_t size; } shader_binary;
 #else
 #define DIRECTX_BINARIES(name) {NULL, 0}, {NULL, 0},
 #endif
+#ifdef __EMSCRIPTEN__
+#define WEBGPU_BINARY(name) BINARY(name, wgsl)
+#else
+#define WEBGPU_BINARY(name) {NULL, 0}
+#endif
 #define SHADER_BINARIES(name) {DIRECTX_BINARIES(name) BINARY(name, metal), \
-    BINARY(name, glsl), BINARY(name, essl), BINARY(name, spirv)}
+    BINARY(name, glsl), BINARY(name, essl), BINARY(name, spirv), WEBGPU_BINARY(name)}
 static const shader_binary compute_shaders[] = SHADER_BINARIES(cs_packet);
 static const shader_binary vertex_shaders[] = SHADER_BINARIES(vs_present);
 static const shader_binary fragment_shaders[] = SHADER_BINARIES(fs_present);
+#ifdef __EMSCRIPTEN__
+static const shader_binary copy_shaders[] = {
+    {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0},
+    BINARY(cs_copy, wgsl)
+};
+static const shader_binary packet_fragment_shaders[] = {
+    {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0}, {NULL, 0},
+    BINARY(fs_present_packet, wgsl)
+};
+#endif
 
 static int shader_profile(bgfx_renderer_type_t type) {
     switch (type) {
@@ -128,6 +172,7 @@ static int shader_profile(bgfx_renderer_type_t type) {
     case BGFX_RENDERER_TYPE_OPENGL: return 3;
     case BGFX_RENDERER_TYPE_OPENGLES: return 4;
     case BGFX_RENDERER_TYPE_VULKAN: return 5;
+    case BGFX_RENDERER_TYPE_WEBGPU: return 6;
     default: return -1;
     }
 }
@@ -137,6 +182,15 @@ static bgfx_shader_handle_t shader(const shader_binary *binaries, int profile) {
 }
 
 static int requested_api(request *r, bgfx_renderer_type_t *type) {
+#ifdef __EMSCRIPTEN__
+    const char *name = SDL_getenv("GEX_BGFX_API");
+    if (!name) name = "auto";
+    if (!strcmp(name, "auto") || !strcmp(name, "webgpu")) {
+        *type = BGFX_RENDERER_TYPE_WEBGPU;
+        return 0;
+    }
+    return fail(r, "WebAssembly bgfx requires GEX_BGFX_API=auto or webgpu");
+#else
     static const struct { const char *name; bgfx_renderer_type_t type; } names[] = {
         {"auto", BGFX_RENDERER_TYPE_COUNT}, {"vulkan", BGFX_RENDERER_TYPE_VULKAN},
         {"metal", BGFX_RENDERER_TYPE_METAL}, {"opengl", BGFX_RENDERER_TYPE_OPENGL},
@@ -152,6 +206,7 @@ static int requested_api(request *r, bgfx_renderer_type_t *type) {
             return 0;
         }
     return fail(r, "GEX_BGFX_API requires auto, vulkan, metal, opengl, opengles, direct3d11 or direct3d12");
+#endif
 }
 
 static int api_index(bgfx_renderer_type_t type) {
@@ -162,6 +217,7 @@ static int api_index(bgfx_renderer_type_t type) {
     case BGFX_RENDERER_TYPE_OPENGLES: return GEX_API_OPENGLES;
     case BGFX_RENDERER_TYPE_DIRECT3D11: return GEX_API_D3D11;
     case BGFX_RENDERER_TYPE_DIRECT3D12: return GEX_API_D3D12;
+    case BGFX_RENDERER_TYPE_WEBGPU: return GEX_API_AUTO;
     default: return GEX_API_AUTO;
     }
 }
@@ -193,11 +249,19 @@ static void close_device(void) {
     if (VALID(table_buffer)) bgfx_destroy_index_buffer(table_buffer);
     if (VALID(program)) bgfx_destroy_program(program);
     if (VALID(presenter)) bgfx_destroy_program(presenter);
+#ifdef __EMSCRIPTEN__
+    if (VALID(copy_program)) bgfx_destroy_program(copy_program);
+    if (VALID(packet_presenter)) bgfx_destroy_program(packet_presenter);
+    if (VALID(copy_source)) bgfx_destroy_uniform(copy_source);
+#endif
     if (VALID(parameters)) bgfx_destroy_uniform(parameters);
     if (VALID(sampler)) bgfx_destroy_uniform(sampler);
     bgfx_shutdown();
     INVALID(frame_texture); INVALID(vertices); INVALID(atlas_buffer); INVALID(table_buffer);
     INVALID(program); INVALID(presenter); INVALID(parameters); INVALID(sampler);
+#ifdef __EMSCRIPTEN__
+    INVALID(copy_program); INVALID(packet_presenter); INVALID(copy_source);
+#endif
     INVALID(compute_output); INVALID(frame_output); INVALID(frame_readback);
     initialised = queued = frame_width = frame_height = 0;
     batch_target = NULL;
@@ -226,7 +290,13 @@ static int open_device(request *r) {
     init.swapChain.numBackBuffers = (uint8_t)swap_buffers;
     init.swapChain.maxFrameLatency = (uint8_t)swap_buffers;
     init.reset = visible ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
-    if (!bgfx_init(&init)) return fail(r, "cannot initialise the platform GPU backend");
+    if (!bgfx_init(&init)) {
+#ifdef __EMSCRIPTEN__
+        return fail(r, "cannot initialise WebGPU; check browser support and GPU adapter availability");
+#else
+        return fail(r, "cannot initialise the platform GPU backend");
+#endif
+    }
     initialised = 1;
     bgfx_renderer_type_t actual = bgfx_get_renderer_type();
     gex_prefs.active_api = api_index(actual);
@@ -240,13 +310,22 @@ static int open_device(request *r) {
     /* ES 3.1 permits R32U read/write without the broader IMAGE_RW capability. */
     uint64_t required = BGFX_CAPS_COMPUTE | BGFX_CAPS_INDEX32;
     uint32_t image = BGFX_CAPS_FORMAT_TEXTURE_IMAGE_READ | BGFX_CAPS_FORMAT_TEXTURE_IMAGE_WRITE;
+#ifdef __EMSCRIPTEN__
+    image |= BGFX_CAPS_FORMAT_TEXTURE_2D;
+#endif
     if ((caps->supported & required) != required ||
         (caps->formats[BGFX_TEXTURE_FORMAT_R32U] & image) != image) {
         snprintf(r->error, r->size,
             "bgfx: %s requires compute/32-bit buffers (caps=0x%llx, required=0x%llx) "
-            "and R32U image read/write (format=0x%x, required=0x%x)",
+            "and R32U image read/write%s (format=0x%x, required=0x%x)",
             bgfx_get_renderer_name(actual), (unsigned long long)caps->supported,
-            (unsigned long long)required, caps->formats[BGFX_TEXTURE_FORMAT_R32U], image);
+            (unsigned long long)required,
+#ifdef __EMSCRIPTEN__
+            " and texture sampling"
+#else
+            ""
+#endif
+            , caps->formats[BGFX_TEXTURE_FORMAT_R32U], image);
         close_device();
         return -1;
     }
@@ -262,6 +341,21 @@ static int open_device(request *r) {
     }
     program = bgfx_create_compute_program(cs, true);
     presenter = bgfx_create_program(vs, fs, true);
+#ifdef __EMSCRIPTEN__
+    bgfx_shader_handle_t copy_cs = shader(copy_shaders, profile);
+    bgfx_shader_handle_t packet_vs = shader(vertex_shaders, profile);
+    bgfx_shader_handle_t packet_fs = shader(packet_fragment_shaders, profile);
+    if (!VALID(copy_cs) || !VALID(packet_vs) || !VALID(packet_fs)) {
+        if (VALID(copy_cs)) bgfx_destroy_shader(copy_cs);
+        if (VALID(packet_vs)) bgfx_destroy_shader(packet_vs);
+        if (VALID(packet_fs)) bgfx_destroy_shader(packet_fs);
+        close_device();
+        return fail(r, "cannot create GPU-owned WebGPU shaders");
+    }
+    copy_program = bgfx_create_compute_program(copy_cs, true);
+    packet_presenter = bgfx_create_program(packet_vs, packet_fs, true);
+    copy_source = bgfx_create_uniform("s_source", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+#endif
     parameters = bgfx_create_uniform("u_batch", BGFX_UNIFORM_TYPE_VEC4, 1);
     sampler = bgfx_create_uniform("s_frame", BGFX_UNIFORM_TYPE_SAMPLER, 1);
     /* Full-screen triangle. No platform graphics calls or native shader compilation. */
@@ -283,6 +377,12 @@ static int open_device(request *r) {
         close_device();
         return fail(r, "cannot allocate shader programs or presentation resources");
     }
+#ifdef __EMSCRIPTEN__
+    if (!VALID(copy_program) || !VALID(packet_presenter) || !VALID(copy_source)) {
+        close_device();
+        return fail(r, "cannot allocate GPU-owned WebGPU programs");
+    }
+#endif
     bgfx_set_view_mode(0, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_set_view_mode(3, BGFX_VIEW_MODE_SEQUENTIAL);
     fprintf(stderr, "[bgfx] %s; exact integer palette/blend shaders; GPU API access through bgfx only\n",
@@ -301,11 +401,24 @@ static int create_target(request *r) {
     t->width = r->width; t->height = r->height;
     t->transfer = calloc((size_t)t->width * t->height, sizeof *t->transfer);
     t->tails = malloc((size_t)t->width * t->height * sizeof *t->tails);
+    INVALID(t->readback);
+    uint64_t image_flags = BGFX_TEXTURE_COMPUTE_WRITE | BGFX_TEXTURE_BLIT_DST;
+#ifdef __EMSCRIPTEN__
+    image_flags |= BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP |
+                   BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
+                   BGFX_SAMPLER_MIP_POINT;
+#endif
     t->image = bgfx_create_texture_2d(t->width, t->height, false, 1, BGFX_TEXTURE_FORMAT_R32U,
-        BGFX_TEXTURE_COMPUTE_WRITE | BGFX_TEXTURE_BLIT_DST, NULL, 0);
+        image_flags, NULL, 0);
+#ifndef __EMSCRIPTEN__
     t->readback = bgfx_create_texture_2d(t->width, t->height, false, 1, BGFX_TEXTURE_FORMAT_R32U,
         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK, NULL, 0);
-    if (!t->transfer || !t->tails || !VALID(t->image) || !VALID(t->readback)) {
+#endif
+    if (!t->transfer || !t->tails || !VALID(t->image)
+#ifndef __EMSCRIPTEN__
+        || !VALID(t->readback)
+#endif
+    ) {
         if (VALID(t->image)) bgfx_destroy_texture(t->image);
         if (VALID(t->readback)) bgfx_destroy_texture(t->readback);
         free(t->tails); free(t->transfer); free(t);
@@ -354,8 +467,9 @@ static int submit_batch(request *r) {
 }
 
 static int submit_from_caller(request *r) {
+    if (worker_executing) return submit_batch(r);
     request submission = {.op = SUBMIT, .error = r->error, .size = r->size};
-    return invoke_worker(&submission);
+    return invoke_api(&submission);
 }
 
 static int upload_target(request *r) {
@@ -373,6 +487,10 @@ static int upload_target(request *r) {
 }
 
 static int download_target(request *r) {
+#ifdef __EMSCRIPTEN__
+    (void)r;
+    return fail(r, "synchronous WebGPU packet readback is unsupported");
+#else
     target *t = r->device;
     if (submit_batch(r)) return -1;
     bgfx_texture_region_t src = {.handle = t->image}, dst = {.handle = t->readback};
@@ -383,6 +501,7 @@ static int download_target(request *r) {
     PROFILE(resolves, 1);
     for (size_t i = 0; i < (size_t)t->width * t->height; ++i) r->output[i] = (uint16_t)t->transfer[i];
     return 0;
+#endif
 }
 
 static int snapshot(bgfx_index_buffer_handle_t *buffer, uint8_t *cache, const uint8_t *data,
@@ -476,8 +595,13 @@ static int draw_target(request *r) {
 }
 
 static int configure_frame(request *r) {
-    if (!r->frame->pixels || !gex_renderer_valid_size(r->frame->width, r->frame->height) ||
-        r->frame->pitch < r->frame->width * 2 ||
+#ifndef __EMSCRIPTEN__
+    if (!r->frame->pixels ||
+#else
+    if (
+#endif
+        !gex_renderer_valid_size(r->frame->width, r->frame->height) ||
+        (r->frame->pixels && r->frame->pitch < r->frame->width * 2) ||
         (uint32_t)r->frame->width > bgfx_get_caps()->limits.maxTextureSize ||
         (uint32_t)r->frame->height > bgfx_get_caps()->limits.maxTextureSize)
         return fail(r, "invalid presentation dimensions or pixel storage");
@@ -579,6 +703,164 @@ static int capture_frame(request *r) {
     return 0;
 }
 
+#ifdef __EMSCRIPTEN__
+static int clear_target(request *r) {
+    target *t = r->device;
+    if (submit_batch(r)) return -1;
+    if (queued) flush();
+    size_t bytes = (size_t)t->width * t->height * sizeof *t->transfer;
+    memset(t->transfer, 0, bytes);
+    bgfx_update_texture_2d(t->image, 0, 0, 0, 0, t->width, t->height,
+                           bgfx_copy(t->transfer, (uint32_t)bytes), UINT16_MAX);
+    memset(t->tails, 0xff, (size_t)t->width * t->height * sizeof *t->tails);
+    flush();
+    return 0;
+}
+
+static int copy_target(request *r) {
+    target *destination = r->device;
+    target *source = r->source;
+    if (!source || destination == source || destination->width != source->width ||
+        destination->height != source->height || r->shade > 255)
+        return fail(r, "invalid GPU-owned picture copy");
+    if (submit_batch(r)) return -1;
+    if (queued) flush();
+    float values[4] = {(float)destination->width, (float)destination->height,
+                       (float)r->shade, 0};
+    bgfx_set_view_frame_buffer(0, compute_output);
+    bgfx_set_uniform(parameters, values, 1);
+    /* WGSL reflects the read-only source as a sampled integer texture. */
+    bgfx_set_texture(0, copy_source, source->image, UINT32_MAX);
+    bgfx_set_image(1, destination->image, 0, BGFX_ACCESS_READWRITE, BGFX_TEXTURE_FORMAT_R32U);
+    bgfx_dispatch(0, copy_program, (destination->width + 7) / 8,
+                  (destination->height + 7) / 8, 1, BGFX_DISCARD_ALL);
+    memset(destination->tails, 0xff,
+           (size_t)destination->width * destination->height * sizeof *destination->tails);
+    flush();
+    return 0;
+}
+
+static void solid_material(gex_gpu_material *material, unsigned pixel) {
+    *material = (gex_gpu_material){
+        .opcode = 0x60,
+        .rgb = ((pixel & 31u) << 3) |
+               (((pixel >> 5) & 31u) << 11) |
+               (((pixel >> 10) & 31u) << 19)
+    };
+}
+
+static int draw_solid_spans(request *r, const gex_gpu_span *spans, size_t count,
+                            const gex_gpu_material *material) {
+    request draw = *r;
+    draw.spans = spans;
+    draw.count = count;
+    draw.material = material;
+    return draw_target(&draw);
+}
+
+static int blit_target(request *r) {
+    target *t = r->device;
+    if (!r->pixels || r->width <= 0 || r->height <= 0 || r->pitch < r->width * 2 ||
+        r->key < -1 || r->key > 65535)
+        return fail(r, "invalid GPU-owned image blit");
+    int source_left = r->x < 0 ? -r->x : 0;
+    int source_top = r->y < 0 ? -r->y : 0;
+    int source_right = r->width < t->width - r->x ? r->width : t->width - r->x;
+    int source_bottom = r->height < t->height - r->y ? r->height : t->height - r->y;
+    if (source_left >= source_right || source_top >= source_bottom) return 0;
+    for (int sy = source_top; sy < source_bottom; ++sy) {
+        const uint8_t *row = r->pixels + (size_t)sy * r->pitch;
+        int sx = source_left;
+        while (sx < source_right) {
+            unsigned pixel = row[sx * 2] | (unsigned)row[sx * 2 + 1] << 8;
+            if (r->key >= 0 && pixel == (unsigned)r->key) {
+                ++sx;
+                continue;
+            }
+            int end = sx + 1;
+            while (end < source_right) {
+                unsigned next = row[end * 2] | (unsigned)row[end * 2 + 1] << 8;
+                if (next != pixel || (r->key >= 0 && next == (unsigned)r->key)) break;
+                ++end;
+            }
+            gex_gpu_material material;
+            solid_material(&material, pixel);
+            while (sx < end) {
+                if (batch_target != t || batch_material_count == MAX_BATCH_MATERIALS ||
+                    batch_node_count == MAX_BATCH_NODES || batch_pixel_count == MAX_BATCH_NODES) {
+                    if (submit_batch(r)) return -1;
+                }
+                int count = end - sx;
+                int capacity = MAX_BATCH_NODES - batch_node_count;
+                if (count > capacity) count = capacity;
+                gex_gpu_span span = {
+                    .x = r->x + sx, .y = r->y + sy, .count = count, .scale = 1
+                };
+                if (draw_solid_spans(r, &span, 1, &material)) return -1;
+                sx += count;
+            }
+        }
+    }
+    return 0;
+}
+
+static int present_target(request *r) {
+    target *t = r->device;
+    if (submit_batch(r)) return -1;
+    if (visible) {
+        int width, height;
+        EMSCRIPTEN_RESULT result = emscripten_get_canvas_element_size("#canvas", &width, &height);
+        if (result != EMSCRIPTEN_RESULT_SUCCESS) {
+            snprintf(r->error, r->size, "bgfx: cannot read WebGPU canvas size (%d)", result);
+            return -1;
+        }
+        if (width > 0 && height > 0 && (width != window_width || height != window_height)) {
+            bgfx_init_t defaults;
+            bgfx_init_ctor(&defaults);
+            defaults.swapChain.nwh = native_window;
+            defaults.swapChain.ndt = native_display;
+            defaults.swapChain.width = (uint32_t)width;
+            defaults.swapChain.height = (uint32_t)height;
+            defaults.swapChain.numBackBuffers = (uint8_t)swap_buffers;
+            defaults.swapChain.maxFrameLatency = (uint8_t)swap_buffers;
+            bgfx_reset(BGFX_RESET_VSYNC, &defaults.swapChain);
+            window_width = width;
+            window_height = height;
+        }
+    }
+    int width = visible ? window_width : t->width;
+    int height = visible ? window_height : t->height;
+    if (width <= 0 || height <= 0) return fail(r, "invalid GPU-owned presentation dimensions");
+    gex_render_rect rect = gex_renderer_fit(width, height, t->width, t->height);
+    float values[4] = {(float)t->width, (float)t->height, 0, 0};
+    const bgfx_frame_buffer_handle_t backbuffer = {UINT16_MAX};
+    bgfx_set_view_frame_buffer(2, backbuffer);
+    bgfx_set_view_frame_buffer(3, backbuffer);
+    bgfx_set_view_rect(2, 0, 0, width, height, 0, 1);
+    bgfx_set_view_clear(2, BGFX_CLEAR_COLOR, 0x000000ff, 1, 0);
+    bgfx_touch(2);
+    bgfx_set_view_rect(3, rect.x, rect.y, rect.width, rect.height, 0, 1);
+    bgfx_set_uniform(parameters, values, 1);
+    bgfx_set_vertex_buffer(0, vertices, 0, 3);
+    bgfx_set_texture(0, sampler, t->image, UINT32_MAX);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+#ifdef __EMSCRIPTEN__
+    bgfx_submit(3, packet_presenter, 0, BGFX_DISCARD_ALL);
+#else
+    bgfx_submit(3, presenter, 0, BGFX_DISCARD_ALL);
+#endif
+    flush();
+    if (visible && !web_presented) {
+        web_presented = 1;
+        MAIN_THREAD_ASYNC_EM_ASM({
+            if (document.getElementById("status").textContent === "Game files loaded. Starting Gex...")
+                window.gexSetStatus("Gex is running.");
+        });
+    }
+    return 0;
+}
+#endif
+
 static int execute(request *r) {
     if (!initialised && r->op != OPEN && r->op != CREATE && r->op != STOP)
         return fail(r, "graphics device is not initialised");
@@ -588,7 +870,7 @@ static int execute(request *r) {
     case DESTROY:
         if (submit_batch(r)) return -1;
         bgfx_destroy_texture(r->device->image);
-        bgfx_destroy_texture(r->device->readback);
+        if (VALID(r->device->readback)) bgfx_destroy_texture(r->device->readback);
         free(r->device->tails); free(r->device->transfer); free(r->device);
         return 0;
     case UPLOAD: return upload_target(r);
@@ -602,12 +884,23 @@ static int execute(request *r) {
     case CONFIGURE: return configure_frame(r);
     case PRESENT: return present_frame(r);
     case CAPTURE: return capture_frame(r);
+#ifdef __EMSCRIPTEN__
+    case CLEAR: return clear_target(r);
+    case COPY: return copy_target(r);
+    case BLIT: return blit_target(r);
+    case PRESENT_TARGET: return present_target(r);
+    case MOVIE: return fail(r, "WebGPU movie uploads are unavailable in this build");
+#endif
     case STOP: close_device(); return 0;
     }
     return fail(r, "unknown worker operation");
 }
 
+#ifdef __EMSCRIPTEN__
+static void *worker(void *unused) {
+#else
 static int worker(void *unused) {
+#endif
     (void)unused;
     SDL_LockMutex(queue);
     for (;;) {
@@ -617,7 +910,15 @@ static int worker(void *unused) {
 #if GEX_PROFILE_RENDERER
         uint64_t started = SDL_GetPerformanceCounter();
 #endif
+        worker_executing = 1;
         r->result = execute(r);
+        worker_executing = 0;
+#ifdef __EMSCRIPTEN__
+        /* Let the canvas-owning worker return to its event loop so submitted
+         * WebGPU work can be composited before the game submits another frame. */
+        if (!r->result && r->op == PRESENT_TARGET)
+            emscripten_sleep(0);
+#endif
 #if GEX_PROFILE_RENDERER
         profile_ticks[r->op] += SDL_GetPerformanceCounter() - started;
         if (r->op == PRESENT) {
@@ -639,7 +940,11 @@ static int worker(void *unused) {
         if (r->op == STOP) break;
     }
     SDL_UnlockMutex(queue);
+#ifdef __EMSCRIPTEN__
+    return NULL;
+#else
     return 0;
+#endif
 }
 
 static int invoke_worker(request *r) {
@@ -651,21 +956,64 @@ static int invoke_worker(request *r) {
     return r->result;
 }
 
+static int invoke_api(request *r) {
+    return invoke_worker(r);
+}
+
 static int invoke(request *r) {
-    if (!thread) {
+#ifdef __EMSCRIPTEN__
+    if (!thread_started) {
         calls = SDL_CreateMutex(); queue = SDL_CreateMutex();
         work = SDL_CreateCond(); completed = SDL_CreateCond();
-        if (calls && queue && work && completed) thread = SDL_CreateThread(worker, "bgfx-api", NULL);
-        if (!thread) {
+        int thread_error = 0;
+        pthread_attr_t attr;
+        if (calls && queue && work && completed) {
+            thread_error = pthread_attr_init(&attr);
+            if (!thread_error) {
+                /* Avoid Emscripten's #canvas alias on a thread that does not own it yet. */
+                thread_error = emscripten_pthread_attr_settransferredcanvases(&attr, "canvas#canvas");
+                if (!thread_error) thread_error = pthread_create(&thread, &attr, worker, NULL);
+                pthread_attr_destroy(&attr);
+            }
+        } else {
+            thread_error = ENOMEM;
+        }
+        thread_started = thread_error == 0;
+        if (!thread_started) {
+            if (completed) SDL_DestroyCond(completed);
+            if (work) SDL_DestroyCond(work);
+            if (queue) SDL_DestroyMutex(queue);
+            if (calls) SDL_DestroyMutex(calls);
+            calls = queue = NULL; work = completed = NULL;
+            snprintf(r->error, r->size,
+                     "bgfx: cannot create the canvas-owning API worker (error %d)", thread_error);
+            return -1;
+        }
+    }
+#else
+    if (!thread_started) {
+        calls = SDL_CreateMutex(); queue = SDL_CreateMutex();
+        work = SDL_CreateCond(); completed = SDL_CreateCond();
+        int thread_error = 0;
+        if (calls && queue && work && completed) {
+            thread = SDL_CreateThread(worker, "bgfx-api", NULL);
+            thread_started = thread != NULL;
+            if (!thread_started) thread_error = EAGAIN;
+        } else {
+            thread_error = ENOMEM;
+        }
+        if (!thread_started) {
             SDL_DestroyCond(completed); SDL_DestroyCond(work);
             SDL_DestroyMutex(queue); SDL_DestroyMutex(calls);
             calls = queue = NULL; work = completed = NULL;
-            return fail(r, "cannot create the graphics API worker");
+            snprintf(r->error, r->size, "bgfx: cannot create the graphics API worker: %s",
+                     strerror(thread_error));
+            return -1;
         }
     }
-    /* Guest workers can migrate; bgfx's API always stays on this one thread. */
+#endif
     SDL_LockMutex(calls);
-    int result = invoke_worker(r);
+    int result = invoke_api(r);
     SDL_UnlockMutex(calls);
     return result;
 }
@@ -699,7 +1047,7 @@ static int draw(void *device, const gex_gpu_span *spans, size_t count,
     int result = 0;
     if ((code == 0x2c || code == 0x64) && material_changed(material)) {
         r.op = MATERIAL;
-        result = invoke_worker(&r);
+        result = invoke_api(&r);
     }
     if (!result) result = draw_target(&r);
 #if GEX_PROFILE_RENDERER
@@ -710,7 +1058,7 @@ static int draw(void *device, const gex_gpu_span *spans, size_t count,
 }
 
 int gex_bgfx_open(SDL_Window *window, char *error, size_t size) {
-    if (thread) {
+    if (thread_started) {
         snprintf(error, size, "bgfx: renderer must open before packet targets");
         return -1;
     }
@@ -721,6 +1069,9 @@ int gex_bgfx_open(SDL_Window *window, char *error, size_t size) {
 #ifdef __ANDROID__
     presentation_window = window;
 #endif
+#ifdef __EMSCRIPTEN__
+    if (window) native_window = (void *)"#canvas";
+#else
     if (window) {
         SDL_SysWMinfo info;
         SDL_VERSION(&info.version);
@@ -755,8 +1106,9 @@ int gex_bgfx_open(SDL_Window *window, char *error, size_t size) {
             snprintf(error, size, "bgfx: unsupported SDL window subsystem %d", info.subsystem);
             return -1;
         }
-        SDL_GetWindowSizeInPixels(window, &window_width, &window_height);
     }
+#endif
+    if (window) SDL_GetWindowSizeInPixels(window, &window_width, &window_height);
     request r = {.op = OPEN, .error = error, .size = size};
     return invoke(&r);
 }
@@ -787,15 +1139,56 @@ int gex_bgfx_read_present(uint8_t *rgba, char *error, size_t size) {
     request r = {.op = CAPTURE, .rgba = rgba, .error = error, .size = size};
     return invoke(&r);
 }
+#ifdef __EMSCRIPTEN__
+static int native_clear(void *device, char *error, size_t size) {
+    request r = {.op = CLEAR, .device = device, .error = error, .size = size};
+    return invoke(&r);
+}
+static int native_copy(void *destination, void *source, unsigned shade,
+                       char *error, size_t size) {
+    request r = {.op = COPY, .device = destination, .source = source, .shade = shade,
+                 .error = error, .size = size};
+    return invoke(&r);
+}
+static int native_blit(void *device, int x, int y, int width, int height,
+                       const uint8_t *pixels, int pitch, int key,
+                       char *error, size_t size) {
+    request r = {.op = BLIT, .device = device, .x = x, .y = y,
+                 .width = width, .height = height, .pixels = pixels,
+                 .pitch = pitch, .key = key, .error = error, .size = size};
+    return invoke(&r);
+}
+static int native_present(void *device, char *error, size_t size) {
+    request r = {.op = PRESENT_TARGET, .device = device, .error = error, .size = size};
+    return invoke(&r);
+}
+static void native_bind(void *device, const uint8_t *atlas, unsigned plane) {
+    (void)device; (void)atlas; (void)plane;
+}
+static int native_movie(void *device, const uint8_t *pixels, int width, int height, int pitch,
+                        char *error, size_t size) {
+    (void)device; (void)pixels; (void)width; (void)height; (void)pitch;
+    snprintf(error, size, "WebGPU movie uploads are unavailable in this build");
+    return -1;
+}
+#endif
 void gex_packet_gpu_shutdown_bgfx(void) {
-    if (!thread) return;
+    if (!thread_started) return;
     char error[512];
     request r = {.op = STOP, .error = error, .size = sizeof error};
     if (invoke(&r)) { fprintf(stderr, "[bgfx] %s\n", error); abort(); }
+#ifdef __EMSCRIPTEN__
+    pthread_join(thread, NULL); thread = 0;
+    SDL_DestroyCond(completed); SDL_DestroyCond(work);
+    SDL_DestroyMutex(queue); SDL_DestroyMutex(calls);
+    calls = queue = NULL; work = completed = NULL;
+#else
     SDL_WaitThread(thread, NULL); thread = NULL;
     SDL_DestroyCond(completed); SDL_DestroyCond(work);
     SDL_DestroyMutex(queue); SDL_DestroyMutex(calls);
     calls = queue = NULL; work = completed = NULL;
+#endif
+    thread_started = 0;
     memset(&platform, 0, sizeof platform);
     native_window = native_display = NULL;
 #ifdef __ANDROID__
@@ -804,8 +1197,21 @@ void gex_packet_gpu_shutdown_bgfx(void) {
     visible = 0;
 }
 const gex_packet_gpu *gex_packet_gpu_bgfx(void) {
+#ifdef __EMSCRIPTEN__
+    static const gex_gpu_native_ops native = {
+        .clear = native_clear,
+        .copy = native_copy,
+        .blit = native_blit,
+        .present = native_present,
+        .bind = native_bind,
+        .movie = native_movie
+    };
+#endif
     static const gex_packet_gpu api = {
         .create = create, .destroy = destroy, .upload = upload, .download = download, .draw = draw
+#ifdef __EMSCRIPTEN__
+        , .native = &native
+#endif
     };
     return &api;
 }

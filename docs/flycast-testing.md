@@ -122,7 +122,7 @@ env -u SDL_AUDIODRIVER -u SDL_VIDEODRIVER \
     XDG_DATA_HOME="$TEST_HOME/.local/share" \
     XDG_CACHE_HOME="$TEST_HOME/.cache" \
     timeout --signal=INT --kill-after=5s 900s "$FLYCAST" \
-    -config 'window:fullscreen=yes,config:pvr.rend=4,config:aica.Volume=100,audio:backend=auto,config:Debug.SerialConsoleEnabled=yes,config:Debug.GDBEnabled=no,config:Debug.FastForward=no,config:rend.vsync=yes' \
+    -config 'window:fullscreen=yes,config:pvr.rend=4,config:rend.EmulateFramebuffer=no,config:rend.RenderToTextureBuffer=no,config:aica.Volume=100,audio:backend=auto,config:Debug.SerialConsoleEnabled=yes,config:Debug.GDBEnabled=no,config:Debug.FastForward=no,config:rend.vsync=yes' \
     "$WORK/manual.cdi" 2>&1 | tee "$WORK/manual.log"
 ```
 
@@ -194,6 +194,7 @@ It supplies hidden-window mode, serial logging, muted audio, and failure/exit
 handling. Isolate `HOME` and XDG directories as above. Its fast-forward default
 is intentional for automation only; set `GEX_TEST_FAST_FORWARD=no` for timing
 comparisons. Require the appropriate readiness markers and no fatal errors.
+TODO: Document Flycast framebuffer emulation and diagnostic readback settings.
 Do not convert a manual disc into an unattended gameplay claim: autoplay and
 guest deadlines must be selected explicitly for automated tests.
 

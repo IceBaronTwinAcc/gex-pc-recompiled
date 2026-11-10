@@ -582,8 +582,8 @@ feedback remains a distinct issue to validate.
 | Fitted screens and static backdrops | `fixed_screen`, `gex_graphics_backdrop_begin/end`, scene/map identities and backdrop arena ranges | Centered UI versus tiled backdrops versus world layout; retained outgoing-screen identity and reset only on the correct scene/map change. Existing producer scopes are `0x0043F080` and `0x0040E570`. |
 | HUD | `gex_graphics_hud_begin/end`; `HUD_DRAWS` in `tools/graphics_rewrite.py` | Anchors, packet-range tags, whole-number pixel replication and original sampling/animation. Queueing untagged geometry before these ranges are classified loses the layout metadata. |
 | Display/device lifecycle | Replacements `0x00401000/0x004010A0/0x004010E0/0x00401100`; `gex_graphics_set_render_size/shutdown`; `gex_renderer_init/resize/shutdown` | Native resource allocation/reconfiguration and guest mode/format return values. Resize failure must retain the old configuration; no live viewport-resize API is presently exposed. |
-| Dreamcast GPU ownership and selection | `src/platform/dreamcast/renderer.c`, `packet_gpu.c`; `cmake/platforms/dreamcast.cmake` | PVR owns packet targets and GPU scanout through `src/packet_gpu.h`; the store-queue presenter is software-only. Native GPU pictures have no CPU pixel/history storage and forbid readback. |
-| Movies and direct RGB565/GDI frames | `src/movie.c`: `gex_movie_pump`; `gex_renderer_frame/commit`; `hle_gdi_window_surface` | Keep the RGB565 RAM-image path for desktop/software and movie ownership gate `0x451040`. PVR uploads native decoder output through its staging texture and GPU aspect-fit composition; it does not overwrite live RTT textures from the CPU. |
+| Dreamcast GPU ownership and selection | `src/platform/dreamcast/renderer.c`, `packet_gpu.c`; `cmake/platforms/dreamcast.cmake` | TODO: Document KOS-managed presentation. |
+| Movies and direct RGB565/GDI frames | `src/movie.c`: `gex_movie_pump`; `gex_renderer_frame/commit`; `hle_gdi_window_surface` | TODO: Document the RGB565 movie staging and presentation path. |
 | Observers/screenshots | `gex_renderer_observe`, commit sequence in `src/renderer.c`; `observe_frame/monitor` in `src/main.c` | Supply the actual CPU image for desktop/software, or `pixels = NULL` with a presentation sequence for GPU-owned PVR. Never label stale RAM as displayed pixels. PVR refuses CPU screenshots and pixel-based gameplay verification. |
 | Submission synchronization | Shared guest-machine lock; renderer backend callback contract | Snapshot packet/state/texture versions before returning to guest code. GPU lifetime can extend beyond the lock; fence before reusing command buffers, textures or targets. Desktop GPU APIs remain owner-thread-affine even though Dreamcast VRAM writes need no desktop context. |
 
@@ -674,17 +674,11 @@ dispatcher without this contract is insufficient.
 | CPU clear/loading artwork | Resolve ordering before overwrite; import the resulting RAM picture for display. Do not read back a fully discarded region. Preserve margins and non-picture atlas columns. |
 | CPU pause operation | Finish and materialize the 320x240 primary source before the original copy/dim/banner code, then import secondary changes. Alternatively reproduce the whole operation on the GPU, including keyed banner and integer BGR555 dimming, without running the stale-RAM CPU version. |
 | Pause presentation copy | Keep secondary-to-primary content changes coherent in both ownership domains; repeated flushes must not recapture or cumulatively dim the picture. |
-| Framebuffer texture/CLUT dependency | Check the actual sampled footprint against GPU-dirty picture regions. Finish earlier draws and obtain a versioned logical BGR555 snapshot before sampling. Never bind a simultaneously written target as an ordinary immutable texture. |
+| Framebuffer texture/CLUT dependency | TODO: Document unsupported picture sampling and its checked footprint. |
 | Presentation | Finish GPU drawing at flush, keep guest counters/return behavior, and publish that result without overwriting it from stale RAM. Movies/GDI/loading retain the independent CPU-image path. |
 | Screenshot, observer or CPU fallback | Materialize the completed actual image on demand. A fallback draw requires coherent source and destination first, and its CPU writes must be imported afterward. Report unsupported operations explicitly rather than silently showing old pixels. |
 
-Readback is therefore a dependency operation, not a mandatory per-frame
-conversion. Pause and requested observation are concrete readback boundaries;
-texture feedback must remain supported even if normal asset placement avoids
-it. Keep the original software path as a differential reference during
-implementation, and use an access-audited debug configuration to identify
-unclassified CPU accesses before enabling exclusive rendering on additional
-paths. Snapshot comparison alone cannot recover reads of stale GPU-owned RAM.
+TODO: Document framebuffer-copy pause and fade behavior and its limits.
 
 Backend feasibility still depends on conformance to the documented integer
 sampling, modulation, zero-color masking and bit-15-conditioned half blending.
@@ -2115,22 +2109,33 @@ mask-bit translucent texels use native half alpha. Direct colors use separate
 ARGB1555 alpha-mask textures. Native blending/packing are intentionally
 approximate: RGB565 device storage drops original bit-15 metadata, shading uses
 native vertex-color modulation, and a channel can round by one 5-bit level.
-Framebuffer dithering is disabled.
+Framebuffer dithering and the PVR vertical smoothing scaler are disabled.
+TODO: Document deferred shading approximation and its validation limits.
 
-Two ping-pong 512x256 textures per target hold the active 320x240 rectangle.
-VRAM also owns raw texture snapshots, the 64 KiB command buffer, an asset/movie
-upload texture and lazily allocated framebuffer-feedback snapshots. Production
-PVR targets have no CPU picture or history allocation. They accept native
+TODO: Document current PVR storage and command-buffer limits.
+TODO: Document deferred picture commands, copies, and asset texture ownership.
+TODO: Document preserved framebuffer copies, one-to-one nearest-filtered
+quads, and their resource costs.
+Repeated background prefixes replay prepared draws instead of rendering a
+separate cached background picture.
+Overlapping atlas mutations use an unreferenced texture-cache slot when
+available, preserving queued texture versions without ending their scene.
+When palette banks fill, indexed draws use temporary direct-color texture
+snapshots; opaque and half-alpha texels remain separate passes. Snapshots
+remain alive through the last scene that references them.
+Production PVR targets have no CPU picture or history allocation. They accept native
 four-vertex polygons, including skewed geometry and non-unit vertical sampling,
 rather than CPU pixel coverage. The CPU clips geometry and splits texture-wrap
 boundaries; PVR performs sampling, shading, rasterization and blending. Native packet
 generation reuses the original guest arena instead of reserving another
-megabyte. Texture validation and framebuffer-feedback fences use actual sampled
-UV bounds, avoiding unrelated wrapped framebuffer bytes at atlas page edges.
+megabyte. TODO: Document sampled UV bounds and picture overlap rejection.
 The compatibility diagnostic path retains modulation-table snapshots.
 The texture cache uses 24 LRU entries with a 4 MiB storage budget, including
 raw snapshots and both direct-color alpha masks. Eviction fences queued
 references before releasing their storage.
+
+TODO: Document compact texture snapshots under cache pressure and deferred
+clear-only target switches.
 
 CPU atlas reset/fill/upload hooks report writes before they occur. Tracked
 textures retain exact verified byte intervals per row and a constant-time
@@ -2155,9 +2160,8 @@ Native rectangular geometry aligns nearest texture samples with the original
 integer grid, including mirroring and fractional scale. Shared packet preparation
 stores integral coordinates/UVs directly; general software interpolation retains
 its floating-point arithmetic. Ordinary axis-aligned rectangles clip and submit
-directly, choosing wrap from covered pixel-center samples. Actual wrap, skew and
-picture feedback retain general clipping, with irrelevant clipping edges and
-framebuffer-boundary splits skipped. The backend, movie decoder/converter and
+directly, choosing wrap from covered pixel-center samples. Actual wrap and skew
+retain general clipping. The backend, movie decoder/converter and
 raster sources are compiled at `-O2`; lifted guest code uses `-Os` to retain
 movie-to-title heap headroom within 16 MiB. The shared scanline,
 compact-rectangle, upload/download and history contracts remain available only
@@ -2167,30 +2171,16 @@ routine instead of running their old CPU pixel loops. Atlas uploads touching
 pictures become GPU asset blits; non-picture asset uploads retain the original
 CPU copy. Fill/reset still maintain non-picture texture data.
 
-List submission, TA registration and render completion establish resource
-lifetimes before storage is reused. Double-buffered TA lists queue RGB565
-scanout behind RTT, but TA registration alone does not prove the preceding
-RTT's palette reads have completed. CPU preparation can overlap scanout;
-changed palette values retire the pending presentation before touching hardware,
-while unchanged values need no fence. Texture refresh, subsequent device
-submission and target destruction also retain their completion fences.
-Other list drains and feedback copies remain synchronous.
-Clear, target copy, dimming,
-asset composition, direct-color framebuffer-as-texture feedback and final
-scanout all execute on PVR. A feedback source is frozen by a GPU-to-GPU RTT
-copy before its ping-pong slot can be overwritten. Flush submits a textured
-quad directly to the PVR display framebuffer; it never downloads, converts
-or reuploads a completed picture.
+TODO: Document KOS scene submission, presentation, picture-sampling rejection,
+and hardware-validation status.
 
 Production pictures reject upload/download and raster materialization,
 sync/export/history calls. The renderer rejects CPU presentation/conversion
 and returns `pixels = NULL` for device-owned frames and observations. Sequence
 counts represent GPU presentations, not changed-pixel/checksum evidence.
 `--screenshot` and pixel-based `--verify-gameplay` are rejected for PVR; emulator
-scanout capture does not require a game-side readback. Indexed reinterpretation
-of framebuffer pixels, framebuffer-as-CLUT and
-CPU-source atlas uploads that reference device-owned pictures are explicitly
-unsupported rather than silently consuming stale pixels or reading them back.
+scanout capture does not require a game-side readback. TODO: Document unsupported
+picture sampling, framebuffer-as-CLUT, and picture-backed CPU-source uploads.
 
 The shared movie path decodes the original AVIs to native-size CPU RGB565
 asset data and uploads it for GPU presentation. The PVR fixture covers native
@@ -2199,6 +2189,9 @@ picture copies/draws. Normal console launches play movies by default.
 Game logic, asset decoding/transcoding, texture validation and geometry
 submission still require CPU work. No physical-hardware performance win or
 full-playthrough equivalence has been established.
+
+The historical measurements below describe the previous render-to-texture
+backend, not the current direct-framebuffer implementation.
 
 The follow-up title investigation identified CPU preparation and compatibility
 work as the dominant bottleneck, not PVR fill rate. The old scanline interface
@@ -2996,6 +2989,7 @@ An explicitly requested **manual test means visible fullscreen + gamepad input,
 Vulkan, and audible game audio**: open the application visibly in fullscreen,
 verify the controller is mapped to player one, and disable autoplay and
 fast-forward. Flycast must explicitly select `config:pvr.rend=4` (Vulkan),
+`config:rend.EmulateFramebuffer=no`,
 `config:aica.Volume=100`, and `audio:backend=auto`, without inheriting
 `SDL_AUDIODRIVER=dummy` or other automated-test audio muting. Its Vulkan backend
 is separate from the guest's `--renderer pvr`. This is the exception to the
@@ -3917,3 +3911,62 @@ fault. To investigate a similar report:
 5. Rebuild the normal game and package a new manual CDI; an already running
    emulator still executes its old disc. Preserve that live test until the
    user is ready to restart, rather than replacing a mounted CDI in place.
+
+## Dreamcast graphics integration frame budget
+
+The Dreamcast manifest compiles only `src/graphics_guest.c` with `-O3` and
+`-fomit-frame-pointer`. This covers the camera, viewport and packet-integration
+hooks that execute repeatedly during drawing. The generated game remains
+`-Os`, the PVR backend remains `-O2`, and fast-math, FP contraction and LTO
+remain disabled. KOS frame-chain stack traces cannot reliably traverse this
+file, as with the already optimized generated game and rasterizer.
+
+The normal FFmpeg/software/PVR executable gains 4,920 bytes of text with
+unchanged data and BSS sizes. This avoids applying speed optimization to the
+entire generated game, which added roughly 85 KiB for much less CPU saving.
+Palette lookup hints and renderer-only `-O3` experiments were also removed
+because they did not provide a useful improvement.
+
+Matched, isolated headless runs of the supplied Flycast used Vulkan, full MMU,
+muted audio, no fast-forward, the normal 320x240 PVR renderer and identical
+real-button input. The route walked and jumped from the Graveyard entrance
+to the first climbable wall, then released movement at player x=1225, y=862.
+Buffered samples measured active game-thread CPU and presentation intervals
+once per frame; sample output occurred only after the measured window.
+A separate PC-sampling run located hot code but was not used for timings.
+
+| Window | Baseline active CPU/frame | Optimized active CPU/frame |
+| --- | ---: | ---: |
+| Moving/jumping, scene frames 220-499 | 19.03-19.05 ms | 18.50 ms |
+| Stationary at wall, scene frames 540-939 | 15.60-15.61 ms | 15.09 ms |
+
+Baseline runs before and after the optimized run retained the same route
+endpoints and approximately 0.5 ms saving, about 3% of active CPU work.
+This is additional frame-budget headroom, not a higher frame-rate claim:
+stationary display intervals remained about 33.51 ms because the game is
+paced to two vblanks. Occasional moving-frame stalls remain. The specific
+reported wall/sky slowdown was not isolated, and these emulator measurements
+do not establish physical Dreamcast performance or whole-game smoothness.
+
+The uninstrumented normal build completed both original intro movies
+(457/867 video frames), reached title scene 63 and exited normally at its
+120-second deadline without a memory failure. This exercises the full decoder
+and movie-to-title allocation handoff, not a skip-movies memory proxy.
+A separate headless emulator scanout showed Gex and the HUD intact beside
+the first large climbable wall. Capture-and-stop is visual evidence only,
+not a normal-exit or full-playthrough check.
+
+For further work:
+
+1. Follow [Flycast testing](flycast-testing.md), retaining the supplied
+   emulator, isolated settings, serial diagnostics and bounded headless runs.
+2. Compare the same input and camera/player windows. Keep detailed callback
+   profiling and PC sampling separate from low-overhead timing controls.
+3. Buffer measurements until after the selected window. Printing the long
+   `[pvr-work]` report every 30 frames introduced roughly 130-180 ms serial
+   stalls in this investigation; do not attribute those stalls to the game.
+4. Distinguish active CPU time, presentation cadence and cold texture/disc
+   work. Preserve the two-vblank pacing, source assets and rendering semantics.
+5. Rebuild the normal executable and binary, and check full intro playback
+   through the title handoff when increasing static memory use. Do not treat
+   a skip-movies or reduced-renderer build as that memory check.

@@ -27,6 +27,9 @@ def main():
     readback = os.environ.get("GEX_TEST_RTT_READBACK", "no")
     if readback not in ("yes", "no"):
         raise ValueError("GEX_TEST_RTT_READBACK must be yes or no")
+    framebuffer = os.environ.get("GEX_TEST_FRAMEBUFFER", "no")
+    if framebuffer not in ("yes", "no"):
+        raise ValueError("GEX_TEST_FRAMEBUFFER must be yes or no")
     fast_forward = os.environ.get("GEX_TEST_FAST_FORWARD", "yes")
     vsync = os.environ.get("GEX_TEST_VSYNC", "no")
     if fast_forward not in ("yes", "no") or vsync not in ("yes", "no"):
@@ -36,7 +39,8 @@ def main():
               f"config:Debug.SerialConsoleEnabled=yes,config:Debug.FastForward={fast_forward},"
               f"rend:vsync={vsync},config:rend.vsync={vsync},config:pvr.rend=4,"
               "config:aica.Volume=0,"
-              f"config:rend.RenderToTextureBuffer={readback}")
+              f"config:rend.RenderToTextureBuffer={readback},"
+              f"config:rend.EmulateFramebuffer={framebuffer}")
     with Path(log).open("wb") as output:
         process = subprocess.Popen([flycast, "-headless", *capture, "-config", config, disc],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -60,11 +64,18 @@ def main():
                         return 0
                     exited = re.search(rb"arch: exit return code (-?[0-9]+)\r?\n", pending)
                     if exited:
-                        return int(exited[1]) or 0
+                        status = int(exited[1])
+                        if capture and not status:
+                            print("guest exited before the screenshot was captured", file=sys.stderr)
+                            return 1
+                        return status
                     if re.search(rb"(?:Out of memory|GEX: Memory Error|Unhandled exception|kernel panic:|\[win32hle\] FATAL:|arch: aborting)[^\r\n]*\r?\n", pending):
                         return 1
                     pending = pending[-256:]
                 if process.poll() is not None:
+                    if capture and process.returncode == 0:
+                        print("emulator exited before the screenshot was captured", file=sys.stderr)
+                        return 1
                     return process.returncode
                 return 124
         finally:

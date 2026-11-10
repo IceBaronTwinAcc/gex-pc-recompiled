@@ -21,6 +21,17 @@ static void *remember_device(int width, int height, char *error, size_t size) {
 }
 #define EXPECT(e) do { if (!(e)) { printf("PVR FAIL line %d: %s\n", __LINE__, #e); ++failures; } } while (0)
 static void put(unsigned at, unsigned value) { atlas[at] = value; atlas[at + 1] = value >> 8; }
+static int download_presented(const gex_packet_gpu *gpu, void *target, uint16_t *out,
+                              char *error, size_t size) {
+    if (gpu->native->present(target, error, size)) return -1;
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    for (unsigned i = 0; i < 320 * 240; ++i) {
+        unsigned c = scanout[i];
+        out[i] = (uint16_t)((c >> 11) | (c >> 1 & 0x3e0) | (c & 31) << 10);
+    }
+    return 0;
+}
 static void check(const gex_packet_gpu *gpu, void *t, gex_gpu_material *m,
                   int x, int y, int count, int u, int v) {
     char error[128] = {0};
@@ -84,7 +95,8 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
         EXPECT(!native->polygon(t, marker_quad, 0, 0, 320, 240, &marker, error, sizeof error));
         if (frame >= 4) {
             size_t after = pvr_mem_available();
-            EXPECT((before >= after ? before - after : after - before) <= 4 * (128 + 32));
+            EXPECT((before >= after ? before - after : after - before) <=
+                   288 * 2 * 128 + 4 * (128 + 32));
         }
         uint32_t first_group[16];
         for (unsigned i = 0; i < 288; ++i) {
@@ -121,11 +133,17 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
                 EXPECT(PVR_GET(PVR_PALETTE_TABLE_BASE + j * 4) == first_group[j]);
         if (frame >= 4) {
             size_t after = pvr_mem_available();
-            EXPECT((before >= after ? before - after : after - before) <= 4 * (128 + 32));
-            warmed_storage += (int64_t)before - (int64_t)after;
+            EXPECT((before >= after ? before - after : after - before) <=
+                   288 * 2 * 128 + 4 * (128 + 32));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
+        if (frame >= 4) {
+            size_t after = pvr_mem_available();
+            EXPECT((before >= after ? before - after : after - before) <=
+                   288 * 2 * 128 + 4 * (128 + 32));
+            warmed_storage += (int64_t)before - (int64_t)after;
+        }
         for (unsigned i = 0; i < 288; ++i) {
             unsigned c = (i * 17 + 1) & 255;
             unsigned expected = 1 + c % 31 + (c / 31) * 32;
@@ -142,6 +160,8 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
             EXPECT(pixels[at + 2] == 0);
         }
     }
+    if (warmed_storage < 236 * 96 || warmed_storage > 256 * 160)
+        printf("PVR warmed storage: %lld\n", (long long)warmed_storage);
     EXPECT(warmed_storage >= 236 * 96 && warmed_storage <= 256 * 160);
     /* Game initialization invalidates, clears GPU targets, then resets CPU
      * atlas data. Deferred warming must not rebuild from the old pixels. */
@@ -161,7 +181,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
         EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
     }
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned i = 0; i < 288; ++i)
         EXPECT(pixels[(180 + i / 48) * 320 + i % 48 * 3] == 0);
     native->atlas_write(atlas, 0, sizeof atlas);
@@ -171,11 +191,11 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
                                  {110, 189, 0, 1}, {107, 189, 3, 1}};
     EXPECT(!native->polygon(t, mirrored, 108, 0, 110, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     memcpy(other, pixels, sizeof pixels);
     EXPECT(!native->clear(copy, error, sizeof error));
     EXPECT(!native->polygon(copy, mirrored, 108, 0, 110, 240, &material, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned x = 107; x <= 110; ++x)
         EXPECT(pixels[188 * 320 + x] == other[188 * 320 + x]);
     /* A full PAL8 palette coexists with the warmed PAL4 layouts. */
@@ -188,7 +208,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
                            {100, 191, 0, 1}, {101, 191, 1, 1}};
     EXPECT(!native->polygon(t, dot, 0, 0, 320, 240, &large, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[190 * 320 + 100] == 0x7c00);
     material.clut = 0x6000; material.rgb = 0x808080;
     material.opcode = 0x2c;
@@ -203,7 +223,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
     dot[0].x = dot[2].x = 103; dot[1].x = dot[3].x = 104;
     EXPECT(!native->polygon(t, dot, 0, 0, 320, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[190 * 320 + 101] == 2);
     EXPECT(pixels[190 * 320 + 102] == 0x3e0);
     EXPECT(pixels[190 * 320 + 103] == 0);
@@ -218,7 +238,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
             EXPECT(!native->polygon(t, row_cell, 0, 0, 320, 240, &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         EXPECT(pixels[190 * 320 + 104] == 19);
     }
     EXPECT(!native->clear(t, error, sizeof error));
@@ -229,7 +249,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
     row_cell[0].x = row_cell[2].x = 105; row_cell[1].x = row_cell[3].x = 106;
     EXPECT(!native->polygon(t, row_cell, 0, 0, 320, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[190 * 320 + 104] == 19 && pixels[190 * 320 + 105] == 0);
     native->atlas_write_rect(atlas, 3 * 2048 + 512, 2048, 1, 2);
     atlas[3 * 2048 + 512] = atlas[4 * 2048 + 512] = 0x43;
@@ -237,7 +257,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
     row_cell[1].u = row_cell[3].u = 2;
     EXPECT(!native->polygon(t, row_cell, 0, 0, 320, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[190 * 320 + 106] == 21 && pixels[190 * 320 + 107] == 22);
     gpu->destroy(copy); gpu->destroy(t);
 }
@@ -284,7 +304,7 @@ static void shared_color_reclamation_regression(const gex_packet_gpu *gpu) {
                                     &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         for (unsigned i = 0; i < palettes; ++i)
             for (unsigned j = 0; j < 16; ++j)
                 EXPECT(pixels[(20 + i / 20) * 320 + i % 20 * 16 + j] ==
@@ -312,7 +332,7 @@ static void command_stream_regression(const gex_packet_gpu *gpu) {
      * to individual strips, and the next full clear retires the old image. */
     for (unsigned frame = 0; frame < 2; ++frame) {
         EXPECT(!native->clear(t, error, sizeof error));
-        for (unsigned i = 0; i < 600; ++i) {
+        for (unsigned i = 0; i < 900; ++i) {
             float x = i % 300, y = 10 + i / 300;
             gex_gpu_vertex cell[] = {{x, y, 0, 0}, {x + 1, y, 0, 0},
                                     {x, y + 1, 0, 0}, {x + 1, y + 1, 0, 0}};
@@ -320,13 +340,1607 @@ static void command_stream_regression(const gex_packet_gpu *gpu) {
             EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
-        for (unsigned i = 0; i < 600; ++i)
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
+        for (unsigned i = 0; i < 900; ++i)
             EXPECT(pixels[(10 + i / 300) * 320 + i % 300] ==
                    (((i + frame) & 1) ? 0x3e0 : 31));
-        EXPECT(pixels[10 * 320 + 300] == 0 && pixels[12 * 320] == 0);
+        EXPECT(pixels[10 * 320 + 300] == 0 && pixels[13 * 320] == 0);
     }
     gpu->destroy(copy); gpu->destroy(t);
+}
+
+static void deferred_command_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred command target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    for (unsigned i = 0; i < 600; ++i) {
+        float x = i % 300, y = 10 + i / 300;
+        gex_gpu_vertex cell[] = {{x, y, 0, 0}, {x + 1, y, 0, 0},
+                                 {x, y + 1, 0, 0}, {x + 1, y + 1, 0, 0}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    for (unsigned i = 0; i < 600; ++i)
+        EXPECT(pixels[(10 + i / 300) * 320 + i % 300] == 31);
+    gpu->destroy(t);
+}
+
+static void deferred_clear_switch_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst) {
+        printf("PVR clear switch targets failed: %s\n", error);
+        ++failures;
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i) other[i] = 31;
+    EXPECT(!gpu->upload(src, other, error, sizeof error));
+    EXPECT(!gpu->upload(dst, other, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->clear(dst, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(dst, error, sizeof error));
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[0] == 0 && pixels[320 * 240 - 1] == 0);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[0] == 0 && pixels[320 * 240 - 1] == 0);
+
+    EXPECT(!gpu->upload(src, other, error, sizeof error));
+    EXPECT(!gpu->upload(dst, other, error, sizeof error));
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0);
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    gpu->destroy(dst);
+    gpu->destroy(src);
+}
+
+static void deferred_picture_switch_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        printf("PVR deferred picture targets failed: %s\n", error);
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    EXPECT(!gpu->native->polygon(first, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    material.rgb = 0x00ff00;
+    EXPECT(!gpu->native->polygon(second, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    material.rgb = 0xff0000;
+    for (unsigned i = 0; i < 4; ++i) cell[i].x += 1;
+    EXPECT(!gpu->native->polygon(first, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    EXPECT(!gpu->download(first, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[20 * 320 + 11] == 0x7c00);
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    EXPECT(!gpu->download(second, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 11] == 0);
+
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    material.rgb = 0xff;
+    EXPECT(!gpu->native->polygon(first, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    material.rgb = 0x00ff00;
+    EXPECT(!gpu->native->polygon(second, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(first, second, 255, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    EXPECT(!gpu->download(first, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 11] == 0x3e0);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void deferred_picture_resources_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        printf("PVR deferred picture resources failed: %s\n", error);
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    atlas[1024] = 1;
+    put(0xc0002, 31);
+    gex_gpu_material material = {8, 0x6000, 0x2c, 0x808080, atlas, table};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 1, 0},
+                             {10, 21, 0, 1}, {11, 21, 1, 1}};
+    uint16_t asset = 31;
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    EXPECT(!gpu->native->polygon(first, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    gpu->native->atlas_write(atlas, 0xc0002, 2);
+    put(0xc0002, 0x3e0);
+    EXPECT(!gpu->native->polygon(second, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->blit(second, 12, 20, 1, 1, (const uint8_t *)&asset,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    EXPECT(!gpu->download(first, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    gpu->native->atlas_write(atlas, 0xc0002, 2);
+    put(0xc0002, 0x7c00);
+    asset = 0x3e0;
+    EXPECT(!gpu->native->blit(first, 12, 20, 1, 1, (const uint8_t *)&asset,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    EXPECT(!gpu->download(second, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 12] == 31);
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    EXPECT(!gpu->download(first, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[20 * 320 + 12] == 0x3e0);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void deferred_picture_full_blit_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 31;
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    EXPECT(!gpu->native->blit(first, 0, 0, 320, 240, (const uint8_t *)pixels,
+                              640, -1, error, sizeof error));
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0x3e0;
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    EXPECT(!gpu->native->blit(second, 0, 0, 320, 240, (const uint8_t *)pixels,
+                              640, -1, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->download(first, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    EXPECT(!gpu->download(second, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0x3e0);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void deferred_snapshot_lifetime_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *snapshot = gpu->create(320, 240, error, sizeof error);
+    void *second_snapshot = gpu->create(320, 240, error, sizeof error);
+    void *other = gpu->create(320, 240, error, sizeof error);
+    if (!source || !snapshot || !second_snapshot || !other) {
+        ++failures;
+        if (other) gpu->destroy(other);
+        if (second_snapshot) gpu->destroy(second_snapshot);
+        if (snapshot) gpu->destroy(snapshot);
+        if (source) gpu->destroy(source);
+        return;
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 31;
+    EXPECT(!gpu->native->clear(source, error, sizeof error));
+    EXPECT(!gpu->native->blit(source, 0, 0, 320, 240, (const uint8_t *)pixels,
+                              640, -1, error, sizeof error));
+    EXPECT(!gpu->native->copy(snapshot, source, 255, error, sizeof error));
+    EXPECT(!gpu->native->copy(second_snapshot, source, 255, error, sizeof error));
+    gpu->destroy(source);
+    gpu->destroy(second_snapshot);
+    uint16_t tile[64];
+    for (unsigned i = 0; i < 64; ++i) tile[i] = 0x3e0;
+    size_t available = 0;
+    for (unsigned frame = 0; frame < 200; ++frame) {
+        EXPECT(!gpu->native->clear(other, error, sizeof error));
+        EXPECT(!gpu->native->blit(other, 0, 0, 8, 8, (const uint8_t *)tile,
+                                  16, -1, error, sizeof error));
+        EXPECT(!gpu->download(other, pixels, error, sizeof error));
+        EXPECT(pixels[0] == 0x3e0);
+        if (!frame) available = pvr_mem_available();
+        else EXPECT(pvr_mem_available() == available);
+    }
+    EXPECT(!gpu->download(snapshot, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    gpu->destroy(other);
+    gpu->destroy(snapshot);
+}
+
+static void deferred_snapshot_cache_lifetime_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *snapshot = gpu->create(320, 240, error, sizeof error);
+    void *other = gpu->create(320, 240, error, sizeof error);
+    if (!source || !snapshot || !other) {
+        ++failures;
+        if (other) gpu->destroy(other);
+        if (snapshot) gpu->destroy(snapshot);
+        if (source) gpu->destroy(source);
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    put(1024, 31);
+    gex_gpu_material material = {8 | 2 << 7, 0, 0x2c, 0x808080, atlas, table};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 1, 0},
+                             {10, 21, 0, 1}, {11, 21, 1, 1}};
+    EXPECT(!gpu->native->clear(source, error, sizeof error));
+    EXPECT(!gpu->native->polygon(source, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(snapshot, source, 255, error, sizeof error));
+    gpu->destroy(source);
+    size_t available = 0;
+    for (unsigned frame = 0; frame < 60; ++frame) {
+        EXPECT(!gpu->native->clear(other, error, sizeof error));
+        for (unsigned i = 0; i < 30; ++i) {
+            gpu->native->atlas_write(atlas, 1024, 2);
+            put(1024, 1 + (frame + i) % 30);
+            EXPECT(!gpu->native->polygon(other, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        EXPECT(!gpu->download(other, pixels, error, sizeof error));
+        EXPECT(pixels[20 * 320 + 10] == 1 + (frame + 29) % 30);
+        if (frame == 5) available = pvr_mem_available();
+        if (frame > 5)
+            EXPECT(pvr_mem_available() + 128 * 1024 >= available);
+    }
+    EXPECT(!gpu->download(snapshot, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    gpu->destroy(other);
+    gpu->destroy(snapshot);
+}
+
+static void deferred_blit_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred blit target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    uint16_t asset[] = {31, 0, 0x3e0};
+    EXPECT(!gpu->native->blit(t, 10, 10, 3, 1, (const uint8_t *)asset,
+                              6, 0, error, sizeof error));
+    asset[0] = 0x7c00;
+    asset[2] = 31;
+    EXPECT(!gpu->native->blit(t, 15, 10, 3, 1, (const uint8_t *)asset,
+                              6, 0, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[10 * 320 + 10] == 31 && pixels[10 * 320 + 11] == 0 &&
+           pixels[10 * 320 + 12] == 0x3e0);
+    EXPECT(pixels[10 * 320 + 15] == 0x7c00 && pixels[10 * 320 + 16] == 0 &&
+           pixels[10 * 320 + 17] == 31);
+
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    asset[0] = 31;
+    EXPECT(!gpu->native->blit(t, 10, 10, 3, 1, (const uint8_t *)asset,
+                              6, 0, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    for (unsigned i = 0; i < 765; ++i) {
+        float x = i % 300, y = 50 + i / 300;
+        gex_gpu_vertex cell[] = {{x, y, 0, 0}, {x + 1, y, 0, 0},
+                                 {x, y + 1, 0, 0}, {x + 1, y + 1, 0, 0}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    asset[0] = 0x3e0;
+    EXPECT(!gpu->native->blit(t, 15, 10, 3, 1, (const uint8_t *)asset,
+                              6, 0, error, sizeof error));
+    asset[0] = 0x7c00;
+    EXPECT(!gpu->native->blit(t, 20, 10, 3, 1, (const uint8_t *)asset,
+                              6, 0, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[10 * 320 + 10] == 31 && pixels[10 * 320 + 15] == 0x3e0 &&
+           pixels[10 * 320 + 20] == 0x7c00);
+
+    for (unsigned i = 0; i < 320 * 240; ++i) other[i] = 31;
+    EXPECT(!gpu->native->blit(t, 0, 0, 320, 240, (const uint8_t *)other,
+                              640, -1, error, sizeof error));
+    other[0] = 0x3e0;
+    EXPECT(!gpu->native->blit(t, 15, 10, 1, 1, (const uint8_t *)other,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[0] == 31 && pixels[10 * 320 + 15] == 0x3e0 &&
+           pixels[10 * 320 + 16] == 31);
+    gpu->destroy(t);
+}
+
+static void deferred_copy_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    EXPECT(gpu->native->copy(NULL, NULL, 255, error, sizeof error) != 0);
+    EXPECT(strstr(error, "invalid PVR framebuffer copy target") != NULL);
+    error[0] = 0;
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst) {
+        printf("PVR deferred copy targets failed: %s\n", error);
+        ++failures;
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i) other[i] = 31;
+    EXPECT(!gpu->upload(src, other, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(dst, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[0] == 31 && pixels[320 * 240 - 1] == 31);
+
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->copy(src, src, 255, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(src, error, sizeof error));
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[0] == 0);
+
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    gpu->destroy(src);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[0] == 0);
+    gpu->destroy(dst);
+}
+
+static void deferred_picture_snapshot_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst) {
+        printf("PVR deferred snapshot targets failed: %s\n", error);
+        ++failures;
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(src, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    material.rgb = 0x00ff00;
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0x3e0);
+    gpu->destroy(dst);
+    gpu->destroy(src);
+}
+
+static void bound_destroy_regression(const gex_packet_gpu *gpu, int saved) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *snapshot = gpu->create(320, 240, error, sizeof error);
+    void *other_target = gpu->create(320, 240, error, sizeof error);
+    if (!src || !snapshot || !other_target) {
+        ++failures;
+        if (other_target) gpu->destroy(other_target);
+        if (snapshot) gpu->destroy(snapshot);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    gpu->native->bind(src, atlas, 0);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->blit(src, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->copy(snapshot, src, 255, error, sizeof error));
+    if (saved) {
+        color = 0x3e0;
+        EXPECT(!gpu->native->clear(other_target, error, sizeof error));
+        EXPECT(!gpu->native->blit(other_target, 11, 20, 1, 1, (const uint8_t *)&color,
+                                  2, -1, error, sizeof error));
+    } else {
+        color = 0x3e0;
+        EXPECT(!gpu->native->blit(src, 11, 20, 1, 1, (const uint8_t *)&color,
+                                  2, -1, error, sizeof error));
+    }
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    gpu->destroy(src);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->download(snapshot, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    if (saved) {
+        EXPECT(!gpu->download(other_target, pixels, error, sizeof error));
+        EXPECT(pixels[20 * 320 + 11] == 0x3e0);
+    }
+    gpu->destroy(other_target);
+    gpu->destroy(snapshot);
+}
+
+static void movie_upload_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    uint8_t *buffer = malloc(641 * 240 + 32);
+    if (!t || !buffer) {
+        ++failures;
+        if (t) gpu->destroy(t);
+        free(buffer);
+        return;
+    }
+    for (unsigned unaligned = 0; unaligned < 2; ++unaligned) {
+        uint8_t *source = (uint8_t *)(((uintptr_t)buffer + 31) & ~(uintptr_t)31);
+        int pitch = unaligned ? 641 : 640;
+        source += unaligned;
+        for (int y = 0; y < 240; ++y)
+            for (int x = 0; x < 320; ++x) {
+                unsigned value = x < 160 ? 0xf800 : 0x07e0;
+                source[y * pitch + x * 2] = value;
+                source[y * pitch + x * 2 + 1] = value >> 8;
+            }
+        EXPECT(!gpu->native->movie(t, source, 320, 240, pitch, error, sizeof error));
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        EXPECT(pixels[0] == 31 && pixels[319] == 0x3e0);
+        EXPECT(pixels[239 * 320] == 31 && pixels[239 * 320 + 319] == 0x3e0);
+    }
+    free(buffer);
+    gpu->destroy(t);
+}
+
+static void presented_feedback_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        ++failures;
+        return;
+    }
+    gpu->native->bind(t, atlas, 0);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->blit(t, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    gex_gpu_vertex q[] = {{40, 40, 10, 20}, {41, 40, 11, 20},
+                          {40, 41, 10, 21}, {41, 41, 11, 21}};
+    gex_gpu_material material = {256, 0, 0x2c, 0x808080, atlas, table};
+    EXPECT(gpu->native->polygon(t, q, 0, 0, 320, 240, &material,
+                                error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800 && scanout[40 * 320 + 40] == 0);
+    gpu->destroy(t);
+}
+
+static void pending_feedback_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *destination = gpu->create(320, 240, error, sizeof error);
+    if (!source || !destination) {
+        ++failures;
+        if (destination) gpu->destroy(destination);
+        if (source) gpu->destroy(source);
+        return;
+    }
+    gpu->native->bind(source, atlas, 0);
+    gpu->native->bind(destination, atlas, 1);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(source, error, sizeof error));
+    EXPECT(!gpu->native->blit(source, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    gex_gpu_vertex q[] = {{40, 40, 10, 20}, {41, 40, 11, 20},
+                          {40, 41, 10, 21}, {41, 41, 11, 21}};
+    gex_gpu_material material = {256, 0, 0x2c, 0x808080, atlas, table};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(gpu->native->polygon(source, q, 0, 0, 320, 240, &material,
+                                error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(source, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    EXPECT(scanout[40 * 320 + 40] == 0);
+
+    color = 0x3e0;
+    EXPECT(!gpu->native->blit(source, 11, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    q[0].u = q[2].u = 11;
+    q[1].u = q[3].u = 12;
+    EXPECT(!gpu->native->clear(destination, error, sizeof error));
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(gpu->native->polygon(destination, q, 0, 0, 320, 240, &material,
+                                error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(destination, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[40 * 320 + 40] == 0);
+    EXPECT(!gpu->native->present(source, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    EXPECT(scanout[20 * 320 + 11] == 0x07e0);
+    gpu->destroy(destination);
+    gpu->destroy(source);
+}
+
+static void repeated_pending_feedback_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        ++failures;
+        return;
+    }
+    gpu->native->bind(t, atlas, 0);
+    uint16_t colors[32];
+    for (unsigned i = 0; i < 32; ++i)
+        colors[i] = i | i << 5 | i << 10;
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->blit(t, 10, 20, 32, 1, (const uint8_t *)colors,
+                              64, -1, error, sizeof error));
+    gex_gpu_vertex q[] = {{10, 20, 10, 20}, {42, 20, 42, 20},
+                          {10, 21, 10, 21}, {42, 21, 42, 21}};
+    gex_gpu_material material = {256, 0, 0x2c, 0x808080, atlas, table};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    for (unsigned i = 0; i < 16; ++i)
+        EXPECT(gpu->native->polygon(t, q, 0, 0, 320, 240, &material,
+                                    error, sizeof error) != 0);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    for (unsigned i = 0; i < 32; ++i)
+        EXPECT(scanout[20 * 320 + 10 + i] == (i << 11 | (i << 1 | i >> 4) << 5 | i));
+    gpu->destroy(t);
+}
+
+static void independent_destroy_regression(const gex_packet_gpu *gpu, int mode) {
+    char error[256] = {0};
+    void *bound = gpu->create(320, 240, error, sizeof error);
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *destination = gpu->create(320, 240, error, sizeof error);
+    if (!bound || !source || !destination) {
+        ++failures;
+        if (destination) gpu->destroy(destination);
+        if (source) gpu->destroy(source);
+        if (bound) gpu->destroy(bound);
+        return;
+    }
+    void *painted = mode ? bound : source;
+    gpu->native->bind(bound, atlas, 0);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(painted, error, sizeof error));
+    EXPECT(!gpu->native->blit(painted, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(painted, error, sizeof error));
+    EXPECT(!gpu->native->copy(destination, painted, 255, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    gpu->destroy(bound);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(destination, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    gpu->destroy(destination);
+    gpu->destroy(source);
+}
+
+static void picture_copy_lifetime_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *destination = gpu->create(320, 240, error, sizeof error);
+    void *copy = gpu->create(320, 240, error, sizeof error);
+    void *other_target = gpu->create(320, 240, error, sizeof error);
+    if (!source || !destination || !copy || !other_target) {
+        ++failures;
+        if (other_target) gpu->destroy(other_target);
+        if (copy) gpu->destroy(copy);
+        if (destination) gpu->destroy(destination);
+        if (source) gpu->destroy(source);
+        return;
+    }
+    gpu->native->bind(source, atlas, 0);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(source, error, sizeof error));
+    EXPECT(!gpu->native->blit(source, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(source, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    color = 0x3e0;
+    EXPECT(!gpu->native->copy(destination, source, 255, error, sizeof error));
+    EXPECT(!gpu->native->blit(destination, 11, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->copy(copy, destination, 255, error, sizeof error));
+    EXPECT(!gpu->native->clear(other_target, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    color = 0x7c00;
+    EXPECT(!gpu->native->clear(source, error, sizeof error));
+    EXPECT(!gpu->native->blit(source, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(source, error, sizeof error));
+    EXPECT(!gpu->native->copy(other_target, source, 255, error, sizeof error));
+    EXPECT(!gpu->native->present(other_target, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0x001f);
+    gpu->destroy(source);
+    gpu->destroy(destination);
+    EXPECT(!gpu->native->present(copy, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    EXPECT(scanout[20 * 320 + 11] == 0x07e0);
+    gpu->destroy(other_target);
+    gpu->destroy(copy);
+}
+
+static void picture_clut_rejection_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *front = gpu->create(320, 240, error, sizeof error);
+    void *back = gpu->create(320, 240, error, sizeof error);
+    if (!front || !back) {
+        ++failures;
+        if (back) gpu->destroy(back);
+        if (front) gpu->destroy(front);
+        return;
+    }
+    gpu->native->bind(front, atlas, 0);
+    gpu->native->bind(back, atlas, 1);
+    gex_gpu_vertex q[] = {{10, 10, 0, 0}, {26, 10, 16, 0},
+                          {10, 26, 0, 16}, {26, 26, 16, 16}};
+    gex_gpu_material material = {8, 8 * 2048 / 32, 0x2c, 0x808080, atlas, table};
+    EXPECT(gpu->native->polygon(front, q, 0, 0, 320, 240,
+                                &material, error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer-as-CLUT") != NULL);
+    material.page = 8 | 128;
+    for (unsigned plane = 0; plane < 2; ++plane) {
+        material.clut = ((7 + plane * 240) * 2048 + 1824) / 32;
+        EXPECT(gpu->native->polygon(front, q, 0, 0, 320, 240,
+                                    &material, error, sizeof error) != 0);
+        EXPECT(strstr(error, "framebuffer-as-CLUT") != NULL);
+    }
+    material.clut = (7 * 2048 + 1536) / 32;
+    EXPECT(!gpu->native->polygon(front, q, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    material.clut = 8 * 2048 / 32;
+    EXPECT(!gpu->native->polygon(front, q, 30, 30, 320, 240,
+                                 &material, error, sizeof error));
+    gpu->destroy(back);
+    gpu->destroy(front);
+}
+
+static void preserved_pixel_mapping_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *front = gpu->create(320, 240, error, sizeof error);
+    void *back = gpu->create(320, 240, error, sizeof error);
+    if (!front || !back) {
+        ++failures;
+        if (back) gpu->destroy(back);
+        if (front) gpu->destroy(front);
+        return;
+    }
+    gpu->native->bind(front, atlas, 0);
+    gpu->native->bind(back, atlas, 1);
+    for (unsigned y = 0; y < 240; ++y)
+        for (unsigned x = 0; x < 320; ++x)
+            pixels[y * 320 + x] = (uint16_t)(((x * 3 + y) & 31) |
+                                            (((x + y * 5) & 31) << 5) |
+                                            (((x * 7 + y * 11) & 31) << 10));
+    EXPECT(!gpu->native->blit(front, 0, 0, 320, 240, (const uint8_t *)pixels,
+                              640, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(front, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    unsigned initial_mismatch = 0;
+    for (unsigned i = 0; i < 320 * 240; ++i) {
+        unsigned c = pixels[i], green = c >> 5 & 31;
+        unsigned expected = (c & 31) << 11 | (green << 1 | green >> 4) << 5 |
+                            (c >> 10 & 31);
+        other[i] = scanout[i];
+        if (other[i] != expected) {
+            if (!initial_mismatch)
+                printf("PVR source pixel mismatch: x=%u y=%u actual=%x expected=%x\n",
+                       i % 320, i / 320, other[i], expected);
+            ++initial_mismatch;
+        }
+    }
+    EXPECT(!initial_mismatch);
+    for (unsigned frame = 0; frame < 40; ++frame) {
+        uint16_t red = 31;
+        for (unsigned draw = 0; draw < 40; ++draw) {
+            unsigned x = (frame * 39 + draw * 47) % 320;
+            unsigned y = (frame * 29 + draw * 31) % 240;
+            EXPECT(!gpu->native->blit(front, x, y, 1, 1, (const uint8_t *)&red,
+                                      2, -1, error, sizeof error));
+            other[y * 320 + x] = 0xf800;
+        }
+        EXPECT(!gpu->native->present(front, error, sizeof error));
+        scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+        unsigned mismatch = 0;
+        for (unsigned i = 0; i < 320 * 240; ++i) {
+            if (scanout[i] != other[i]) {
+                if (!mismatch)
+                    printf("PVR preserved pixel mismatch: frame=%u x=%u y=%u actual=%x expected=%x\n",
+                           frame, i % 320, i / 320, scanout[i], other[i]);
+                ++mismatch;
+            }
+        }
+        EXPECT(!mismatch);
+    }
+    EXPECT(!gpu->native->copy(back, front, 255, error, sizeof error));
+    EXPECT(!gpu->native->present(back, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    unsigned mismatch = 0;
+    for (unsigned i = 0; i < 320 * 240; ++i) mismatch += scanout[i] != other[i];
+    EXPECT(!mismatch);
+    gpu->destroy(back);
+    gpu->destroy(front);
+}
+
+static void pause_fade_presentation_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *front = gpu->create(320, 240, error, sizeof error);
+    void *back = gpu->create(320, 240, error, sizeof error);
+    void *capture = gpu->create(320, 240, error, sizeof error);
+    void *shaded = gpu->create(320, 240, error, sizeof error);
+    if (!front || !back || !capture || !shaded) {
+        ++failures;
+        if (shaded) gpu->destroy(shaded);
+        if (capture) gpu->destroy(capture);
+        if (back) gpu->destroy(back);
+        if (front) gpu->destroy(front);
+        return;
+    }
+    gpu->native->bind(front, atlas, 0);
+    gpu->native->bind(back, atlas, 1);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(front, error, sizeof error));
+    EXPECT(!gpu->native->blit(front, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->copy(back, front, 127, error, sizeof error));
+    color = 0x7c00;
+    EXPECT(!gpu->native->blit(back, 11, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->copy(front, back, 255, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->present(back, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    unsigned paused = scanout[20 * 320 + 10];
+    EXPECT((paused >> 11) >= 14 && (paused >> 11) <= 16);
+    EXPECT(scanout[20 * 320 + 11] == 0x001f);
+    EXPECT(!gpu->native->copy(front, back, 255, error, sizeof error));
+    EXPECT(!gpu->native->present(back, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->native->present(front, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->copy(capture, front, 255, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    color = 0x3e0;
+    EXPECT(!gpu->native->blit(front, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(front, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0x07e0);
+    const unsigned shades[] = {255, 127, 0, 255};
+    for (unsigned i = 0; i < sizeof shades / sizeof shades[0]; ++i) {
+        EXPECT(!gpu->native->copy(shaded, capture, shades[i], error, sizeof error));
+        EXPECT(!gpu->native->present(shaded, error, sizeof error));
+        scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+        unsigned value = scanout[20 * 320 + 10];
+        if (shades[i] == 255) EXPECT(value == paused);
+        else if (!shades[i]) EXPECT(value == 0);
+        else EXPECT((value >> 11) >= 6 && (value >> 11) <= 8);
+        if (shades[i] == 255) EXPECT(scanout[20 * 320 + 11] == 0x001f);
+    }
+    gpu->destroy(shaded);
+    gpu->destroy(capture);
+    gpu->destroy(back);
+    gpu->destroy(front);
+}
+
+static void inactive_picture_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    gpu->native->bind(first, atlas, 0);
+    gpu->native->bind(second, atlas, 1);
+    uint16_t color = 31;
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    EXPECT(!gpu->native->blit(first, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    color = 0x3e0;
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    EXPECT(!gpu->native->blit(second, 11, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800 && scanout[20 * 320 + 11] == 0);
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0 && scanout[20 * 320 + 11] == 0x07e0);
+    color = 0x7c00;
+    EXPECT(!gpu->native->blit(first, 12, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800 && scanout[20 * 320 + 12] == 0x001f);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void inactive_texture_replay_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    gpu->native->bind(first, atlas, 0);
+    gpu->native->bind(second, atlas, 1);
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    atlas[512] = 1;
+    put(0xc0402, 31);
+    gex_gpu_vertex q[] = {{10, 20, 0, 0}, {11, 20, 1, 0},
+                          {10, 21, 0, 1}, {11, 21, 1, 1}};
+    gex_gpu_material material = {4, 0x6020, 0x2c, 0x808080, atlas, table};
+    EXPECT(!gpu->native->clear(first, error, sizeof error));
+    EXPECT(!gpu->native->polygon(first, q, 0, 0, 320, 240, &material,
+                                 error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    gpu->native->atlas_write(atlas, 0xc0402, 2);
+    put(0xc0402, 0x3e0);
+    EXPECT(!gpu->native->clear(second, error, sizeof error));
+    EXPECT(!gpu->native->polygon(second, q, 0, 0, 320, 240, &material,
+                                 error, sizeof error));
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0x07e0);
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0x07e0);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void inactive_movie_replay_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *first = gpu->create(320, 240, error, sizeof error);
+    void *second = gpu->create(320, 240, error, sizeof error);
+    if (!first || !second) {
+        ++failures;
+        if (second) gpu->destroy(second);
+        if (first) gpu->destroy(first);
+        return;
+    }
+    gpu->native->bind(first, atlas, 0);
+    gpu->native->bind(second, atlas, 1);
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0xf800;
+    EXPECT(!gpu->native->movie(first, (const uint8_t *)pixels, 320, 240, 640,
+                               error, sizeof error));
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0x07e0;
+    EXPECT(!gpu->native->movie(second, (const uint8_t *)pixels, 320, 240, 640,
+                               error, sizeof error));
+    EXPECT(!gpu->native->present(first, error, sizeof error));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0xf800);
+    EXPECT(!gpu->native->present(second, error, sizeof error));
+    scanout = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(scanout[20 * 320 + 10] == 0x07e0);
+    gpu->destroy(second);
+    gpu->destroy(first);
+}
+
+static void bound_command_capacity_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        ++failures;
+        return;
+    }
+    gpu->native->bind(t, atlas, 0);
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60};
+    unsigned submitted = 0;
+    for (unsigned i = 0; i < 1800; ++i) {
+        float x = i % 280, y = 10 + i / 280;
+        gex_gpu_vertex q[] = {{x, y, 0, 0}, {x + 1, y, 0, 0},
+                              {x, y + 1, 0, 0}, {x + 1, y + 1, 0, 0}};
+        material.rgb = i & 1 ? 0x00ff00 : 0x0000ff;
+        if (gpu->native->polygon(t, q, 0, 0, 320, 240, &material,
+                                 error, sizeof error)) {
+            EXPECT(strstr(error, "intermediate scene required") != NULL);
+            break;
+        }
+        ++submitted;
+    }
+    EXPECT(submitted >= 1400 && submitted < 1800);
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    const volatile uint16_t *scanout =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    for (unsigned i = 0; i < submitted; ++i)
+        EXPECT(scanout[(10 + i / 280) * 320 + i % 280] ==
+               ((i & 1) ? 0x07e0 : 0xf800));
+    gpu->destroy(t);
+}
+
+static void deferred_saved_picture_copy_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    void *other_target = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst || !other_target) {
+        ++failures;
+        if (other_target) gpu->destroy(other_target);
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    uint16_t color = 0x7c00;
+    EXPECT(!gpu->native->clear(dst, error, sizeof error));
+    EXPECT(!gpu->native->blit(dst, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    color = 31;
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->blit(src, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    color = 0x3e0;
+    EXPECT(!gpu->native->clear(other_target, error, sizeof error));
+    EXPECT(!gpu->native->blit(other_target, 10, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    EXPECT(!gpu->native->copy(other_target, src, 255, error, sizeof error));
+    color = 0x3e0;
+    EXPECT(!gpu->native->blit(other_target, 11, 20, 1, 1, (const uint8_t *)&color,
+                              2, -1, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    gpu->destroy(src);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    EXPECT(!gpu->download(other_target, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[20 * 320 + 11] == 0x3e0);
+    gpu->destroy(other_target);
+    gpu->destroy(dst);
+}
+
+static void deferred_incremental_copy_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    void *other_target = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst || !other_target) {
+        ++failures;
+        if (other_target) gpu->destroy(other_target);
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 31;
+    EXPECT(!gpu->upload(src, pixels, error, sizeof error));
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0x7c00;
+    EXPECT(!gpu->upload(dst, pixels, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0x00ff00};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(dst, src, 255, error, sizeof error));
+    for (unsigned i = 0; i < 4; ++i) ++cell[i].x;
+    material.rgb = 0xff0000;
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->clear(other_target, error, sizeof error));
+    material.rgb = 0xff;
+    EXPECT(!gpu->native->polygon(other_target, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(other_target, src, 255, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 9] == 31 &&
+           pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 11] == 31);
+    EXPECT(!gpu->download(other_target, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 9] == 31 &&
+           pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 11] == 0x7c00);
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 9] == 31 &&
+           pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 11] == 0x7c00);
+    gpu->destroy(other_target);
+    gpu->destroy(dst);
+    gpu->destroy(src);
+}
+
+static void deferred_black_copy_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *src = gpu->create(320, 240, error, sizeof error);
+    void *dst = gpu->create(320, 240, error, sizeof error);
+    if (!src || !dst) {
+        ++failures;
+        if (dst) gpu->destroy(dst);
+        if (src) gpu->destroy(src);
+        return;
+    }
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 0, 0},
+                             {10, 21, 0, 0}, {11, 21, 0, 0}};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(src, error, sizeof error));
+    EXPECT(!gpu->native->polygon(src, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->copy(dst, src, 0, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->download(dst, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0);
+    EXPECT(!gpu->download(src, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31);
+    gpu->destroy(dst);
+    gpu->destroy(src);
+}
+
+static void deferred_shading_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *source = gpu->create(320, 240, error, sizeof error);
+    void *reference = gpu->create(320, 240, error, sizeof error);
+    void *candidate = gpu->create(320, 240, error, sizeof error);
+    void *result = gpu->create(320, 240, error, sizeof error);
+    if (!source || !reference || !candidate || !result) {
+        ++failures;
+        if (result) gpu->destroy(result);
+        if (candidate) gpu->destroy(candidate);
+        if (reference) gpu->destroy(reference);
+        if (source) gpu->destroy(source);
+        return;
+    }
+    for (unsigned shade = 1; shade < 255; ++shade) {
+        for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = i & 0x7fff;
+        EXPECT(!gpu->upload(source, pixels, error, sizeof error));
+        EXPECT(!gpu->upload(candidate, pixels, error, sizeof error));
+        gex_gpu_material material = {.opcode = 0x62};
+        for (unsigned strip = 0; strip < 16; ++strip) {
+            float left = strip * 20, right = left + 20;
+            gex_gpu_vertex fill[] = {{left, 0, 0, 0}, {right, 0, 0, 0},
+                                     {left, 240, 0, 0}, {right, 240, 0, 0}};
+            material.rgb = (strip * 17) | ((255 - strip * 17) << 8) |
+                           ((strip * 73 & 255) << 16);
+            EXPECT(!gpu->native->polygon(source, fill, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        EXPECT(!gpu->download(source, pixels, error, sizeof error));
+        EXPECT(!gpu->native->copy(reference, source, shade, error, sizeof error));
+        EXPECT(!gpu->native->present(reference, error, sizeof error));
+        const volatile uint16_t *display =
+            (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+        for (unsigned i = 0; i < 320 * 240; ++i) other[i] = display[i];
+        for (unsigned strip = 0; strip < 16; ++strip) {
+            float left = strip * 20, right = left + 20;
+            gex_gpu_vertex fill[] = {{left, 0, 0, 0}, {right, 0, 0, 0},
+                                     {left, 240, 0, 0}, {right, 240, 0, 0}};
+            material.rgb = (strip * 17) | ((255 - strip * 17) << 8) |
+                           ((strip * 73 & 255) << 16);
+            EXPECT(!gpu->native->polygon(candidate, fill, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        vid_waitvbl();
+        pvr_stats_t before, after;
+        EXPECT(!pvr_get_stats(&before));
+        EXPECT(!gpu->native->copy(result, candidate, shade, error, sizeof error));
+        vid_waitvbl();
+        EXPECT(!pvr_get_stats(&after));
+        EXPECT(after.frame_count == before.frame_count);
+        EXPECT(!gpu->native->present(result, error, sizeof error));
+        display = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+        unsigned max_error = 0;
+        for (unsigned i = 0; i < 320 * 240; ++i) {
+            unsigned a = display[i], b = other[i];
+            unsigned d = abs((int)(a >> 11) - (int)(b >> 11));
+            if (d > max_error) max_error = d;
+            d = abs((int)(a >> 5 & 63) - (int)(b >> 5 & 63));
+            if (d > max_error) max_error = d;
+            d = abs((int)(a & 31) - (int)(b & 31));
+            if (d > max_error) max_error = d;
+        }
+        if (max_error > 1) printf("PVR shade %u maximum error: %u\n", shade, max_error);
+        EXPECT(max_error <= 1);
+    }
+    gpu->destroy(result);
+    gpu->destroy(candidate);
+    gpu->destroy(reference);
+    gpu->destroy(source);
+}
+
+static void deferred_background_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred background target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->bind(t, atlas, 0);
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        vid_waitvbl();
+        pvr_stats_t before, after;
+        EXPECT(!pvr_get_stats(&before));
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        for (unsigned i = 0; i < 20; ++i) {
+            float x = i * 4;
+            gex_gpu_vertex tile[] = {{x, 20, 0, 0}, {x + 4, 20, 0, 0},
+                                     {x, 24, 0, 0}, {x + 4, 24, 0, 0}};
+            EXPECT(!gpu->native->polygon(t, tile, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        vid_waitvbl();
+        EXPECT(!pvr_get_stats(&after));
+        EXPECT(after.frame_count == before.frame_count);
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        EXPECT(!pvr_get_stats(&after));
+        EXPECT(after.frame_count == before.frame_count + 1);
+        const volatile uint16_t *display =
+            (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+        EXPECT(display[20 * 320] == 0xf800 && display[20 * 320 + 79] == 0xf800);
+    }
+    gpu->destroy(t);
+}
+
+static void deferred_texture_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred texture target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    const unsigned colors[] = {31, 0x3e0, 0x7c00};
+    gex_gpu_material material = {8 | 2 << 7, 0, 0x2c, 0x808080, atlas, table};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    for (unsigned i = 0; i < 3; ++i) {
+        gpu->native->atlas_write(atlas, 1024, 2);
+        put(1024, colors[i]);
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count + 1);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    for (unsigned i = 0; i < 3; ++i)
+        EXPECT(pixels[20 * 320 + 10 + i] == colors[i]);
+    gpu->destroy(t);
+}
+
+static void deferred_texture_pressure_regression(const gex_packet_gpu *gpu, unsigned format) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR texture pressure target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    for (unsigned i = 1; i < 16; ++i) put(0xc0000 + i * 2, i);
+    gex_gpu_material material = {8 | format << 7, 0x6000, 0x2c, 0x808080, atlas, table};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    const volatile uint16_t *display =
+        (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    uint16_t previous_display = display[20 * 320 + 10];
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    for (unsigned i = 0; i < 30; ++i) {
+        gpu->native->atlas_write(atlas, 1024, format == 2 ? 2 : 1);
+        if (format == 2) put(1024, i + 1);
+        else atlas[1024] = (uint8_t)(i % 15 + 1);
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    display = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(display[20 * 320 + 10] == previous_display);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    display = (const volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    EXPECT(display[20 * 320 + 10] == 0x0800);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    for (unsigned i = 0; i < 30; ++i)
+        EXPECT(pixels[20 * 320 + 10 + i] == (format == 2 ? i + 1 : i % 15 + 1));
+    gpu->destroy(t);
+}
+
+static void deferred_alpha_texture_pressure_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR alpha texture pressure target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    gex_gpu_material background = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex fill[] = {{0, 0, 0, 0}, {320, 0, 0, 0},
+                             {0, 240, 0, 0}, {320, 240, 0, 0}};
+    EXPECT(!gpu->native->polygon(t, fill, 0, 0, 320, 240,
+                                 &background, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    gex_gpu_material material = {8 | 2 << 7, 0, 0x2e, 0x808080, atlas, table};
+    for (unsigned i = 0; i < 30; ++i) {
+        gpu->native->atlas_write(atlas, 1024, 2);
+        put(1024, 0x8000 | (i + 1) << 5);
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    for (unsigned i = 0; i < 30; ++i) {
+        unsigned pixel = pixels[20 * 320 + 10 + i];
+        unsigned green = pixel >> 5 & 31;
+        EXPECT((pixel & 31) >= 14 && (pixel & 31) <= 16);
+        EXPECT(green >= i / 2 && green <= i / 2 + 2);
+        EXPECT((pixel >> 10 & 31) == 0);
+    }
+    gpu->destroy(t);
+}
+
+static void deferred_palette_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred palette target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    atlas[1024] = 1;
+    for (unsigned i = 0; i < 65; ++i)
+        for (unsigned j = 0; j < 16; ++j)
+            put(0xc0000 + i * 32 + j * 2, 1 + i * 16 + j);
+    gex_gpu_material material = {8, 0x6000, 0x2c, 0x808080, atlas, table};
+    for (unsigned frame = 0; frame < 2; ++frame) {
+        if (frame) {
+            gpu->native->atlas_write(atlas, 0xc0000 + 64 * 32 + 2, 2);
+            put(0xc0000 + 64 * 32 + 2, 0x8000 | 0x3e0);
+            material.opcode = 0x2e;
+        }
+        vid_waitvbl();
+        pvr_stats_t before, after;
+        EXPECT(!pvr_get_stats(&before));
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        if (frame) {
+            gex_gpu_material background = {.opcode = 0x60, .rgb = 0xff};
+            gex_gpu_vertex fill[] = {{0, 0, 0, 0}, {320, 0, 0, 0},
+                                     {0, 240, 0, 0}, {320, 240, 0, 0}};
+            EXPECT(!gpu->native->polygon(t, fill, 0, 0, 320, 240,
+                                         &background, error, sizeof error));
+        }
+        for (unsigned i = 0; i < 65; ++i) {
+            material.clut = 0x6000 + i;
+            float x = 10 + i;
+            gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                     {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        vid_waitvbl();
+        EXPECT(!pvr_get_stats(&after));
+        EXPECT(after.frame_count == before.frame_count);
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        EXPECT(!pvr_get_stats(&after));
+        EXPECT(after.frame_count == before.frame_count + 1);
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        for (unsigned i = 0; i < 64; ++i)
+            EXPECT(pixels[20 * 320 + 10 + i] == 2 + i * 16);
+        if (!frame) {
+            EXPECT(pixels[20 * 320 + 74] == 2 + 64 * 16);
+        } else {
+            unsigned c = pixels[20 * 320 + 74];
+            EXPECT((c & 31) >= 14 && (c & 31) <= 16);
+            EXPECT((c >> 5 & 31) >= 14 && (c >> 5 & 31) <= 16);
+            EXPECT((c >> 10 & 31) == 0);
+        }
+    }
+    gpu->destroy(t);
+}
+
+static void deferred_pal8_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred PAL8 target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    atlas[1024] = 1; atlas[1025] = 2; atlas[1026] = 3;
+    atlas[1024 + 2048] = 3; atlas[1025 + 2048] = 2; atlas[1026 + 2048] = 1;
+    for (unsigned i = 0; i < 5; ++i)
+        for (unsigned j = 0; j < 256; ++j)
+            put(0xc0000 + i * 512 + j * 2, 1 + i * 256 + j);
+    put(0xc0000 + 4 * 512 + 4, 0x8000 | 0x3e0);
+    put(0xc0000 + 4 * 512 + 6, 0);
+    gex_gpu_material material = {8 | 128, 0x6000, 0x2e, 0x808080, atlas, table};
+    for (unsigned frame = 0; frame < 2; ++frame) {
+        vid_waitvbl();
+        pvr_stats_t before, after;
+        EXPECT(!pvr_get_stats(&before));
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        gex_gpu_material background = {.opcode = 0x60, .rgb = 0xff};
+        gex_gpu_vertex fill[] = {{0, 0, 0, 0}, {320, 0, 0, 0},
+                                 {0, 240, 0, 0}, {320, 240, 0, 0}};
+        EXPECT(!gpu->native->polygon(t, fill, 0, 0, 320, 240,
+                                     &background, error, sizeof error));
+        if (frame) {
+            for (unsigned i = 0; i < 759; ++i) {
+                float x = i % 300, y = 50 + i / 300;
+                gex_gpu_vertex cell[] = {{x, y, 0, 0}, {x + 1, y, 0, 0},
+                                         {x, y + 1, 0, 0}, {x + 1, y + 1, 0, 0}};
+                EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                             &background, error, sizeof error));
+            }
+        }
+        for (unsigned i = 0; i < 5; ++i) {
+            material.clut = 0x6000 + i * 16;
+            float x = 10 + i * 10;
+            gex_gpu_vertex block[] = {{x, 20, 0, 0}, {x + 3, 20, 3, 0},
+                                      {x, 22, 0, 2}, {x + 3, 22, 3, 2}};
+            EXPECT(!gpu->native->polygon(t, block, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        if (!frame) {
+            vid_waitvbl();
+            EXPECT(!pvr_get_stats(&after));
+            EXPECT(after.frame_count == before.frame_count);
+        }
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        EXPECT(pixels[20 * 320 + 50] == 1 + 4 * 256 + 1);
+        EXPECT(pixels[20 * 320 + 52] == 31);
+        EXPECT(pixels[21 * 320 + 50] == 31);
+        EXPECT(pixels[21 * 320 + 52] == 1 + 4 * 256 + 1);
+        for (unsigned y = 20; y < 22; ++y) {
+            unsigned c = pixels[y * 320 + 51];
+            EXPECT((c & 31) >= 14 && (c & 31) <= 16);
+            EXPECT((c >> 5 & 31) >= 14 && (c >> 5 & 31) <= 16);
+            EXPECT((c >> 10 & 31) == 0);
+        }
+    }
+    gpu->destroy(t);
+}
+
+static void deferred_eviction_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR deferred eviction target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0x11, sizeof atlas);
+    put(0xc0002, 31);
+    gex_gpu_material material = {0, 0x6000, 0x2c, 0x808080, atlas, table};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    for (unsigned i = 0; i < 24; ++i) {
+        material.page = i;
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    for (unsigned i = 0; i < 2; ++i) {
+        material.page = i ? 24 : 0;
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+    }
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 31 && pixels[20 * 320 + 11] == 31);
+    gpu->destroy(t);
 }
 
 static void refresh_texel(const gex_gpu_native_ops *native, unsigned format,
@@ -372,7 +1986,7 @@ static void presentation_palette_regression(const gex_packet_gpu *gpu) {
                             {10, 23, 0, 1}, {11, 23, 1, 1}};
     EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned i = 0; i < 600; ++i)
         EXPECT(pixels[(20 + i / 300) * 320 + i % 300] == 31);
     EXPECT(pixels[22 * 320 + 10] == 0x3e0);
@@ -418,7 +2032,7 @@ static void lazy_page_regression(const gex_packet_gpu *gpu) {
             EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         EXPECT(pixels[10 * 320 + 10] == 31);
         EXPECT(pixels[10 * 320 + 20] == (format < 2 ? 0x7c00 : 0));
         EXPECT(pixels[10 * 320 + 30] == (format < 2 ? 0x7c00 : 0));
@@ -499,7 +2113,7 @@ static void sparse_sampling_regression(const gex_packet_gpu *gpu) {
                     }
             }
             EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-            EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+            EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
             for (unsigned i = 0; i < 320 * 240; ++i)
                 if (pixels[i] != other[i]) {
                     printf("PVR sparse sampling mismatch: format=%u frame=%u x=%u y=%u actual=%x expected=%x\n",
@@ -569,7 +2183,7 @@ static void lazy_alpha_regression(const gex_packet_gpu *gpu) {
         EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
     }
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[20 * 320 + 10] == 0x3e0 && pixels[20 * 320 + 11] == 0);
     EXPECT(pixels[21 * 320 + 10] == 0x7c00 && pixels[21 * 320 + 11] == 31);
     EXPECT(pixels[20 * 320 + 20] == 0x3e0);
@@ -603,8 +2217,7 @@ static void alpha_pressure_regression(const gex_packet_gpu *gpu) {
     native->atlas_write(atlas, 0, sizeof atlas);
     memset(atlas, 0, sizeof atlas);
     gex_gpu_material background = {.opcode = 0x60, .rgb = 0xff};
-    /* Retain a real background and create a self-feedback snapshot before
-     * filling the cache: production VRAM is not exclusively page storage. */
+    /* Retain backgrounds before filling the texture cache. */
     for (unsigned frame = 0; frame < 3; ++frame) {
         for (unsigned plane = 0; plane < 2; ++plane) {
             void *target = plane ? back : t;
@@ -618,13 +2231,11 @@ static void alpha_pressure_regression(const gex_packet_gpu *gpu) {
         }
     }
     gex_gpu_material material = {256, 0, 0x2c, 0x808080, atlas, table};
-    gex_gpu_vertex feedback_quad[] = {{200, 10, 0, 180}, {204, 10, 4, 180},
-                                     {200, 14, 0, 184}, {204, 14, 4, 184}};
     for (unsigned plane = 0; plane < 2; ++plane) {
         void *target = plane ? back : t;
-        material.page = 256 | (plane ? 16 : 0);
-        EXPECT(!native->polygon(target, feedback_quad, 0, 0, 320, 240, &material, error, sizeof error));
+        EXPECT(!native->present(target, error, sizeof error));
         EXPECT(!native->copy(copy, target, 255, error, sizeof error));
+        EXPECT(!native->present(copy, error, sizeof error));
     }
     printf("PVR alpha pressure available before pages: %lu\n", (unsigned long)pvr_mem_available());
     for (unsigned page = 0; page < 32; ++page)
@@ -649,7 +2260,7 @@ static void alpha_pressure_regression(const gex_packet_gpu *gpu) {
             }
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         if (!failed)
             for (unsigned page = 0; page < 32; ++page) {
                 unsigned at = (40 + pass) * 320 + page * 3;
@@ -740,7 +2351,7 @@ static void fragmented_alpha_regression(const gex_packet_gpu *gpu, int remap) {
     if (!result)
         EXPECT(!native->polygon(t, revisit, 0, 0, 320, 240, &material, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned i = 0; i < 4; ++i) {
         unsigned at = 50 * 320 + 10 + i * 5;
         EXPECT(pixels[at] == 31 && pixels[at + 1] == 0x3e0 && pixels[at + 2] == 0);
@@ -804,17 +2415,71 @@ static void fragmented_feedback_regression(const gex_packet_gpu *gpu) {
     material.opcode = 0x2c;
     gex_gpu_vertex feedback_quad[] = {{200, 10, 0, 180}, {204, 10, 4, 180},
                                       {200, 14, 0, 184}, {204, 14, 4, 184}};
+    vid_waitvbl();
+    pvr_stats_t before, after;
+    EXPECT(!pvr_get_stats(&before));
     int result = native->polygon(t, feedback_quad, 0, 0, 320, 240,
-                                &material, error, sizeof error);
-    EXPECT(!result);
-    if (result)
-        printf("PVR fragmented feedback free=%lu: %s\n",
-               (unsigned long)available, error);
-    else
-        printf("PVR fragmented feedback snapshot: PASS (free=%lu)\n",
-               (unsigned long)available);
+                                 &material, error, sizeof error);
+    EXPECT(result != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
 
+    vid_waitvbl();
+    EXPECT(!pvr_get_stats(&after));
+    EXPECT(after.frame_count == before.frame_count);
     for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].guard);
+    EXPECT(!native->present(t, error, sizeof error));
+    gpu->destroy(t);
+}
+
+static void direct_framebuffer_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR direct framebuffer target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    EXPECT(!(PVR_GET(PVR_SCALER_CFG) & 1u));
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 31;
+    EXPECT(!gpu->upload(t, pixels, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    uint32_t first = PVR_GET(PVR_FB_ADDR);
+    volatile uint16_t *display = (volatile uint16_t *)(PVR_RAM_BASE + first);
+    EXPECT(display[120 * 320 + 160] == 0xf800);
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    vid_waitvbl();
+    EXPECT(PVR_GET(PVR_FB_ADDR) == first);
+    EXPECT(display[120 * 320 + 160] == 0xf800);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    uint32_t second = PVR_GET(PVR_FB_ADDR);
+    EXPECT(second != first);
+    display = (volatile uint16_t *)(PVR_RAM_BASE + second);
+    EXPECT(display[120 * 320 + 160] == 0);
+    for (unsigned y = 0; y < 240; ++y)
+        for (unsigned x = 0; x < 320; ++x)
+            pixels[y * 320 + x] = (x ^ y) & 1 ? 0x7fff : 0;
+    EXPECT(!gpu->native->blit(t, 0, 0, 320, 240, (const uint8_t *)pixels,
+                              320 * 2, -1, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    display = (volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    for (unsigned y = 0; y < 240; ++y) {
+        int mismatch = 0;
+        for (unsigned x = 0; x < 320; ++x)
+            mismatch |= !!display[y * 320 + x] != (int)((x ^ y) & 1);
+        EXPECT(!mismatch);
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i)
+        pixels[i] = i & 1 ? 0xf81f : 0x07e0;
+    EXPECT(!gpu->native->movie(t, (const uint8_t *)pixels, 320, 240,
+                               320 * 2, error, sizeof error));
+    display = (volatile uint16_t *)(PVR_RAM_BASE + PVR_GET(PVR_FB_ADDR));
+    for (unsigned y = 0; y < 240; ++y) {
+        int mismatch = 0;
+        for (unsigned x = 0; x < 320; ++x)
+            mismatch |= display[y * 320 + x] != pixels[y * 320 + x];
+        EXPECT(!mismatch);
+    }
     gpu->destroy(t);
 }
 
@@ -828,27 +2493,20 @@ static void presentation_pacing_regression(const gex_packet_gpu *gpu) {
             ++failures;
             return;
         }
-        size_t seen = 0;
+        uint64_t seen = 0;
         unsigned observed = 0;
         for (unsigned frame = 0; frame < 8; ++frame) {
             EXPECT(!native->clear(t, error, sizeof error));
             EXPECT(!native->present(t, error, sizeof error));
-            pvr_stats_t stats;
-            int flags = irq_disable();
-            int result = pvr_get_stats(&stats);
-            irq_restore(flags);
-            EXPECT(!result);
-            if (result) break;
-            if (seen && stats.frame_count != seen) {
-                EXPECT(stats.frame_count == seen + 1);
-                if (stats.frame_last_time < UINT64_C(30000000))
-                    printf("PVR pacing context=%u frame=%u displayed=%lu interval_ns=%llu vblank=%lu\n",
-                           context, frame, (unsigned long)stats.frame_count,
-                           (unsigned long long)stats.frame_last_time, (unsigned long)stats.vbl_count);
-                EXPECT(stats.frame_last_time >= UINT64_C(30000000));
+            uint64_t now = timer_us_gettime64();
+            if (seen) {
+                if (now - seen < 30000)
+                    printf("PVR pacing context=%u frame=%u interval_us=%llu\n",
+                           context, frame, (unsigned long long)(now - seen));
+                EXPECT(now - seen >= 30000);
                 ++observed;
             }
-            seen = stats.frame_count;
+            seen = now;
         }
         EXPECT(observed >= 4);
         gpu->destroy(t);
@@ -893,7 +2551,7 @@ static void opaque_region_regression(const gex_packet_gpu *gpu) {
         if (frame == 1) EXPECT(before_clear >= after && before_clear - after >= 128 * 128 * 2);
         if (frame == 2) EXPECT(before == after);
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         for (unsigned y = 0; y < 128; ++y)
             for (unsigned x = 0; x < 128; ++x)
                 EXPECT(pixels[(20 + y) * 320 + 10 + x] == (colors[((x + y) % 16) % 6] & 0x7fff));
@@ -936,21 +2594,21 @@ static void texture_refresh_regression(const gex_packet_gpu *gpu) {
             EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         for (unsigned i = 0; i < 6; ++i) EXPECT(pixels[198 * 320 + i] == expected[i]);
         EXPECT(!native->clear(t, error, sizeof error));
         /* The first strip after a capacity drain still owns its old texel. */
-        for (unsigned i = 0; i < 600; ++i) {
-            if (i == 511) refresh_texel(native, format, 32, 2);
+        for (unsigned i = 0; i < 900; ++i) {
+            if (i == 767) refresh_texel(native, format, 32, 2);
             float x = i % 300, y = 198 + i / 300;
             gex_gpu_vertex cell[] = {{x, y, 0, 32}, {x + 1, y, 1, 32},
                                     {x, y + 1, 0, 33}, {x + 1, y + 1, 1, 33}};
             EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
-        for (unsigned i = 0; i < 600; ++i)
-            EXPECT(pixels[(198 + i / 300) * 320 + i % 300] == (i < 511 ? 31 : 0x3e0));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
+        for (unsigned i = 0; i < 900; ++i)
+            EXPECT(pixels[(198 + i / 300) * 320 + i % 300] == (i < 767 ? 31 : 0x3e0));
         refresh_texel(native, format, 33, 2);
         EXPECT(!native->clear(t, error, sizeof error));
         gex_gpu_vertex block[] = {{10, 198, 0, 32}, {11, 198, 1, 32},
@@ -964,7 +2622,7 @@ static void texture_refresh_regression(const gex_packet_gpu *gpu) {
         block[0].x = block[2].x = 11; block[1].x = block[3].x = 12;
         EXPECT(!native->polygon(t, block, 0, 0, 320, 240, &material, error, sizeof error));
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         for (unsigned y = 198; y < 200; ++y) {
             EXPECT(pixels[y * 320 + 10] == 0x3e0);
             EXPECT(pixels[y * 320 + 11] == 0x7c00);
@@ -973,7 +2631,7 @@ static void texture_refresh_regression(const gex_packet_gpu *gpu) {
     gpu->destroy(copy); gpu->destroy(t);
 }
 
-static int fragmented_feedback_requested(void) {
+static int test_mode(void) {
     FILE *config = fopen("/cd/gex-test.cfg", "r");
     if (!config) {
         if (errno == ENOENT) return 0;
@@ -990,6 +2648,7 @@ static int fragmented_feedback_requested(void) {
     char *save, *token = strtok_r(args, " \r\n\t", &save);
     while (token) {
         if (!strcmp(token, "--fragmented-feedback")) return 1;
+        if (!strcmp(token, "--strict-guard")) return 2;
         token = strtok_r(NULL, " \r\n\t", &save);
     }
     return 0;
@@ -1008,18 +2667,64 @@ int main(void) {
     char error[128] = {0};
     unsigned initial_scheduler_hz = thd_get_hz();
     const gex_packet_gpu *gpu = gex_packet_gpu_get();
-    int fragmented_feedback = fragmented_feedback_requested();
-    if (fragmented_feedback < 0) {
+    int mode = test_mode();
+    if (mode < 0) {
         mmu_shutdown_basic();
         return 64;
     }
-    if (fragmented_feedback) {
+    if (mode == 1) {
         fragmented_feedback_regression(gpu);
         mmu_shutdown_basic();
         printf("Dreamcast PVR fragmented feedback regression: %s (%d failures)\n",
                failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
+    if (mode == 2) {
+        bound_destroy_regression(gpu, 0);
+        bound_destroy_regression(gpu, 1);
+        presented_feedback_regression(gpu);
+        pending_feedback_regression(gpu);
+        repeated_pending_feedback_regression(gpu);
+        independent_destroy_regression(gpu, 0);
+        independent_destroy_regression(gpu, 1);
+        independent_destroy_regression(gpu, 2);
+        picture_copy_lifetime_regression(gpu);
+        picture_clut_rejection_regression(gpu);
+        preserved_pixel_mapping_regression(gpu);
+        pause_fade_presentation_regression(gpu);
+        inactive_picture_regression(gpu);
+        inactive_texture_replay_regression(gpu);
+        inactive_movie_replay_regression(gpu);
+        bound_command_capacity_regression(gpu);
+        movie_upload_regression(gpu);
+        mmu_shutdown_basic();
+        printf("Dreamcast PVR strict guard regression: %s (%d failures)\n",
+               failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    direct_framebuffer_regression(gpu);
+    deferred_command_regression(gpu);
+    deferred_clear_switch_regression(gpu);
+    deferred_picture_switch_regression(gpu);
+    deferred_picture_resources_regression(gpu);
+    deferred_picture_full_blit_regression(gpu);
+    deferred_snapshot_lifetime_regression(gpu);
+    deferred_snapshot_cache_lifetime_regression(gpu);
+    deferred_blit_regression(gpu);
+    deferred_copy_regression(gpu);
+    deferred_picture_snapshot_regression(gpu);
+    deferred_saved_picture_copy_regression(gpu);
+    deferred_incremental_copy_regression(gpu);
+    deferred_black_copy_regression(gpu);
+    deferred_shading_regression(gpu);
+    deferred_background_regression(gpu);
+    deferred_texture_regression(gpu);
+    deferred_texture_pressure_regression(gpu, 0);
+    deferred_texture_pressure_regression(gpu, 2);
+    deferred_alpha_texture_pressure_regression(gpu);
+    deferred_palette_regression(gpu);
+    deferred_pal8_regression(gpu);
+    deferred_eviction_regression(gpu);
     fragmented_feedback_regression(gpu);
     /* Compatibility regressions explicitly exercise the diagnostic readback
      * contract. Production PVR targets use the native operations below. */
@@ -1225,16 +2930,16 @@ int main(void) {
     gex_gpu_material solid = {.opcode = 0x60, .rgb = 0xff};
     EXPECT(!native->polygon(t, quad, 0, 0, 320, 240, &solid, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[10 * 320 + 10] == 31 && pixels[19 * 320 + 19] == 31);
     EXPECT(pixels[9 * 320 + 10] == 0 && pixels[20 * 320 + 10] == 0);
     EXPECT(!native->copy(copy, t, 127, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT((pixels[10 * 320 + 10] & 31) >= 14 && (pixels[10 * 320 + 10] & 31) <= 16);
     const uint8_t banner[] = {0xe0, 3, 0, 0, 0, 0x7c};
     EXPECT(!native->blit(t, 10, 10, 3, 1, banner, 6, 0, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[10 * 320 + 10] == 0x3e0);
     EXPECT(pixels[10 * 320 + 11] == 31);
     EXPECT(pixels[10 * 320 + 12] == 0x7c00);
@@ -1247,7 +2952,7 @@ int main(void) {
                                {80, 112, 0, 16}, {96, 112, 16, 16}};
     EXPECT(!native->polygon(t, scaled, 83, 80, 94, 112, &indexed, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned row = 0; row < 32; ++row)
         for (unsigned col = 83; col < 94; ++col)
             EXPECT(pixels[(80 + row) * 320 + col] == row / 2 + 1);
@@ -1258,7 +2963,7 @@ int main(void) {
                                 {128, 136, 0, 264}, {112, 136, 16, 264}};
     EXPECT(!native->polygon(t, wrapped, 0, 0, 320, 240, &indexed, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned row = 0; row < 16; ++row)
         for (unsigned col = 112; col < 128; ++col)
             EXPECT(pixels[(120 + row) * 320 + col] == row + 1);
@@ -1270,7 +2975,7 @@ int main(void) {
                                {150, 151, 0, 1}, {166, 151, 16, 1}};
     EXPECT(!native->polygon(t, tinted, 0, 0, 320, 240, &indexed, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT((pixels[150 * 320 + 150] >> 5 & 31) >= 14);
     EXPECT((pixels[150 * 320 + 150] >> 5 & 31) <= 16);
     /* Opt-in write tracking must retain exact mutation checks, including
@@ -1320,7 +3025,7 @@ int main(void) {
                                   {150, 153, 0, 1}, {166, 153, 16, 1}};
     EXPECT(!native->polygon(t, recolored, 0, 0, 320, 240, &indexed, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[150 * 320 + 150] == 0x3e0);
     EXPECT(pixels[152 * 320 + 150] == 0x7c00);
     /* A PAL8 bank overwrites sixteen PAL4 banks, including cached source
@@ -1429,7 +3134,7 @@ int main(void) {
     dot[0].y = dot[1].y = 206; dot[2].y = dot[3].y = 207;
     EXPECT(!native->polygon(t, dot, 0, 0, 320, 240, &direct, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[204 * 320 + 20] == 0x3e0);
     EXPECT((pixels[206 * 320 + 20] >> 10 & 31) >= 14);
     EXPECT((pixels[206 * 320 + 20] >> 10 & 31) <= 16);
@@ -1437,14 +3142,14 @@ int main(void) {
     put(512, 0);
     EXPECT(!native->polygon(t, dot, 0, 0, 320, 240, &direct, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT((pixels[206 * 320 + 20] >> 10 & 31) >= 14);
     for (unsigned pass = 0; pass < 2; ++pass) {
         for (unsigned i = 0; i < 320 * 240; ++i) other[i] = pass ? 0x001f : 0xf800;
         other[239 * 320 + 319] = 0x07e0;
         EXPECT(!native->movie(t, (const uint8_t *)other, 320, 240, 640, error, sizeof error));
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         EXPECT(pixels[0] == (pass ? 0x7c00 : 31));
         EXPECT(pixels[239 * 320 + 318] == (pass ? 0x7c00 : 31));
         EXPECT(pixels[239 * 320 + 319] == 0x3e0);
@@ -1452,35 +3157,28 @@ int main(void) {
     for (unsigned i = 0; i < 160 * 120; ++i) other[i] = 0xf800;
     EXPECT(!native->movie(t, (const uint8_t *)other, 160, 120, 320, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     EXPECT(pixels[0] == 31 && pixels[239 * 320 + 319] == 31);
-    EXPECT(!native->blit(t, 10, 10, 3, 1, banner, 6, 0, error, sizeof error));
-    /* Freeze an actual GPU-owned picture as a texture. Read only a separate
-     * diagnostic target; the production target explicitly refuses download. */
+    /* Production picture reads and framebuffer texture sampling are rejected. */
     native->bind(t, atlas, 0);
+    EXPECT(!native->clear(t, error, sizeof error));
+    EXPECT(!native->blit(t, 10, 10, 3, 1, banner, 6, 0, error, sizeof error));
     EXPECT(gpu->download(t, pixels, error, sizeof error) != 0);
     EXPECT(strstr(error, "readback is forbidden") != NULL);
     EXPECT(gpu->upload(t, pixels, error, sizeof error) != 0);
     gex_gpu_vertex feedback_quad[] = {{40, 40, 10, 10}, {50, 40, 20, 10},
                                       {40, 50, 10, 20}, {50, 50, 20, 20}};
     gex_gpu_material feedback_material = {256, 0, 0x2c, 0x808080, atlas, table};
-    EXPECT(!native->polygon(t, feedback_quad, 0, 0, 320, 240,
-                            &feedback_material, error, sizeof error));
-    EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
-    EXPECT(pixels[40 * 320 + 40] == 0x3e0);
-    EXPECT(pixels[40 * 320 + 41] == 31);
-    EXPECT(pixels[40 * 320 + 42] == 0x7c00);
-    EXPECT(pixels[41 * 320 + 40] == 31);
+    EXPECT(!native->present(t, error, sizeof error));
+    EXPECT(native->polygon(t, feedback_quad, 0, 0, 320, 240,
+                           &feedback_material, error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
     gex_gpu_vertex edge_feedback[] = {{60, 60, 74, 9}, {70, 60, 84, 9},
                                       {60, 70, 74, 19}, {70, 70, 84, 19}};
     feedback_material.page = 15 | 256;
-    EXPECT(!native->polygon(t, edge_feedback, 0, 0, 320, 240,
-                            &feedback_material, error, sizeof error));
-    EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
-    EXPECT(pixels[60 * 320 + 60] == 0x3e0 && pixels[60 * 320 + 61] == 31);
-    EXPECT(pixels[60 * 320 + 62] == 0x7c00);
+    EXPECT(native->polygon(t, edge_feedback, 0, 0, 320, 240,
+                           &feedback_material, error, sizeof error) != 0);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
     indexed.page = 4;
     indexed.clut = 0x1020;
     /* Only the visible four rows sample the asset above the picture.
@@ -1496,7 +3194,7 @@ int main(void) {
     EXPECT(!native->polygon(t, clipped_asset, 0, 0, 320, 240,
                             &indexed, error, sizeof error));
     EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-    EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+    EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
     for (unsigned row = 236; row < 240; ++row)
         for (unsigned x = 100; x < 116; ++x) EXPECT(pixels[row * 320 + x] == 0x3e0);
     gex_gpu_vertex edge_asset[] = {{120, 220, 0, 0}, {136, 220, 16, 0},
@@ -1505,7 +3203,7 @@ int main(void) {
                             &indexed, error, sizeof error));
     EXPECT(native->polygon(t, feedback_quad, 0, 0, 320, 240,
                            &indexed, error, sizeof error) != 0);
-    EXPECT(strstr(error, "indexed framebuffer sampling") != NULL);
+    EXPECT(strstr(error, "framebuffer sampling is unsupported") != NULL);
     indexed.clut = 0x1000;
     /* Learn an ordered background, then move an overlapping live sprite.
      * Camera/material changes and a write midway through deferred validation
@@ -1574,7 +3272,7 @@ int main(void) {
         EXPECT(!native->polygon(t, moving, 0, 0, 320, 240,
                                 &sprite, error, sizeof error));
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         EXPECT(pixels[180 * 320 + 20 + frame] == 31);
         if (frame == 3) EXPECT(pixels[180 * 320 + 20] == 0);
         if (frame < 4 || frame == 5 || frame == 7)
@@ -1604,7 +3302,7 @@ int main(void) {
                                     &indexed, error, sizeof error));
         }
         EXPECT(!native->copy(copy, t, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         if (frame < 3) {
             EXPECT((pixels[180 * 320 + 70] & 31) >= 14);
             EXPECT((pixels[180 * 320 + 70] & 31) <= 16);
@@ -1699,7 +3397,7 @@ int main(void) {
         gex_raster_packet(cached_raster, empty_packet, &cache_state);
         gex_raster_fill(cached_raster, 20 + frame, 180, 1, 1, 0x0000ff);
         EXPECT(!native->copy(copy, raster_device, 255, error, sizeof error));
-        EXPECT(!gpu->download(copy, pixels, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
         EXPECT(pixels[180 * 320 + 20 + frame] == 31);
         EXPECT(pixels[180 * 320 + 70] == 0x3e0);
         if (frame == 3) EXPECT(pixels[180 * 320 + 20] == 0);

@@ -6,7 +6,7 @@
 
 ## What is this?
 
-A work-in-progress AI-led static recompilation of the [Windows release of Gex (1995) from GOG](https://www.gog.com/en/game/gex) for Linux, macOS, Windows, Android and Sega Dreamcast, using [pcrecomp](https://github.com/sp00nznet/pcrecomp) by sp00nznet and a version of the [Claude Code skill](https://github.com/DohmBoy64Bit/pcrecomp-skill) by DohmBoy64Bit adapted for GitHub Copilot. Huge thanks to the creators of those repositories.
+A work-in-progress AI-led static recompilation of the [Windows release of Gex (1995) from GOG](https://www.gog.com/en/game/gex) for Linux, macOS, Windows, Android and Sega Dreamcast, using [pcrecomp](https://github.com/sp00nznet/pcrecomp) by sp00nznet and a version of the [Cursor Agent skill](https://github.com/DohmBoy64Bit/pcrecomp-skill) by DohmBoy64Bit adapted for GitHub Copilot. Huge thanks to the creators of those repositories.
 
 ## Usage
 
@@ -59,8 +59,7 @@ Run - Right shoulder button
 
 ## Planned features
 
-- Ingame settings
-- Remapping
+- Settings & saving on Dreamcast
 - Texture pack support
 - UWP (Xbox One/Series) support, feel free to contact if you're able to test on Xbox One
 

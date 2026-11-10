@@ -8,11 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DreamcastRendererTests(unittest.TestCase):
-    def test_pvr_palette_writes_retire_pending_presentation(self):
+    def test_pvr_palette_writes_skip_unchanged_entries(self):
         source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
         start = source.rfind("static ", 0, source.index("program_palette("))
         helper = source[start:source.index("static int native_polygon_draw(", start)]
-        invoke = "program_palette(0, colors, 2, error, sizeof error)"
         harness = r"""
 #include <stdint.h>
 #include <stddef.h>
@@ -20,44 +19,28 @@ class DreamcastRendererTests(unittest.TestCase):
 #include <string.h>
 #define WORK(field, value) ((void)0)
 static uint32_t programmed_palettes[32], palettes[1024];
-static int pending, fence_failure, fences, writes, unsafe_writes, failures;
-char error[64];
-int complete_presentation(char *error, size_t size) {
-    if (!pending) return 0;
-    ++fences;
-    if (fence_failure) {
-        snprintf(error, size, "completion failed");
-        return -1;
-    }
-    pending = 0;
-    return 0;
-}
+static int writes, failures;
 void pvr_set_pal_entry(unsigned at, uint32_t color) {
     (void)at; (void)color;
     ++writes;
-    unsafe_writes += pending;
 }
 #define EXPECT(e) do { if (!(e)) { \
-    fprintf(stderr, "palette fence failed: %s\n", #e); ++failures; \
+    fprintf(stderr, "palette update failed: %s\n", #e); ++failures; \
 } } while (0)
 """
         harness += helper
-        harness += f"""
-int main(void) {{
-    const uint32_t colors[] = {{0xff123456, 0xff789abc}};
-    pending = 1;
-    EXPECT(!{invoke});
-    EXPECT(fences == 1 && !pending && writes == 2 && !unsafe_writes);
-    pending = 1;
-    EXPECT(!{invoke});
-    EXPECT(fences == 1 && pending && writes == 2);
-    programmed_palettes[0] = 0;
-    fence_failure = 1;
-    EXPECT({invoke} != 0);
-    EXPECT(fences == 2 && pending && writes == 2 && !unsafe_writes);
-    EXPECT(!programmed_palettes[0] && !strcmp(error, "completion failed"));
+        harness += r"""
+int main(void) {
+    uint32_t colors[] = {0xff123456, 0xff789abc};
+    program_palette(0, colors, 2);
+    EXPECT(writes == 2 && palettes[0] == colors[0] && palettes[1] == colors[1]);
+    program_palette(0, colors, 2);
+    EXPECT(writes == 2);
+    colors[1] = 0xffabcdef;
+    program_palette(0, colors, 2);
+    EXPECT(writes == 3 && palettes[1] == colors[1]);
     return failures != 0;
-}}
+}
 """
         with tempfile.TemporaryDirectory(prefix="gex-pvr-palette-fence-") as work:
             work = Path(work)
@@ -67,6 +50,32 @@ int main(void) {{
                             "-fno-sanitize-recover=all", str(work / "test.c"),
                             "-o", str(work / "test")], check=True)
             subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_presentation_renders_to_framebuffer(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        flush = source[source.index("static int flush_commands_impl("):
+                       source.index("static int flush_commands(", source.index("static int flush_commands_impl("))]
+        self.assertIn("if (wait_for_render) {", flush)
+        self.assertIn("pvr_scene_begin_txr(", flush)
+        self.assertIn("} else {\n            pvr_scene_begin();", flush)
+        self.assertNotIn("pvr_scene_begin_rtt(", source)
+
+    def test_pvr_preservation_uses_one_to_one_nearest_texture(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        flush = source[source.index("static int flush_commands_impl("):
+                       source.index("static int flush_commands(", source.index("static int flush_commands_impl("))]
+        context = source[source.index("static void context("):
+                         source.index("static void vertices(")]
+        quad = source[source.index("static void picture_quad("):
+                      source.index("static void clear_texture_reads(")]
+        self.assertIn("PVR_FILTER_NONE", context)
+        self.assertIn("if (!wait_for_render) {", flush)
+        self.assertIn("source + y * (320 / 2), 320 * 2 / 32", flush)
+        self.assertIn("PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH", quad)
+        self.assertIn("vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH,", quad)
+        self.assertIn("picture_quad(&header, v, current_image(active), 255)", flush)
+        self.assertNotIn("finish_feedback(", source)
+        self.assertNotIn("save_replay(", source)
 
     def test_pvr_rect_invalidation_matches_row_writes(self):
         source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()

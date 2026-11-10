@@ -61,6 +61,8 @@ set_source_files_properties(src/main.c src/platform/dreamcast/renderer.c
     src/platform/dreamcast/packet_gpu.c src/platform/gl/packet_gpu.c src/sha256.c
     "${PCRECOMP_DIR}/runtime/win32hle/dsound.c"
     PROPERTIES COMPILE_OPTIONS -O2)
+set_source_files_properties(src/graphics_guest.c
+    PROPERTIES COMPILE_OPTIONS "-O3;-fomit-frame-pointer")
 add_link_options(-fno-lto "-Wl,--gc-sections" "-Wl,-Map=${CMAKE_BINARY_DIR}/gex_recomp.map")
 if(BUILD_TESTING)
     add_executable(gex_dc_movie_test tests/dreamcast_movie.c)

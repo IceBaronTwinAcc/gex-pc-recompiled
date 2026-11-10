@@ -1,6 +1,8 @@
 #include <kos.h>
 #include <dc/pvr.h>
 #include <dc/asic.h>
+#include <dc/sq.h>
+#include <dc/vblank.h>
 #include <math.h>
 #include <malloc.h>
 #include <stdio.h>
@@ -9,14 +11,17 @@
 #include "packet_gpu.h"
 #include "raster.h"
 
-/* RTT keeps scanout separate from guest framebuffer/atlas compatibility.
- * A single presorted translucent list preserves original packet order. */
+/* A single presorted translucent list preserves original packet order. */
 enum { TW = 512, TH = 256, CACHE_COUNT = 24, CACHE_BYTES = 4 * 1024 * 1024,
-       COMMAND_BYTES = 65536, BACKGROUND_POLYGONS = 384, BACKGROUND_MINIMUM = 16,
+       COMMAND_BYTES = 65536, COMMAND_MAX_BYTES = 196608,
+       BACKGROUND_POLYGONS = 384, BACKGROUND_MINIMUM = 16,
        REMAP_COUNT = 256, REMAP_BYTES = 512 * 1024, SHARED_GROUPS = 2,
        WARM_REGIONS = 4, WARM_BYTES = 128 * 128 };
 enum { BACKGROUND_IDLE, BACKGROUND_RECORD, BACKGROUND_REUSE, BACKGROUND_VERIFY,
        BACKGROUND_REDRAW };
+typedef struct {
+    unsigned begin, end, top, bottom;
+} texture_read;
 typedef struct {
     uint8_t packet[36];
     const uint8_t *atlas, *modulation;
@@ -41,9 +46,8 @@ typedef struct target {
     unsigned plane;
     int owned;
     background_polygon *background;
-    pvr_ptr_t background_image;
     unsigned background_count, background_at;
-    int background_mode, background_valid, background_source;
+    int background_mode, background_valid;
     unsigned background_misses;
     unsigned pal4_draws;
     unsigned warm_at, warm_budget, warm_bytes;
@@ -55,13 +59,22 @@ typedef struct target {
     uint64_t background_revision;
     packet_key pending_key;
     uint32_t dependencies[512];
+    uint8_t *saved_commands;
+    size_t saved_size;
+    pvr_poly_hdr_t saved_header;
+    int saved_replaces, saved_clear_only;
+    struct transient_texture **saved_transients;
+    size_t saved_transient_count;
+    texture_read saved_reads[CACHE_COUNT];
+    uint8_t saved_remaps[REMAP_COUNT];
+    int known_clear;
 #if GEX_PROFILE_RENDERER
     uint64_t draw_cpu_begin;
 #endif
     struct target *next;
 } target;
 static pvr_ptr_t current_image(const target *t) {
-    return t->background_source ? t->background_image : t->image[t->current];
+    return t->image[t->current];
 }
 typedef struct {
     unsigned page, rgb, opcode, raw;
@@ -81,7 +94,7 @@ typedef struct {
 typedef struct {
     unsigned page, clut;
     uint16_t origin_u, origin_v, dimension, next;
-    uint8_t group, valid, alpha;
+    uint8_t group, valid, alpha, queued;
     int header_format;
     uint64_t used;
     const uint8_t *verified_atlas;
@@ -90,9 +103,22 @@ typedef struct {
     uint8_t index_map[16];
     uint16_t source_indices;
 } remap_texture;
+typedef struct transient_texture {
+    pvr_ptr_t image[2];
+    const uint8_t *atlas;
+    uint64_t epoch;
+    unsigned page, clut, alpha, origin_u, origin_v, dimension;
+    unsigned current, saved_refs;
+    struct transient_texture *next;
+} transient_texture;
+typedef struct transient_pin {
+    transient_texture *texture;
+    struct transient_pin *previous;
+} transient_pin;
 typedef struct {
     texture *page;
     remap_texture *region;
+    transient_texture *converted;
 } draw_texture;
 
 static texture cache[CACHE_COUNT];
@@ -117,8 +143,11 @@ static size_t cache_bytes;
 static target *active;
 static target *targets;
 static uint8_t *commands;
-static size_t command_size;
-static int command_replaces;
+static size_t command_size, command_capacity;
+static int command_replaces, command_clear_only;
+static unsigned saved_count;
+static texture_read current_reads[CACHE_COUNT];
+static uint8_t current_remaps[REMAP_COUNT];
 static pvr_poly_hdr_t last_header;
 static uint32_t palettes[1024];
 static uint32_t programmed_palettes[32];
@@ -138,21 +167,85 @@ static struct {
 } small_palettes[256];
 static unsigned palette_used;
 static uint32_t palette_banks[2];
-static pvr_ptr_t staging;
 static target *pictures[2];
-static pvr_ptr_t feedback[2];
 static const uint8_t *tracked_atlas;
-static int presentation_pending;
-static size_t last_submission_vblank;
-static int submission_paced;
 static uint64_t atlas_revision;
+static uint64_t atlas_write_epoch;
+static transient_texture *transients;
+static transient_pin *active_transient_pin;
 static unsigned previous_scheduler_hz;
+static target *last_presented;
+static unsigned last_present_vblank;
+static int presentation_paced;
 static int fail(char *error, size_t size, const char *message);
-static int read_display(pvr_stats_t *stats) {
-    int flags = irq_disable();
-    int result = pvr_get_stats(stats);
-    irq_restore(flags);
-    return result;
+static void release_transients(void) {
+    transient_texture **link = &transients;
+    while (*link) {
+        transient_texture *t = *link;
+        transient_pin *pin = active_transient_pin;
+        while (pin && pin->texture != t) pin = pin->previous;
+        if (pin || t->current || t->saved_refs) {
+            link = &t->next;
+            continue;
+        }
+        *link = t->next;
+        for (unsigned i = 0; i < 2; ++i)
+            if (t->image[i]) pvr_mem_free(t->image[i]);
+        free(t);
+    }
+}
+static void clear_current_transients(void) {
+    for (transient_texture *t = transients; t; t = t->next) t->current = 0;
+}
+
+static int capture_transients(transient_texture ***out, size_t *count,
+                              char *error, size_t size) {
+    size_t n = 0;
+    for (transient_texture *t = transients; t; t = t->next) n += !!t->current;
+    transient_texture **items = n ? malloc(n * sizeof *items) : NULL;
+    if (n && !items) return fail(error, size, "cannot retain PVR snapshot textures");
+    size_t i = 0;
+    for (transient_texture *t = transients; t; t = t->next)
+        if (t->current) {
+            items[i++] = t;
+            ++t->saved_refs;
+        }
+    *out = items;
+    *count = n;
+    return 0;
+}
+
+static int clone_saved_transients(const target *source, transient_texture ***out,
+                                  char *error, size_t size) {
+    size_t count = source->saved_transient_count;
+    transient_texture **items = count ? malloc(count * sizeof *items) : NULL;
+    if (count && !items) return fail(error, size, "cannot retain PVR snapshot textures");
+    for (size_t i = 0; i < count; ++i) {
+        items[i] = source->saved_transients[i];
+        ++items[i]->saved_refs;
+    }
+    *out = items;
+    return 0;
+}
+
+static void release_saved_transients(target *t, int restore) {
+    for (size_t i = 0; i < t->saved_transient_count; ++i) {
+        transient_texture *texture = t->saved_transients[i];
+        if (restore) texture->current = 1;
+        --texture->saved_refs;
+    }
+    free(t->saved_transients);
+    t->saved_transients = NULL;
+    t->saved_transient_count = 0;
+}
+static int display_wait(uint32_t address, char *error, size_t size) {
+    uint64_t deadline = timer_us_gettime64() + 100000;
+    while (PVR_GET(PVR_FB_ADDR) != address) {
+        if (timer_us_gettime64() >= deadline)
+            return fail(error, size, "PVR display page flip timed out");
+        thd_sleep(1);
+    }
+    return 0;
 }
 #if GEX_PROFILE_RENDERER
 static struct native_cpu {
@@ -185,20 +278,24 @@ struct frame_work {
     unsigned polygons, remaps, pages, refresh, drains;
 };
 static size_t display_seen;
+static uint64_t display_last_us;
 static int profile_display(char *error, size_t size) {
     pvr_stats_t stats;
-    if (read_display(&stats)) return fail(error, size, "cannot read PVR display timing");
-    if (stats.frame_count != display_seen) {
+    if (pvr_get_stats(&stats)) return fail(error, size, "PVR display statistics failed");
+    size_t frames = stats.frame_count;
+    uint64_t now = timer_us_gettime64();
+    uint64_t interval = (now - display_last_us) * 1000;
+    if (frames != display_seen) {
         if (display_seen) {
-            unsigned skipped = stats.frame_count - display_seen - 1;
+            unsigned skipped = frames - display_seen - 1;
             work.display_missed += skipped;
             ++work.display_samples;
-            work.display_sum += stats.frame_last_time;
-            if (stats.frame_last_time > work.display_max)
-                work.display_max = stats.frame_last_time;
-            work.display_late += stats.frame_last_time > UINT64_C(40000000);
+            work.display_sum += interval;
+            if (interval > work.display_max) work.display_max = interval;
+            work.display_late += interval > UINT64_C(40000000);
         }
-        display_seen = stats.frame_count;
+        display_seen = frames;
+        display_last_us = now;
     }
     return 0;
 }
@@ -288,11 +385,7 @@ static void report_profile(void) {
 #define PROFILE_BEGIN() ((void)0)
 #define PROFILE_END(field) ((void)0)
 #endif
-static int complete_presentation(char *error, size_t size);
-
-static int program_palette(unsigned offset, const uint32_t *colors, unsigned count,
-                           char *error, size_t size) {
-    /* Reservations reset per RTT batch; known hardware colors do not. */
+static void program_palette(unsigned offset, const uint32_t *colors, unsigned count) {
     for (unsigned i = 0; i < count; ++i) {
         unsigned at = offset + i;
         uint32_t bit = UINT32_C(1) << (at & 31);
@@ -300,15 +393,11 @@ static int program_palette(unsigned offset, const uint32_t *colors, unsigned cou
             WORK(same_palette_entries, 1);
             continue;
         }
-        /* TA registration does not retire the preceding RTT's palette reads.
-         * Cached/new page hits can reach this write without a texture fence. */
-        if (complete_presentation(error, size)) return -1;
         pvr_set_pal_entry(at, colors[i]);
         palettes[at] = colors[i];
         programmed_palettes[at / 32] |= bit;
     }
     WORK(palette_entries, count);
-    return 0;
 }
 static int native_polygon_draw(void *data, const gex_gpu_vertex input[4],
                                int left, int top, int right, int bottom,
@@ -476,6 +565,7 @@ static void invalidate_rect(texture *t, unsigned offset, unsigned bytes, unsigne
 static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, size_t pitch,
                                         size_t bytes, unsigned rows) {
     WORK(writes, 1);
+    ++atlas_write_epoch;
     if (tracked_atlas != atlas) {
         char error[256];
         if (active && background_replay(active, error, sizeof error)) {
@@ -653,59 +743,117 @@ static void vertices(pvr_vertex_t v[4], float x, float y, float w, float h,
     }
 }
 
-static int complete_presentation(char *error, size_t size) {
-    if (!presentation_pending) return 0;
-    if (pvr_wait_ready() || pvr_wait_render_done())
-        return hardware_fail(error, size, "PVR pending presentation completion failed");
-    presentation_pending = 0;
-    return 0;
+static void picture_quad(pvr_poly_hdr_t *header, pvr_vertex_t v[4],
+                         pvr_ptr_t image, unsigned shade) {
+    pvr_poly_cxt_t c;
+    context(&c, image, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
+    c.blend.src = PVR_BLEND_ONE;
+    c.blend.dst = PVR_BLEND_ZERO;
+    pvr_poly_compile(header, &c);
+    vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH,
+             0xff000000 | shade << 16 | shade << 8 | shade);
 }
 
 static void clear_texture_reads(void) {
     for (unsigned i = 0; i < CACHE_COUNT; ++i) cache[i].read_end = 0;
+    for (unsigned i = 0; i < REMAP_COUNT; ++i) remaps[i].queued = 0;
 }
 
-static int flush_commands_impl(int wait_for_render, char *error, size_t size) {
-    if (complete_presentation(error, size)) return -1;
-    if (!active || !command_size) return 0;
-    WORK(resolves, 1);
-    if (pvr_wait_ready()) return hardware_fail(error, size, "PVR tile accelerator wait failed");
-    uint32_t w = TW, h = TH;
-    pvr_scene_begin_txr(active->image[active->current ^ 1], &w, &h);
-    if (pvr_list_begin(PVR_LIST_TR_POLY))
-        return fail(error, size, "PVR ordered list initialization failed");
-    pvr_poly_cxt_t c;
-    pvr_poly_hdr_t header __attribute__((aligned(32)));
-    pvr_vertex_t v[4] __attribute__((aligned(32)));
-    if (!command_replaces) {
-        WORK(preservation, 1);
-        context(&c, current_image(active),
-                PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
-        c.blend.src = PVR_BLEND_ONE;
-        c.blend.dst = PVR_BLEND_ZERO;
-        pvr_poly_compile(&header, &c);
-        vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH, 0xffffffff);
-        if (pvr_prim(&header, sizeof header) || pvr_prim(v, sizeof v))
-            return hardware_fail(error, size, "PVR framebuffer preservation failed");
+static void merge_texture_reads(const texture_read *reads, const uint8_t *regions) {
+    for (unsigned i = 0; i < CACHE_COUNT; ++i) {
+        const texture_read *read = &reads[i];
+        texture *t = &cache[i];
+        if (!read->end) continue;
+        if (!t->read_end) {
+            t->read_begin = read->begin; t->read_end = read->end;
+            t->read_top = read->top; t->read_bottom = read->bottom;
+        } else {
+            if (read->begin < t->read_begin) t->read_begin = read->begin;
+            if (read->end > t->read_end) t->read_end = read->end;
+            if (read->top < t->read_top) t->read_top = read->top;
+            if (read->bottom > t->read_bottom) t->read_bottom = read->bottom;
+        }
     }
-    if (pvr_prim(commands, command_size))
-        return hardware_fail(error, size, "PVR primitive submission failed");
-    /* scene_finish only enqueues TA work. Wait for registration before the
-     * render fence, otherwise render_busy may still be false and resources
-     * can be reused while that scene is only just starting. */
-    if (pvr_list_finish() || pvr_scene_finish())
-        return hardware_fail(error, size, "PVR list submission failed");
-    if (pvr_wait_ready()) return hardware_fail(error, size, "PVR registration completion failed");
-    if (wait_for_render && pvr_wait_render_done())
-        return hardware_fail(error, size, "PVR render-to-texture completion failed");
-    active->current ^= 1;
-    active->background_source = 0;
-    command_size = 0;
+    for (unsigned i = 0; i < REMAP_COUNT; ++i)
+        if (regions[i]) remaps[i].queued = 1;
+}
+
+static void rebuild_texture_reads(void) {
     clear_texture_reads();
-    command_replaces = 0;
+    merge_texture_reads(current_reads, current_remaps);
+    for (target *t = targets; t; t = t->next)
+        if (t->saved_size) merge_texture_reads(t->saved_reads, t->saved_remaps);
+}
+
+static void clear_current_texture_reads(void) {
+    memset(current_reads, 0, sizeof current_reads);
+    memset(current_remaps, 0, sizeof current_remaps);
+    rebuild_texture_reads();
+}
+
+static void retire_command_resources(void) {
+    clear_current_transients();
+    release_transients();
+    clear_current_texture_reads();
+    if (saved_count) return;
     palette_used = 0;
     memset(palette_banks, 0, sizeof palette_banks);
     for (unsigned i = 0; i < SHARED_GROUPS; ++i) shared_groups[i].bank = -1;
+}
+
+static int flush_commands_impl(int wait_for_render, char *error, size_t size) {
+    if (!active || !command_size) return 0;
+    if (wait_for_render && command_clear_only) {
+        if (pvr_wait_render_done())
+            return hardware_fail(error, size, "PVR clear completion failed");
+        sq_clr(current_image(active), TW * TH * sizeof(uint16_t));
+        active->known_clear = 1;
+        if (last_presented == active) last_presented = NULL;
+    } else {
+        if (last_presented == active) last_presented = NULL;
+        WORK(resolves, 1);
+        if (pvr_wait_ready()) return hardware_fail(error, size, "PVR tile accelerator wait failed");
+        if (wait_for_render) {
+            uint32_t width = TW, height = TH;
+            pvr_scene_begin_txr(active->image[active->current ^ 1], &width, &height);
+        } else {
+            pvr_scene_begin();
+        }
+        if (pvr_list_begin(PVR_LIST_TR_POLY))
+            return fail(error, size, "PVR ordered list initialization failed");
+        pvr_poly_hdr_t header __attribute__((aligned(32)));
+        pvr_vertex_t v[4] __attribute__((aligned(32)));
+        if (!command_replaces) {
+            WORK(preservation, 1);
+            picture_quad(&header, v, current_image(active), 255);
+            if (pvr_prim(&header, sizeof header) || pvr_prim(v, sizeof v))
+                return hardware_fail(error, size, "PVR framebuffer preservation failed");
+        }
+        if (pvr_prim(commands, command_size))
+            return hardware_fail(error, size, "PVR primitive submission failed");
+        if (pvr_list_finish() || pvr_scene_finish())
+            return hardware_fail(error, size, "PVR list submission failed");
+        if (pvr_wait_ready()) return hardware_fail(error, size, "PVR registration completion failed");
+        if (pvr_wait_render_done())
+            return hardware_fail(error, size, "PVR framebuffer rendering completion failed");
+        if (!wait_for_render) {
+            uint32_t address = PVR_GET(PVR_RENDER_ADDR);
+            if ((address & ~((uint32_t)PVR_RAM_SIZE - 1)) ||
+                address > PVR_RAM_SIZE - 320 * 240 * 2)
+                return fail(error, size, "invalid PVR render framebuffer address");
+            const uint32_t *source = (const uint32_t *)(PVR_RAM_BASE + address);
+            uint32_t *destination = sq_lock(active->image[active->current ^ 1]);
+            for (unsigned y = 0; y < 240; ++y)
+                sq_fast_cpy(destination + y * (TW / 2), source + y * (320 / 2), 320 * 2 / 32);
+            sq_wait();
+            sq_unlock();
+        }
+        active->current ^= 1;
+        active->known_clear = 0;
+    }
+    command_size = 0;
+    command_replaces = command_clear_only = 0;
+    retire_command_resources();
     return 0;
 }
 
@@ -718,13 +866,61 @@ static int flush_commands(int wait_for_render, char *error, size_t size) {
 
 static int finish(char *error, size_t size) {
     if (active && background_replay(active, error, size)) return -1;
+    if ((pictures[0] || pictures[1]) && active && command_size && !command_clear_only)
+        return fail(error, size, "PVR intermediate scene required before presentation");
     return flush_commands(1, error, size);
 }
 
 static int select_target(target *t, char *error, size_t size) {
     if (active != t) {
         if (active && background_stop(active, error, size)) return -1;
-        if (finish(error, size)) return -1;
+        if (t->saved_size > command_capacity) {
+            uint8_t *expanded = memalign(32, t->saved_size);
+            if (!expanded) return fail(error, size, "cannot restore PVR picture commands");
+            memcpy(expanded, commands, command_size);
+            free(commands);
+            commands = expanded;
+            command_capacity = t->saved_size;
+        }
+        if (command_size && command_clear_only) {
+            if (finish(error, size)) return -1;
+        } else if (command_size) {
+            uint8_t *saved = malloc(command_size);
+            if (!saved) return fail(error, size, "cannot defer PVR picture commands");
+            if (capture_transients(&active->saved_transients, &active->saved_transient_count,
+                                   error, size)) {
+                free(saved);
+                return -1;
+            }
+            memcpy(saved, commands, command_size);
+            active->saved_commands = saved;
+            active->saved_size = command_size;
+            active->saved_header = last_header;
+            active->saved_replaces = command_replaces;
+            active->saved_clear_only = command_clear_only;
+            memcpy(active->saved_reads, current_reads, sizeof current_reads);
+            memcpy(active->saved_remaps, current_remaps, sizeof current_remaps);
+            ++saved_count;
+            command_size = 0;
+            clear_current_transients();
+            memset(current_reads, 0, sizeof current_reads);
+            memset(current_remaps, 0, sizeof current_remaps);
+            command_replaces = command_clear_only = 0;
+        }
+        if (t->saved_size) {
+            memcpy(commands, t->saved_commands, t->saved_size);
+            command_size = t->saved_size;
+            last_header = t->saved_header;
+            command_replaces = t->saved_replaces;
+            command_clear_only = t->saved_clear_only;
+            release_saved_transients(t, 1);
+            memcpy(current_reads, t->saved_reads, sizeof current_reads);
+            memcpy(current_remaps, t->saved_remaps, sizeof current_remaps);
+            free(t->saved_commands);
+            t->saved_commands = NULL;
+            t->saved_size = 0;
+            --saved_count;
+        }
     }
     active = t;
     return 0;
@@ -770,7 +966,8 @@ static void *create(int width, int height, char *error, size_t size) {
         return NULL;
     }
     if (!users) {
-        submission_paced = 0;
+        last_presented = NULL;
+        presentation_paced = 0;
 #if GEX_PROFILE_RENDERER
         if (!report_registered) {
             if (atexit(report_profile)) {
@@ -802,18 +999,18 @@ static void *create(int width, int height, char *error, size_t size) {
             fail(error, size, "PVR initialization failed");
             return NULL;
         }
+        PVR_SET(PVR_SCALER_CFG, PVR_GET(PVR_SCALER_CFG) & ~1u);
         pvr_set_pal_format(PVR_PAL_ARGB8888);
-        /* KOS enables framebuffer dithering by default. Native pixel art and
-         * repeated framebuffer feedback must not accumulate that noise. */
+        /* KOS enables framebuffer dithering by default. */
         PVR_SET(PVR_FB_CFG_2, PVR_GET(PVR_FB_CFG_2) & ~8u);
         /* CPU-built commands are copied synchronously to TA store queues;
          * cached RAM avoids uncached VRAM reads and writes on every append. */
         commands = memalign(32, COMMAND_BYTES);
-        staging = pvr_mem_malloc(TW * TH * 2);
-        if (!commands || !staging) {
+        command_capacity = commands ? COMMAND_BYTES : 0;
+        if (!commands) {
             free(commands);
-            if (staging) pvr_mem_free(staging);
-            commands = staging = NULL;
+            commands = NULL;
+            command_capacity = 0;
             pvr_shutdown();
             fail(error, size, "cannot allocate PVR submission storage");
             return NULL;
@@ -833,8 +1030,7 @@ static void *create(int width, int height, char *error, size_t size) {
             free(t);
         }
         if (!users) {
-            free(commands); commands = NULL;
-            pvr_mem_free(staging); staging = NULL;
+            free(commands); commands = NULL; command_capacity = 0;
             pvr_shutdown();
         }
         fail(error, size, "cannot allocate PVR framebuffer textures");
@@ -845,13 +1041,13 @@ static void *create(int width, int height, char *error, size_t size) {
         if (thd_set_hz(1000)) {
             for (unsigned i = 0; i < 2; ++i) pvr_mem_free(t->image[i]);
             free(t);
-            free(commands); commands = NULL;
-            pvr_mem_free(staging); staging = NULL;
+            free(commands); commands = NULL; command_capacity = 0;
             pvr_shutdown();
             fail(error, size, "cannot select millisecond PVR scheduling");
             return NULL;
         }
     }
+    t->known_clear = 1;
     ++users;
     t->next = targets;
     targets = t;
@@ -862,43 +1058,47 @@ static void *create(int width, int height, char *error, size_t size) {
 
 static void destroy(void *data) {
     target *t = data;
-    char error[128];
-    if (complete_presentation(error, sizeof error)) {
-        fprintf(stderr, "[packet-gpu] %s\n", error);
-        abort();
-    }
     if (active == t) {
-        if (finish(error, sizeof error)) { fprintf(stderr, "[packet-gpu] %s\n", error); abort(); }
+        command_size = 0;
+        command_replaces = command_clear_only = 0;
         active = NULL;
+        retire_command_resources();
     }
-    for (unsigned i = 0; i < 2; ++i) pvr_mem_free(t->image[i]);
-    if (t->background_image) pvr_mem_free(t->background_image);
+    if (t->saved_size) {
+        release_saved_transients(t, 0);
+        free(t->saved_commands);
+        t->saved_commands = NULL;
+        t->saved_size = 0;
+        --saved_count;
+        rebuild_texture_reads();
+        release_transients();
+    }
+    for (unsigned i = 0; i < 2; ++i)
+        if (t->image[i]) pvr_mem_free(t->image[i]);
     free(t->background);
     for (unsigned i = 0; i < 2; ++i) if (pictures[i] == t) pictures[i] = NULL;
     if (t->history) pvr_mem_free(t->history);
+    if (last_presented == t) last_presented = NULL;
     target **link = &targets;
     while (*link != t) link = &(*link)->next;
     *link = t->next;
     free(t);
     if (!--users) {
-        for (unsigned i = 0; i < 2; ++i) {
-            if (feedback[i]) pvr_mem_free(feedback[i]);
-            feedback[i] = NULL;
-        }
         release_cache();
+        release_transients();
         tracked_atlas = NULL;
         memset(palette_keys, 0, sizeof palette_keys);
         memset(small_palettes, 0, sizeof small_palettes);
-        free(commands); commands = NULL;
-        pvr_mem_free(staging); staging = NULL;
+        free(commands); commands = NULL; command_capacity = 0;
         pvr_shutdown();
         if (thd_set_hz(previous_scheduler_hz)) {
             fprintf(stderr, "[packet-gpu] cannot restore scheduler frequency\n");
             abort();
         }
         command_size = palette_used = 0;
+        saved_count = 0;
         memset(palette_banks, 0, sizeof palette_banks);
-        command_replaces = 0;
+        command_replaces = command_clear_only = 0;
         cache_clock = 0;
     }
 }
@@ -908,6 +1108,8 @@ static int upload(void *data, const uint16_t *pixels, char *error, size_t size) 
     if (t->owned) return fail(error, size, "PVR live framebuffer CPU replacement is forbidden");
     if (background_stop(t, error, size) ||
         select_target(t, error, size) || finish(error, size)) return -1;
+    t->known_clear = 0;
+    if (last_presented == t) last_presented = NULL;
     uint16_t *out = t->image[t->current];
     for (int y = 0; y < 240; ++y)
         for (int x = 0; x < 320; ++x)
@@ -1059,28 +1261,30 @@ static void update_region(texture *t, const gex_gpu_material *m,
 }
 
 static int evict_texture(texture *protected, size_t bytes, char *error, size_t size) {
-    if (finish(error, size)) return -1;
-    /* An empty CPU queue can still have a registered RTT using these images. */
-    if (pvr_wait_render_done())
-        return hardware_fail(error, size, "PVR texture reclamation completion failed");
     texture *victim = NULL;
     remap_texture *remapped = NULL;
-    /* Prefer an old allocation large enough for the failed request. Freeing
-     * tiny remaps first needlessly destroys warming without opening a hole. */
-    for (unsigned pass = 0; pass < 2; ++pass) {
-        size_t minimum = pass ? 0 : bytes;
-        for (unsigned i = 0; i < CACHE_COUNT; ++i)
-            if (&cache[i] != protected && cache[i].storage &&
-                (cache[i].bytes >= minimum || cache[i].source_bytes >= minimum) &&
-                (!victim || cache[i].used < victim->used)) victim = &cache[i];
-        for (unsigned i = 0; i < REMAP_COUNT; ++i)
-            if (remaps[i].image &&
-                remaps[i].dimension * remaps[i].dimension *
-                    (remaps[i].group == SHARED_GROUPS ? 2u : 1u) >= minimum &&
-                (!remapped || remaps[i].used < remapped->used))
-                remapped = &remaps[i];
+    for (unsigned fenced = 0; fenced < 2; ++fenced) {
+        /* Prefer an allocation large enough to open the requested hole. */
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            size_t minimum = pass ? 0 : bytes;
+            for (unsigned i = 0; i < CACHE_COUNT; ++i)
+                if (&cache[i] != protected && cache[i].storage && !cache[i].read_end &&
+                    (cache[i].bytes >= minimum || cache[i].source_bytes >= minimum) &&
+                    (!victim || cache[i].used < victim->used)) victim = &cache[i];
+            for (unsigned i = 0; i < REMAP_COUNT; ++i)
+                if (remaps[i].image && !remaps[i].queued &&
+                    remaps[i].dimension * remaps[i].dimension *
+                        (remaps[i].group == SHARED_GROUPS ? 2u : 1u) >= minimum &&
+                    (!remapped || remaps[i].used < remapped->used))
+                    remapped = &remaps[i];
+            if (victim || remapped) break;
+        }
         if (victim || remapped) break;
+        if (fenced) break;
+        if (finish(error, size)) return -1;
     }
+    if (pvr_wait_render_done())
+        return hardware_fail(error, size, "PVR texture reclamation completion failed");
     if (!victim && !remapped) return fail(error, size, "PVR texture memory cannot be reclaimed");
     if (remapped && (!victim || remapped->used < victim->used)) release_remap(remapped);
     else release_texture(victim);
@@ -1091,6 +1295,18 @@ static int reserve_texture(texture *t, size_t storage, char *error, size_t size)
     while (cache_bytes + storage > CACHE_BYTES)
         if (evict_texture(t, 0, error, size)) return -1;
     return 0;
+}
+
+static int cache_can_reserve(texture *protected, size_t storage, size_t replaced) {
+    size_t available = CACHE_BYTES - cache_bytes + replaced;
+    for (unsigned i = 0; i < CACHE_COUNT; ++i)
+        if (&cache[i] != protected && !cache[i].read_end)
+            available += cache[i].storage;
+    for (unsigned i = 0; i < REMAP_COUNT; ++i)
+        if (remaps[i].image && !remaps[i].queued)
+            available += remaps[i].dimension * remaps[i].dimension *
+                         (remaps[i].group == SHARED_GROUPS ? 2u : 1u);
+    return available >= storage;
 }
 
 static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
@@ -1121,13 +1337,148 @@ static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
     }
 }
 
+static pvr_ptr_t allocate_texture_without_drain(texture *protected, size_t bytes,
+                                                char *error, size_t size) {
+    for (;;) {
+        pvr_ptr_t memory = pvr_mem_malloc(bytes);
+        if (memory) return memory;
+        int reclaimable = 0;
+        for (unsigned i = 0; i < CACHE_COUNT; ++i)
+            if (&cache[i] != protected && cache[i].storage && !cache[i].read_end)
+                reclaimable = 1;
+        for (unsigned i = 0; i < REMAP_COUNT; ++i)
+            if (remaps[i].image && !remaps[i].queued)
+                reclaimable = 1;
+        if (!reclaimable) return NULL;
+        if (evict_texture(protected, bytes, error, size)) return NULL;
+    }
+}
+
+static transient_texture *snapshot_picture_image(const target *source, char *error, size_t size) {
+    transient_texture *snapshot = calloc(1, sizeof *snapshot);
+    if (!snapshot) {
+        fail(error, size, "cannot allocate PVR converted texture record");
+        return NULL;
+    }
+    snapshot->next = transients;
+    transients = snapshot;
+    transient_pin pin = {snapshot, active_transient_pin};
+    active_transient_pin = &pin;
+    snapshot->image[0] =
+        allocate_texture(NULL, TW * TH * 2, "picture-copy", 0, 0, 0, error, size);
+    if (!snapshot->image[0]) {
+        active_transient_pin = pin.previous;
+        release_transients();
+        return NULL;
+    }
+    uint32_t *destination = sq_lock(snapshot->image[0]);
+    sq_fast_cpy(destination, current_image(source), TW * TH * 2 / 32);
+    sq_wait();
+    sq_unlock();
+    snapshot->current = 1;
+    active_transient_pin = pin.previous;
+    return snapshot;
+}
+
+static unsigned sampled_color(const gex_gpu_material *m, unsigned u, unsigned v) {
+    unsigned format = m->page >> 7 & 3;
+    unsigned base = (m->page & 15) * 128 + (m->page & 16 ? 0x80000 : 0);
+    unsigned at = (base + v * 2048 +
+                   (format == 0 ? u / 2 : format == 1 ? u : u * 2)) & 0xfffff;
+    if (format == 2) return word(m->atlas + at);
+    unsigned index = m->atlas[at];
+    if (format == 0) index = index >> ((u & 1) * 4) & 15;
+    return word(m->atlas + ((m->clut * 32 + index * 2) & 0xffffe));
+}
+
+static transient_texture *snapshot_texture(const gex_gpu_material *m,
+                                           unsigned u0, unsigned u1,
+                                           unsigned v0, unsigned v1,
+                                           char *error, size_t size) {
+    unsigned dimension = 8, left = u0, top = v0;
+    while (dimension < u1 - u0 || dimension < v1 - v0) dimension *= 2;
+    if (left + dimension > 256) left = 256 - dimension;
+    if (top + dimension > 256) top = 256 - dimension;
+    if (!active_transient_pin) {
+        fail(error, size, "PVR converted texture has no submission scope");
+        return NULL;
+    }
+    if (m->atlas == tracked_atlas)
+        for (transient_texture *t = transients; t; t = t->next)
+            if (t->atlas == m->atlas && t->epoch == atlas_write_epoch &&
+                t->page == m->page && t->clut == m->clut &&
+                t->alpha == (m->opcode & 2) && t->origin_u == left &&
+                t->origin_v == top && t->dimension == dimension) {
+                active_transient_pin->texture = t;
+                return t;
+            }
+    transient_texture *t = calloc(1, sizeof *t);
+    if (!t) {
+        fail(error, size, "cannot allocate PVR converted texture record");
+        return NULL;
+    }
+    t->next = transients;
+    transients = t;
+    active_transient_pin->texture = t;
+    size_t bytes = dimension * dimension * sizeof(uint16_t);
+    t->image[0] = allocate_texture(NULL, bytes, "texture-snapshot", m->page,
+                                   m->clut, m->opcode, error, size);
+    if (t->image[0] && (m->opcode & 2))
+        t->image[1] = allocate_texture(NULL, bytes, "texture-snapshot-alpha", m->page,
+                                       m->clut, m->opcode, error, size);
+    if (!t->image[0] || ((m->opcode & 2) && !t->image[1])) {
+        active_transient_pin->texture = NULL;
+        transients = t->next;
+        for (unsigned i = 0; i < 2; ++i)
+            if (t->image[i]) pvr_mem_free(t->image[i]);
+        free(t);
+        return NULL;
+    }
+    for (unsigned y = 0; y < dimension; y += 2)
+        for (unsigned x = 0; x < dimension; x += 2) {
+            unsigned c[4] = {
+                sampled_color(m, left + x, top + y),
+                sampled_color(m, left + x, top + y + 1),
+                sampled_color(m, left + x + 1, top + y),
+                sampled_color(m, left + x + 1, top + y + 1)
+            };
+            uint16_t opaque[4], alpha[4];
+            for (unsigned i = 0; i < 4; ++i) {
+                unsigned value = c[i] ? argb1555(c[i]) : 0;
+                int half = (m->opcode & 2) && (c[i] & 0x8000);
+                opaque[i] = half ? 0 : (uint16_t)value;
+                alpha[i] = half ? (uint16_t)value : 0;
+            }
+            unsigned at = (twiddle(y) | twiddle(x) << 1) / 2;
+            uint32_t *out = t->image[0];
+            out[at] = opaque[0] | (uint32_t)opaque[1] << 16;
+            out[at + 1] = opaque[2] | (uint32_t)opaque[3] << 16;
+            if (t->image[1]) {
+                out = t->image[1];
+                out[at] = alpha[0] | (uint32_t)alpha[1] << 16;
+                out[at + 1] = alpha[2] | (uint32_t)alpha[3] << 16;
+            }
+        }
+    t->atlas = m->atlas;
+    t->epoch = atlas_write_epoch;
+    t->page = m->page;
+    t->clut = m->clut;
+    t->alpha = m->opcode & 2;
+    t->origin_u = left;
+    t->origin_v = top;
+    t->dimension = dimension;
+    return t;
+}
+
 static void zero_texture_memory(pvr_ptr_t memory, size_t bytes) {
     volatile uint32_t *out = memory;
     for (size_t i = 0; i < bytes / sizeof *out; ++i) out[i] = 0;
 }
 
 static texture *texture_region_base(const gex_gpu_material *m, int raw,
-                                    int u0, int u1, int v0, int v1, char *error, size_t size) {
+                                    int u0, int u1, int v0, int v1, int avoid_drain,
+                                    char *error, size_t size) {
+    /* With avoid_drain, NULL without an error requests a compact snapshot. */
     WORK(page_lookups, 1);
     unsigned format = m->page >> 7 & 3;
     raw = format == 2 && raw;
@@ -1169,7 +1520,6 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
                     same_bytes(t->source + y * row + begin + first, m->atlas, bytes - first);
             WORK(compared_bytes, bytes);
             if (equal) {
-                if (complete_presentation(error, size)) return NULL;
                 /* Unsampled GPU bytes are unspecified, even when their
                  * zero source snapshot matches the newly requested texels. */
                 pack_row(t, m, raw, y, begin, end);
@@ -1200,17 +1550,34 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
     if (t && m->atlas == tracked_atlas && (format < 2 || raw)) {
         WORK(texture_refreshes, 1);
         if (refresh_reads(t, m, begin, end, v0, v1)) {
+            texture *replacement = NULL;
+            for (unsigned i = 0; i < CACHE_COUNT; ++i) {
+                texture *candidate = &cache[i];
+                if (candidate == t || candidate->read_end) continue;
+                if (!replacement || candidate->used < replacement->used)
+                    replacement = candidate;
+            }
+            if (replacement) {
+                t = replacement;
+                goto rebuild;
+            }
+            if (avoid_drain) return NULL;
             if (finish(error, size)) return NULL;
-        } else if (complete_presentation(error, size)) return NULL;
+        }
         update_region(t, m, begin, end, v0, v1, 1);
         t->used = used;
         return t;
     }
-    if (!t)
+    if (!t) {
         for (unsigned i = 0; i < CACHE_COUNT; ++i)
-            if (!t || cache[i].used < t->used) t = &cache[i];
-    /* Unused slots cannot affect queued draws; eviction must retire them. */
-    if (t->valid && finish(error, size)) return NULL;
+            if (!cache[i].read_end && (!t || cache[i].used < t->used)) t = &cache[i];
+        if (!t)
+            for (unsigned i = 0; i < CACHE_COUNT; ++i)
+                if (!t || cache[i].used < t->used) t = &cache[i];
+    }
+rebuild:
+    if (avoid_drain && t->valid && t->read_end) return NULL;
+    if (t->valid && t->read_end && finish(error, size)) return NULL;
     t->verified_atlas = NULL;
     t->region_begin = t->region_end = t->region_top = t->region_bottom = 0;
     memset(t->dirty, 0xff, sizeof t->dirty);
@@ -1219,23 +1586,30 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
     int masked = format == 2 && !raw && (m->opcode & 2);
     if (t->bytes != bytes || t->source_bytes != source_bytes ||
         (!raw && !!t->image[1] != masked)) {
-        release_texture(t);
         size_t storage = source_bytes + bytes * (masked ? 2 : 1);
+        if (avoid_drain && !cache_can_reserve(t, storage, t->storage)) return NULL;
+        release_texture(t);
         /* Keep small paletted pages resident without allowing direct-color
-         * pages to consume VRAM reserved for RTT targets and PVR binning. */
+         * pages to consume VRAM reserved for picture buffers and PVR binning. */
         if (reserve_texture(t, storage, error, size)) return NULL;
         t->bytes = bytes;
         t->source_bytes = source_bytes;
         t->storage = storage;
         cache_bytes += storage;
-        t->source = allocate_texture(t, source_bytes, "page-source", m->page,
-                                     m->rgb, m->opcode, error, size);
+        t->source = avoid_drain ?
+            allocate_texture_without_drain(t, source_bytes, error, size) :
+            allocate_texture(t, source_bytes, "page-source", m->page,
+                             m->rgb, m->opcode, error, size);
         if (t->source)
-            t->image[0] = allocate_texture(t, bytes, "page-image", m->page,
-                                           m->rgb, m->opcode, error, size);
+            t->image[0] = avoid_drain ?
+                allocate_texture_without_drain(t, bytes, error, size) :
+                allocate_texture(t, bytes, "page-image", m->page,
+                                 m->rgb, m->opcode, error, size);
         if (t->image[0] && masked)
-            t->image[1] = allocate_texture(t, bytes, "page-alpha", m->page,
-                                           m->rgb, m->opcode, error, size);
+            t->image[1] = avoid_drain ?
+                allocate_texture_without_drain(t, bytes, error, size) :
+                allocate_texture(t, bytes, "page-alpha", m->page,
+                                 m->rgb, m->opcode, error, size);
         if (!t->source || !t->image[0] || (masked && !t->image[1])) {
             release_texture(t);
             return NULL;
@@ -1262,21 +1636,26 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
     return t;
 }
 
-static texture *texture_region(const gex_gpu_material *m, int raw, int u0, int u1, int v0, int v1,
-                               char *error, size_t size) {
-    texture *t = texture_region_base(m, raw, u0, u1, v0, v1, error, size);
+static texture *texture_region_impl(const gex_gpu_material *m, int raw, int u0, int u1,
+                                    int v0, int v1, int avoid_drain, char *error, size_t size) {
+    texture *t = texture_region_base(m, raw, u0, u1, v0, v1, avoid_drain, error, size);
     if (!t || !t->raw || !(m->opcode & 2) || t->image[1]) return t;
     /* Opaque and alpha draws share one source and opaque image. Create the
      * two alpha passes lazily, without modifying an image in a queued draw. */
+    if (avoid_drain && !cache_can_reserve(t, t->bytes * 2, 0)) return NULL;
     if (reserve_texture(t, t->bytes * 2, error, size)) return NULL;
-    pvr_ptr_t unmasked = allocate_texture(t, t->bytes, "page-alpha", m->page,
-                                          m->rgb, m->opcode, error, size);
-    pvr_ptr_t masked = unmasked ? allocate_texture(t, t->bytes, "page-alpha",
-                                                   m->page, m->rgb, m->opcode,
-                                                   error, size) : NULL;
+    pvr_ptr_t unmasked = avoid_drain ?
+        allocate_texture_without_drain(t, t->bytes, error, size) :
+        allocate_texture(t, t->bytes, "page-alpha", m->page,
+                         m->rgb, m->opcode, error, size);
+    pvr_ptr_t masked = unmasked ?
+        (avoid_drain ? allocate_texture_without_drain(t, t->bytes, error, size) :
+         allocate_texture(t, t->bytes, "page-alpha", m->page, m->rgb, m->opcode,
+                          error, size)) : NULL;
     if (!unmasked || !masked) {
         if (unmasked) pvr_mem_free(unmasked);
         if (masked) pvr_mem_free(masked);
+        if (avoid_drain && (!error || !size || !*error)) return NULL;
         fprintf(stderr, "[packet-gpu] alpha allocation failed: page=%lx opcode=%lx "
                 "cache=%lu free=%lu request=%lu\n",
                 (unsigned long)m->page, (unsigned long)m->opcode,
@@ -1314,6 +1693,11 @@ static texture *texture_region(const gex_gpu_material *m, int raw, int u0, int u
     return t;
 }
 
+static texture *texture_region(const gex_gpu_material *m, int raw, int u0, int u1, int v0, int v1,
+                               char *error, size_t size) {
+    return texture_region_impl(m, raw, u0, u1, v0, v1, 0, error, size);
+}
+
 static uint32_t *palette_colors(const gex_gpu_material *m, int raw, unsigned count,
                                 uint32_t decoded[256]) {
     unsigned source = m->clut * 32 & 0xfffff;
@@ -1349,7 +1733,8 @@ static int shared_bank(unsigned offset) {
     return 0;
 }
 
-static int palette(const gex_gpu_material *m, int raw, char *error, size_t size) {
+static int palette(const gex_gpu_material *m, int raw, int allow_drain,
+                   char *error, size_t size) {
     unsigned count = (m->page >> 7 & 3) == 0 ? 16 : 256;
     WORK(pal4_calls, count == 16);
     WORK(pal8_calls, count == 256);
@@ -1379,12 +1764,13 @@ static int palette(const gex_gpu_material *m, int raw, char *error, size_t size)
             break;
         }
     if (offset + count > 1024) {
+        if (!allow_drain) return -2;
         WORK(palette_drains, 1);
         WORK(pal8_drains, count == 256);
         if (finish(error, size)) return -1;
         offset = 0;
     }
-    if (program_palette(offset, colors, count, error, size)) return -1;
+    program_palette(offset, colors, count);
     /* PAL8 writes replace sixteen PAL4 banks. Source keys from retired
      * lists must not claim that an overwritten bank still holds its CLUT. */
     for (unsigned i = 0; i < 64; ++i)
@@ -1409,12 +1795,13 @@ static uint16_t *shared_color_slot(unsigned group, uint32_t color) {
     return &shared_groups[group].lookup[at];
 }
 
-static int shared_palette(unsigned group, char *error, size_t size) {
+static int shared_palette(unsigned group, int allow_drain, char *error, size_t size) {
     if (shared_groups[group].bank < 0) {
         unsigned bank;
         for (bank = 0; bank < 64; bank += 16)
             if (!(palette_banks[bank / 32] & (UINT32_C(0xffff) << (bank & 31)))) break;
         if (bank == 64) {
+            if (!allow_drain) return -2;
             WORK(palette_drains, 1);
             if (finish(error, size)) return -1;
             bank = 0;
@@ -1429,8 +1816,8 @@ static int shared_palette(unsigned group, char *error, size_t size) {
     /* Existing indices never move. Appending unused entries cannot change
      * colors sampled by already queued draws in this group. */
     unsigned written = shared_groups[group].written;
-    if (program_palette(offset + written, shared_groups[group].colors + written,
-                        shared_groups[group].count - written, error, size)) return -1;
+    program_palette(offset + written, shared_groups[group].colors + written,
+                    shared_groups[group].count - written);
     shared_groups[group].written = shared_groups[group].count;
     return shared_groups[group].bank;
 }
@@ -1485,8 +1872,9 @@ static remap_texture *remapped_region_impl(const gex_gpu_material *m, int u0, in
         if (!victim || (!t->valid && victim->valid) ||
             (t->valid == victim->valid && t->used < victim->used)) victim = t;
     }
-    if (command_size && (victim->image || remap_bytes + bytes > REMAP_BYTES ||
-                         cache_bytes + bytes > CACHE_BYTES)) {
+    if ((command_size || saved_count) &&
+        (victim->image || remap_bytes + bytes > REMAP_BYTES ||
+         cache_bytes + bytes > CACHE_BYTES)) {
         WORK(remap_queued, 1);
         defer_warming(m, u0, u1, v0, v1);
         return NULL;
@@ -1572,7 +1960,7 @@ static remap_texture *remapped_region_impl(const gex_gpu_material *m, int u0, in
         }
     color_space_failed:
         if (group == SHARED_GROUPS) {
-            if (!command_size && active->reclaim_budget) {
+            if (!command_size && !saved_count && active->reclaim_budget) {
                 remap_texture *cold = NULL;
                 for (unsigned i = 0; i < REMAP_COUNT; ++i)
                     if (&remaps[i] != victim && remaps[i].valid &&
@@ -1668,13 +2056,15 @@ static remap_texture *remapped_region(const gex_gpu_material *m, int u0, int u1,
 }
 
 static float texture_coordinate(draw_texture t, float coordinate, int vertical) {
-    return t.region ?
+    return t.converted ?
+        (coordinate * 256 - (vertical ? t.converted->origin_v : t.converted->origin_u)) /
+        t.converted->dimension : t.region ?
         (coordinate * 256 - (vertical ? t.region->origin_v : t.region->origin_u)) /
         t.region->dimension : coordinate;
 }
 
 static int prune_shared_colors(char *error, size_t size) {
-    if (!shared_dirty || command_size) return 0;
+    if (!shared_dirty || command_size || saved_count) return 0;
     if (finish(error, size)) return -1;
     uint32_t live[SHARED_GROUPS][8] = {{0}};
     for (unsigned i = 0; i < REMAP_COUNT; ++i)
@@ -1724,12 +2114,27 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     if (!t->region) {
         gex_gpu_material neutral = *m;
         neutral.rgb = 0x808080;
-        t->page = texture_region(&neutral, 1, u0, u1, v0, v1, error, size);
-        if (!t->page) return -1;
+        char page_error[256] = {0};
+        t->page = texture_region_impl(&neutral, 1, u0, u1, v0, v1, 1,
+                                      page_error, sizeof page_error);
+        if (!t->page) {
+            if (page_error[0]) return fail(error, size, page_error);
+            t->converted = snapshot_texture(m, u0, u1, v0, v1, error, size);
+            if (!t->converted) return -1;
+            *bank = 0;
+            return 0;
+        }
     }
     *bank = t->region ? (t->region->group == SHARED_GROUPS ? 0 :
-                        shared_palette(t->region->group, error, size)) :
-        (m->page >> 7 & 3) < 2 ? palette(m, 1, error, size) : 0;
+                        shared_palette(t->region->group, 0, error, size)) :
+        (m->page >> 7 & 3) < 2 ? palette(m, 1, 0, error, size) : 0;
+    if (*bank == -2) {
+        t->converted = snapshot_texture(m, u0, u1, v0, v1, error, size);
+        if (!t->converted) return -1;
+        t->page = NULL;
+        t->region = NULL;
+        *bank = 0;
+    }
     return *bank < 0 ? -1 : 0;
 }
 
@@ -1743,10 +2148,22 @@ static int native_texture_region(const gex_gpu_material *m, int u0, int u1, int 
 
 static int append(const pvr_poly_hdr_t *header, const pvr_vertex_t v[4],
                   char *error, size_t size) {
+    command_clear_only = 0;
     int same_header = command_size && !memcmp(header, &last_header, sizeof *header);
     size_t bytes = (same_header ? 0 : sizeof *header) + sizeof(pvr_vertex_t) * 4;
     /* Palette selectors remain valid across command-buffer drains. */
-    if (command_size + bytes > COMMAND_BYTES) {
+    if (command_size + bytes > command_capacity &&
+        command_size + bytes <= COMMAND_MAX_BYTES) {
+        size_t capacity = command_capacity * 2;
+        if (capacity > COMMAND_MAX_BYTES) capacity = COMMAND_MAX_BYTES;
+        uint8_t *expanded = memalign(32, capacity);
+        if (!expanded) return fail(error, size, "cannot expand PVR command buffer");
+        memcpy(expanded, commands, command_size);
+        free(commands);
+        commands = expanded;
+        command_capacity = capacity;
+    }
+    if (command_size + bytes > command_capacity) {
         unsigned used = palette_used;
         uint32_t banks[2];
         int shared_banks[SHARED_GROUPS];
@@ -1768,6 +2185,8 @@ static int append(const pvr_poly_hdr_t *header, const pvr_vertex_t v[4],
     }
     memcpy(commands + command_size, v, sizeof(pvr_vertex_t) * 4);
     command_size += sizeof(pvr_vertex_t) * 4;
+    if (active_transient_pin && active_transient_pin->texture)
+        active_transient_pin->texture->current = 1;
     return 0;
 }
 
@@ -1777,19 +2196,36 @@ static int append_replacement(const pvr_poly_hdr_t *header, const pvr_vertex_t v
      * fences remain intact; later partial draws still preserve this image. */
     WORK(discarded_bytes, command_size);
     command_size = 0;
-    clear_texture_reads();
+    clear_current_transients();
+    release_transients();
+    clear_current_texture_reads();
     command_replaces = 1;
     return append(header, v, error, size);
 }
 
 static int append_texture(const pvr_poly_hdr_t *header, const pvr_vertex_t v[4],
-                          texture *t, unsigned u0, unsigned u1, unsigned v0, unsigned v1,
+                          texture *t, remap_texture *region,
+                          unsigned u0, unsigned u1, unsigned v0, unsigned v1,
                           char *error, size_t size) {
     if (append(header, v, error, size)) return -1;
+    if (region) {
+        region->queued = 1;
+        current_remaps[region - remaps] = 1;
+    }
     if (!t) return 0;
     unsigned format = t->page >> 7 & 3;
     unsigned begin = format == 0 ? u0 / 2 : format == 1 ? u0 : u0 * 2;
     unsigned end = format == 0 ? (u1 + 1) / 2 : format == 1 ? u1 : u1 * 2;
+    texture_read *read = &current_reads[t - cache];
+    if (!read->end) {
+        read->begin = begin; read->end = end;
+        read->top = v0; read->bottom = v1;
+    } else {
+        if (begin < read->begin) read->begin = begin;
+        if (end > read->end) read->end = end;
+        if (v0 < read->top) read->top = v0;
+        if (v1 > read->bottom) read->bottom = v1;
+    }
     /* Record after append: a capacity drain may have retired earlier reads. */
     if (!t->read_end) {
         t->read_begin = begin; t->read_end = end;
@@ -1822,7 +2258,7 @@ static int native_clear(void *data, char *error, size_t size) {
     if (t->warm_budget) {
         /* Vacant slots let later draws warm without evicting queued images.
          * Retire only invalid regions, before this frame queues its clear. */
-        if (!command_size) {
+        if (!command_size && !saved_count) {
             for (unsigned reclaimed = 0; reclaimed < WARM_REGIONS; ++reclaimed) {
                 remap_texture *stale = NULL;
                 for (unsigned i = 0; i < REMAP_COUNT; ++i)
@@ -1882,27 +2318,150 @@ static int native_clear(void *data, char *error, size_t size) {
     pvr_poly_compile(&header, &c);
     vertices(v, 0, 0, 320, 240, 0, 0, 0, 0, 0xff000000);
     int result = append_replacement(&header, v, error, size);
+    if (!result) command_clear_only = 1;
     NATIVE_DRAW_END(clear);
     return result;
 }
 
 static int native_copy(void *destination, void *source, unsigned shade, char *error, size_t size) {
     target *src = source;
+    target *dst = destination;
+    if (!src || !dst) return fail(error, size, "invalid PVR framebuffer copy target");
     if (shade > 255) return fail(error, size, "invalid PVR framebuffer shade");
+    if (src == dst && shade == 255) return 0;
     if (background_stop(src, error, size) ||
-        background_stop(destination, error, size) ||
-        finish(error, size) || select_target(destination, error, size)) return -1;
-    pvr_poly_cxt_t c;
+        background_stop(dst, error, size)) return -1;
+    if (!shade) {
+        return native_clear(dst, error, size);
+    }
+    if (shade < 255 && (src->saved_size || (active == src && command_size))) {
+        if (native_copy(dst, src, 255, error, size) ||
+            select_target(dst, error, size)) return -1;
+        pvr_poly_cxt_t c;
+        pvr_poly_hdr_t header;
+        pvr_vertex_t v[4];
+        context(&c, NULL, 0, 0, 0);
+        pvr_poly_compile(&header, &c);
+        vertices(v, 0, 0, 320, 240, 0, 0, 0, 0, (255 - shade) << 24);
+        return append(&header, v, error, size);
+    }
+    if (shade == 255 && src != dst && src->saved_size) {
+        if (dst == active) {
+            if (src->saved_size > command_capacity) {
+                uint8_t *expanded = memalign(32, src->saved_size);
+                if (!expanded) return fail(error, size, "cannot restore PVR picture commands");
+                free(commands);
+                commands = expanded;
+                command_capacity = src->saved_size;
+            }
+            if (!src->saved_replaces) {
+                uint32_t *out = sq_lock(current_image(dst));
+                sq_fast_cpy(out, current_image(src), TW * TH * 2 / 32);
+                sq_wait();
+                sq_unlock();
+            }
+            memcpy(commands, src->saved_commands, src->saved_size);
+            command_size = src->saved_size;
+            last_header = src->saved_header;
+            command_replaces = src->saved_replaces;
+            command_clear_only = src->saved_clear_only;
+            clear_current_transients();
+            for (size_t i = 0; i < src->saved_transient_count; ++i)
+                src->saved_transients[i]->current = 1;
+            memcpy(current_reads, src->saved_reads, sizeof current_reads);
+            memcpy(current_remaps, src->saved_remaps, sizeof current_remaps);
+            rebuild_texture_reads();
+            release_transients();
+            return 0;
+        }
+        {
+            uint8_t *snapshot = malloc(src->saved_size);
+            if (!snapshot) return fail(error, size, "cannot defer PVR picture snapshot");
+            transient_texture **snapshot_transients = NULL;
+            if (clone_saved_transients(src, &snapshot_transients, error, size)) {
+                free(snapshot);
+                return -1;
+            }
+            memcpy(snapshot, src->saved_commands, src->saved_size);
+            if (!src->saved_replaces) {
+                uint32_t *out = sq_lock(current_image(dst));
+                sq_fast_cpy(out, current_image(src), TW * TH * 2 / 32);
+                sq_wait();
+                sq_unlock();
+            }
+            if (dst->saved_size) {
+                release_saved_transients(dst, 0);
+                free(dst->saved_commands);
+                --saved_count;
+            }
+            dst->saved_commands = snapshot;
+            dst->saved_size = src->saved_size;
+            dst->saved_header = src->saved_header;
+            dst->saved_replaces = src->saved_replaces;
+            dst->saved_clear_only = src->saved_clear_only;
+            dst->saved_transients = snapshot_transients;
+            dst->saved_transient_count = src->saved_transient_count;
+            memcpy(dst->saved_reads, src->saved_reads, sizeof dst->saved_reads);
+            memcpy(dst->saved_remaps, src->saved_remaps, sizeof dst->saved_remaps);
+            ++saved_count;
+            rebuild_texture_reads();
+            release_transients();
+            return 0;
+        }
+    }
+    if (src->saved_size && (select_target(src, error, size) || finish(error, size)))
+        return -1;
+    if (shade == 255 && src != dst && active == src && command_size) {
+        uint8_t *snapshot;
+        transient_texture **snapshot_transients = NULL;
+        size_t snapshot_transient_count = 0;
+        snapshot = malloc(command_size);
+        if (!snapshot) return fail(error, size, "cannot defer PVR picture snapshot");
+        if (capture_transients(&snapshot_transients, &snapshot_transient_count, error, size)) {
+            free(snapshot);
+            return -1;
+        }
+        memcpy(snapshot, commands, command_size);
+        if (!command_replaces) {
+            uint32_t *out = sq_lock(current_image(dst));
+            sq_fast_cpy(out, current_image(src), TW * TH * 2 / 32);
+            sq_wait();
+            sq_unlock();
+        }
+        if (dst->saved_size) {
+            release_saved_transients(dst, 0);
+            free(dst->saved_commands);
+            dst->saved_commands = NULL;
+            dst->saved_size = 0;
+            --saved_count;
+            release_transients();
+            rebuild_texture_reads();
+        }
+        dst->saved_commands = snapshot;
+        dst->saved_size = command_size;
+        dst->saved_header = last_header;
+        dst->saved_replaces = command_replaces;
+        dst->saved_clear_only = command_clear_only;
+        dst->saved_transients = snapshot_transients;
+        dst->saved_transient_count = snapshot_transient_count;
+        memcpy(dst->saved_reads, current_reads, sizeof current_reads);
+        memcpy(dst->saved_remaps, current_remaps, sizeof current_remaps);
+        ++saved_count;
+        return 0;
+    }
+    if ((active == src && command_size && finish(error, size)) ||
+        select_target(dst, error, size)) return -1;
+    transient_texture *snapshot = snapshot_picture_image(src, error, size);
+    if (!snapshot) return -1;
+    transient_pin pin = {snapshot, active_transient_pin};
+    active_transient_pin = &pin;
     pvr_poly_hdr_t header;
     pvr_vertex_t v[4];
-    context(&c, current_image(src), PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
-    c.blend.src = PVR_BLEND_ONE; c.blend.dst = PVR_BLEND_ZERO;
-    pvr_poly_compile(&header, &c);
-    vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH,
-             0xff000000 | shade << 16 | shade << 8 | shade);
-    if (append_replacement(&header, v, error, size)) return -1;
-    /* A copy can reference either ping-pong slot, including its own target. */
-    return finish(error, size);
+    picture_quad(&header, v, snapshot->image[0], shade);
+    int result = append_replacement(&header, v, error, size);
+    active_transient_pin = pin.previous;
+    if (result) release_transients();
+    return result;
 }
 
 static int native_blit(void *data, int x, int y, int width, int height,
@@ -1910,73 +2469,76 @@ static int native_blit(void *data, int x, int y, int width, int height,
     if (!pixels || width <= 0 || height <= 0 || width > TW || height > TH ||
         pitch < width * 2 || x < 0 || y < 0 || x + width > 320 || y + height > 240)
         return fail(error, size, "invalid PVR asset blit");
-    if (background_stop(data, error, size) ||
-        finish(error, size) || select_target(data, error, size)) return -1;
-    uint16_t *out = staging;
+    if (background_stop(data, error, size) || select_target(data, error, size)) return -1;
+    unsigned tw = 8, th = 8;
+    while (tw < (unsigned)width) tw *= 2;
+    while (th < (unsigned)height) th *= 2;
+    transient_texture *texture = calloc(1, sizeof *texture);
+    if (!texture) return fail(error, size, "cannot allocate PVR asset texture record");
+    texture->next = transients;
+    transients = texture;
+    transient_pin pin = {texture, active_transient_pin};
+    active_transient_pin = &pin;
+    size_t bytes = tw * th * sizeof(uint16_t);
+    texture->image[0] = allocate_texture(NULL, bytes, "asset-blit", 0, 0, 0, error, size);
+    if (!texture->image[0]) {
+        active_transient_pin = pin.previous;
+        release_transients();
+        return -1;
+    }
+    uint16_t *out = texture->image[0];
     for (int row = 0; row < height; ++row)
         for (int col = 0; col < width; ++col) {
             unsigned c = word(pixels + row * pitch + col * 2);
-            out[row * TW + col] = (int)c == key ? 0 : (uint16_t)argb1555(c);
+            out[row * tw + col] = (int)c == key ? 0 : (uint16_t)argb1555(c);
         }
     pvr_poly_cxt_t c;
     pvr_poly_hdr_t header;
     pvr_vertex_t v[4];
-    context(&c, staging, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
+    context(&c, out, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, tw, th);
     pvr_poly_compile(&header, &c);
     vertices(v, (float)x, (float)y, (float)width, (float)height,
-             0, 0, (float)width / TW, (float)height / TH, 0xffffffff);
-    if (append(&header, v, error, size)) return -1;
-    return finish(error, size);
+             0, 0, (float)width / tw, (float)height / th, 0xffffffff);
+    int result = append(&header, v, error, size);
+    active_transient_pin = pin.previous;
+    if (result) release_transients();
+    return result;
 }
 
 static int native_present(void *data, char *error, size_t size) {
     target *t = data;
-    if (background_stop(t, error, size) ||
-        flush_commands(0, error, size) || select_target(t, error, size))
-        return -1;
-    if (pvr_wait_ready())
-        return hardware_fail(error, size, "PVR presentation wait failed");
-    /* Keep two-vblank cadence without delaying CPU preparation until the flip. */
-    pvr_stats_t display;
+    if (background_stop(t, error, size) || select_target(t, error, size)) return -1;
+    if (!command_size && last_presented != t) {
+        if (t->known_clear) {
+            if (native_clear(t, error, size)) return -1;
+        } else {
+            pvr_poly_hdr_t header;
+            pvr_vertex_t v[4];
+            picture_quad(&header, v, current_image(t), 255);
+            if (append_replacement(&header, v, error, size)) return -1;
+        }
+    }
     uint64_t deadline = timer_us_gettime64() + 100000;
-    for (;;) {
-        if (read_display(&display)) return fail(error, size, "cannot read PVR pacing state");
-        if (!submission_paced || display.vbl_count - last_submission_vblank >= 2) break;
+    while (presentation_paced && (unsigned)pvr_get_vbl_count() - last_present_vblank < 1) {
         if (timer_us_gettime64() >= deadline)
-            return fail(error, size, "PVR pacing vblank timed out");
+            return fail(error, size, "PVR presentation pacing timed out");
         thd_sleep(1);
     }
-    size_t previous_display = display.frame_count;
-    pvr_poly_cxt_t c;
-    pvr_poly_hdr_t header __attribute__((aligned(32)));
-    pvr_vertex_t v[4] __attribute__((aligned(32)));
-    context(&c, current_image(t), PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
-    c.blend.src = PVR_BLEND_ONE; c.blend.dst = PVR_BLEND_ZERO;
-    pvr_poly_compile(&header, &c);
-    vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH, 0xffffffff);
-    pvr_scene_begin();
-    if (pvr_list_begin(PVR_LIST_TR_POLY) || pvr_prim(&header, sizeof header) ||
-        pvr_prim(v, sizeof v) || pvr_list_finish() || pvr_scene_finish() || pvr_wait_ready())
-        return hardware_fail(error, size, "PVR GPU presentation failed");
-    /* Double-buffered TA registration queues scanout behind RTT. Once
-     * scanout starts, RTT and its palette reads are complete; CPU preparation
-     * may proceed until finish() fences the RGB565 scanout's resource use. */
-    presentation_pending = 1;
-    if (read_display(&display)) return fail(error, size, "cannot read PVR scanout pacing state");
-    if (!submission_paced) {
-        /* Startup render latency can span a vblank; align only the first flip. */
-        deadline = timer_us_gettime64() + 100000;
-        while (display.frame_count == previous_display) {
-            if (timer_us_gettime64() >= deadline)
-                return fail(error, size, "PVR first page flip timed out");
-            thd_sleep(1);
-            if (read_display(&display)) return fail(error, size, "cannot read PVR first page flip");
-        }
-        last_submission_vblank = display.vbl_count - 1;
+    if (command_size) {
+        int result = flush_commands(0, error, size);
+        if (result || display_wait(PVR_GET(PVR_RENDER_ADDR), error, size)) return -1;
+        last_presented = t;
     } else {
-        last_submission_vblank = display.vbl_count;
+        unsigned vblank = (unsigned)pvr_get_vbl_count();
+        deadline = timer_us_gettime64() + 100000;
+        while ((unsigned)pvr_get_vbl_count() == vblank) {
+            if (timer_us_gettime64() >= deadline)
+                return fail(error, size, "PVR presentation pacing timed out");
+            thd_sleep(1);
+        }
     }
-    submission_paced = 1;
+    last_present_vblank = (unsigned)pvr_get_vbl_count();
+    presentation_paced = 1;
 #if GEX_PROFILE_RENDERER
     if (profile_display(error, size)) return -1;
     uint64_t cpu, now = gex_packet_gpu_profile_clock(&cpu);
@@ -2064,21 +2626,51 @@ static int native_movie(void *data, const uint8_t *pixels, int width, int height
                         char *error, size_t size) {
     if (!pixels || width <= 0 || height <= 0 || width > TW || height > TH || pitch < width * 2)
         return fail(error, size, "PVR movie texture dimensions are unsupported");
-    if (finish(error, size) || select_target(data, error, size)) return -1;
-    for (int row = 0; row < height; ++row)
-        memcpy((uint8_t *)staging + row * TW * 2, pixels + row * pitch, (size_t)width * 2);
-    if (native_clear(data, error, size)) return -1;
+    target *t = data;
+    if (background_stop(t, error, size) || select_target(t, error, size)) return -1;
+    t->background_valid = 0;
+    t->background_count = t->background_at = 0;
+    t->pending_key.valid = 0;
+    if (native_clear(t, error, size)) return -1;
+    transient_texture *frame = calloc(1, sizeof *frame);
+    if (!frame) return fail(error, size, "cannot allocate PVR asset texture record");
+    frame->next = transients;
+    transients = frame;
+    transient_pin pin = {frame, active_transient_pin};
+    active_transient_pin = &pin;
+    frame->image[0] = allocate_texture(NULL, TW * TH * 2, "movie", 0, 0, 0, error, size);
+    if (!frame->image[0]) {
+        active_transient_pin = pin.previous;
+        release_transients();
+        return -1;
+    }
+    if (!((uintptr_t)pixels & 7) && !(pitch & 7) && !((width * 2) & 31)) {
+        uint32_t *out = sq_lock(frame->image[0]);
+        for (int row = 0; row < height; ++row)
+            sq_fast_cpy(out + row * (TW / 2), pixels + row * pitch, (size_t)width * 2 / 32);
+        sq_wait();
+        sq_unlock();
+    } else {
+        for (int row = 0; row < height; ++row)
+            memcpy((uint8_t *)frame->image[0] + row * TW * 2,
+                   pixels + row * pitch, (size_t)width * 2);
+    }
     float w = 320, h = (float)height * 320 / width;
     if (h > 240) { h = 240; w = (float)width * 240 / height; }
     pvr_poly_cxt_t c;
     pvr_poly_hdr_t header;
     pvr_vertex_t v[4];
-    context(&c, staging, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
+    context(&c, frame->image[0], PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
     c.blend.src = PVR_BLEND_ONE; c.blend.dst = PVR_BLEND_ZERO;
     pvr_poly_compile(&header, &c);
     vertices(v, (320 - w) * 0.5f, (240 - h) * 0.5f, w, h,
              0, 0, (float)width / TW, (float)height / TH, 0xffffffff);
-    if (append(&header, v, error, size)) return -1;
+    int result = append(&header, v, error, size);
+    active_transient_pin = pin.previous;
+    if (result) {
+        release_transients();
+        return -1;
+    }
     return native_present(data, error, size);
 }
 
@@ -2120,33 +2712,36 @@ static unsigned clip_polygon(const gex_gpu_vertex *input, unsigned count,
 }
 
 static uint32_t polygon_header(const gex_gpu_material *m, draw_texture tx, int bank,
-                               unsigned pass, int picture, pvr_poly_hdr_t *header) {
+                               unsigned pass, pvr_poly_hdr_t *header) {
     unsigned code = m->opcode & ~2u, format = m->page >> 7 & 3;
     int textured = code == 0x64 || code == 0x2c;
     int fmt = format == 0 ? PVR_TXRFMT_PAL4BPP | PVR_TXRFMT_4BPP_PAL(bank) :
               format == 1 ? PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank) :
                             PVR_TXRFMT_ARGB1555;
+    if (tx.converted) fmt = PVR_TXRFMT_ARGB1555;
     if (tx.region) fmt = tx.region->group == SHARED_GROUPS ? PVR_TXRFMT_ARGB1555 :
                         PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank);
-    if (picture >= 0) fmt = PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED;
     unsigned image = pass + (tx.page && tx.page->raw && (m->opcode & 2) ? 1 : 0);
-    if (textured && picture < 0 && tx.region &&
+    if (textured && !tx.converted && tx.region &&
         tx.region->header_format == fmt) {
         *header = tx.region->header;
-    } else if (textured && picture < 0 && tx.page &&
+    } else if (textured && !tx.converted && tx.page &&
                tx.page->header_valid[image] && tx.page->header_format[image] == fmt) {
         *header = tx.page->header[image];
     } else {
         pvr_poly_cxt_t c;
-        context(&c, picture >= 0 ? feedback[picture] : !textured ? NULL :
+        context(&c, !textured ? NULL :
+                    tx.converted ? tx.converted->image[pass] :
                     tx.region ? tx.region->image : tx.page->image[image],
-                fmt, picture >= 0 ? TW : tx.region ? tx.region->dimension : 256,
-                picture >= 0 ? TH : tx.region ? tx.region->dimension : 256);
+                fmt, tx.converted ? tx.converted->dimension :
+                     tx.region ? tx.region->dimension : 256,
+                tx.converted ? tx.converted->dimension :
+                     tx.region ? tx.region->dimension : 256);
         pvr_poly_compile(header, &c);
-        if (textured && picture < 0 && tx.region) {
+        if (textured && !tx.converted && tx.region) {
             tx.region->header = *header;
             tx.region->header_format = fmt;
-        } else if (textured && picture < 0) {
+        } else if (textured && !tx.converted) {
             tx.page->header[image] = *header;
             tx.page->header_format[image] = fmt;
             tx.page->header_valid[image] = 1;
@@ -2155,35 +2750,11 @@ static uint32_t polygon_header(const gex_gpu_material *m, draw_texture tx, int b
     if (!textured)
         return ((m->opcode & 2) ? 128u : 255u) << 24 | (m->rgb & 255) << 16 |
                (m->rgb & 0xff00) | (m->rgb >> 16 & 255);
-    if (picture >= 0 || format < 2 ||
+    if (format < 2 ||
         (code == 0x64 && !(m->opcode & 2) && (m->rgb & 255) != 128 &&
          (m->rgb >> 8 & 255) != 128 && (m->rgb >> 16 & 255) != 128))
-        return tint(m->rgb, pass || (picture >= 0 && (m->opcode & 2)) ? 128 : 255);
+        return tint(m->rgb, pass ? 128 : 255);
     return pass ? 0x80ffffff : 0xffffffff;
-}
-
-static int snapshot_picture(unsigned plane, char *error, size_t size) {
-    WORK(snapshots, 1);
-    target *t = pictures[plane];
-    if (!feedback[plane])
-        feedback[plane] = allocate_texture(NULL, TW * TH * 2, "feedback",
-                                           plane, 0, 0, error, size);
-    if (!feedback[plane]) return -1;
-    if (pvr_wait_ready()) return hardware_fail(error, size, "PVR feedback wait failed");
-    uint32_t w = TW, h = TH;
-    pvr_poly_cxt_t c;
-    pvr_poly_hdr_t header __attribute__((aligned(32)));
-    pvr_vertex_t v[4] __attribute__((aligned(32)));
-    context(&c, current_image(t), PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
-    c.blend.src = PVR_BLEND_ONE; c.blend.dst = PVR_BLEND_ZERO;
-    pvr_poly_compile(&header, &c);
-    vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH, 0xffffffff);
-    pvr_scene_begin_txr(feedback[plane], &w, &h);
-    if (pvr_list_begin(PVR_LIST_TR_POLY) || pvr_prim(&header, sizeof header) ||
-        pvr_prim(v, sizeof v) || pvr_list_finish() || pvr_scene_finish() ||
-        pvr_wait_ready() || pvr_wait_render_done())
-        return hardware_fail(error, size, "PVR framebuffer snapshot failed");
-    return 0;
 }
 
 static int samples_picture(const gex_gpu_material *m, unsigned plane,
@@ -2227,19 +2798,18 @@ static float pixel_ceil(float value) {
 
 /* Keep general clipping's arrays and register spills out of rectangular draws. */
 static int __attribute__((noinline)) polygon_pieces(const gex_gpu_vertex q[4], int left, int top, int right, int bottom,
-                          const gex_gpu_material *m, draw_texture tx, int bank, const int sampled[2],
+                          const gex_gpu_material *m, draw_texture tx, int bank,
                           const float bounds[8], char *error, size_t size) {
     float x0 = bounds[0], x1 = bounds[1], y0 = bounds[2], y1 = bounds[3];
     float u0 = bounds[4], u1 = bounds[5], v0 = bounds[6], v1 = bounds[7];
     unsigned code = m->opcode & ~2u, format = m->page >> 7 & 3;
     int textured = code == 0x64 || code == 0x2c;
-    int source_x = (int)(m->page & 15) * 64;
-    int source_y = m->page & 16 ? 256 : 0;
     int min_u = (int)floorf(u0), max_u = (int)ceilf(u1);
     int min_v = (int)floorf(v0), max_v = (int)ceilf(v1);
     if (min_u < 0 || max_u > 255) { min_u = 0; max_u = 255; }
     if (min_v < 0 || max_v > 255) { min_v = 0; max_v = 255; }
-    unsigned passes = textured && format == 2 && (m->opcode & 2) ? 2 : 1;
+    unsigned passes = textured && (format == 2 || tx.converted) &&
+                      (m->opcode & 2) ? 2 : 1;
     int ux0 = textured ? (int)floorf(u0 / 256) : 0;
     int ux1 = textured ? (int)floorf(u1 / 256) : 0;
     int vy0 = textured ? (int)floorf(v0 / 256) : 0;
@@ -2250,26 +2820,10 @@ static int __attribute__((noinline)) polygon_pieces(const gex_gpu_vertex q[4], i
         for (int ux = ux0; ux <= ux1; ++ux) {
             float u_edges[5] = {0};
             unsigned nu = 1;
-            const int x_edges[] = {320, 1024, 1344};
-            if (sampled[0] || sampled[1])
-                for (unsigned i = 0; i < 3; ++i) {
-                    int edge = x_edges[i] - source_x;
-                    if (edge > 0 && edge < 256)
-                        u_edges[nu++] = (float)edge;
-                }
             u_edges[nu++] = 256;
             for (unsigned ui = 0; ui + 1 < nu; ++ui) {
-                int carry = source_x + (u_edges[ui] + u_edges[ui + 1]) * 0.5f >= 1024;
-                int px = source_x - carry * 1024, py = source_y + carry;
                 float v_edges[6] = {0};
                 unsigned nv = 1;
-                const int picture_edges[] = {8, 232, 248, 472};
-                if (sampled[0] || sampled[1])
-                    for (unsigned i = 0; i < 4; ++i) {
-                        int edge = picture_edges[i] - py;
-                        if (edge > 0 && edge < 256)
-                            v_edges[nv++] = (float)edge;
-                    }
                 v_edges[nv++] = 256;
                 for (unsigned vi = 0; vi + 1 < nv; ++vi) {
                     gex_gpu_vertex a[24], b[24];
@@ -2310,25 +2864,9 @@ static int __attribute__((noinline)) polygon_pieces(const gex_gpu_vertex q[4], i
                     if (pixel_ceil(min_x - 0.5f) >= pixel_ceil(max_x - 0.5f) ||
                         pixel_ceil(min_y - 0.5f) >= pixel_ceil(max_y - 0.5f))
                         continue;
-                    int picture = -1;
-                    if (textured && format == 2 && px + u_edges[ui] < 320)
-                        for (unsigned plane = 0; plane < 2; ++plane) {
-                            float y = py + (v_edges[vi] + v_edges[vi + 1]) * 0.5f;
-                            if (sampled[plane] && y >= 8 + plane * 240 && y < 232 + plane * 240)
-                                picture = (int)plane;
-                        }
-                    unsigned piece_passes = picture >= 0 ? 1 : passes;
-                    /* GPU-only pieces never prepare a CPU atlas snapshot. */
-                    if (textured && picture < 0 && !tx.page && !tx.region) {
-                        gex_gpu_material material = *m;
-                        material.rgb = 0x808080;
-                        tx.page = texture_region(&material, 1, min_u, max_u + 1,
-                                                 min_v, max_v + 1, error, size);
-                        if (!tx.page) return -1;
-                    }
-                    for (unsigned pass = 0; pass < piece_passes; ++pass) {
+                    for (unsigned pass = 0; pass < passes; ++pass) {
                         pvr_poly_hdr_t header;
-                        uint32_t color = polygon_header(m, tx, bank, pass, picture, &header);
+                        uint32_t color = polygon_header(m, tx, bank, pass, &header);
                         for (unsigned i = 1; i + 1 < count; ++i) {
                             gex_gpu_vertex triangle[] = {a[0], a[i], a[i + 1], a[i + 1]};
                             if (count == 4) {
@@ -2339,17 +2877,14 @@ static int __attribute__((noinline)) polygon_pieces(const gex_gpu_vertex q[4], i
                                 v[j] = (pvr_vertex_t){
                                     .flags = j == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX,
                                     .x = triangle[j].x, .y = triangle[j].y, .z = 1,
-                                    .u = (triangle[j].u - ux * 256 + (picture >= 0 ? px : 0)) /
-                                         (picture >= 0 ? TW : 256),
-                                    .v = (triangle[j].v - uy * 256 +
-                                          (picture >= 0 ? py - picture * 240 : 0)) / 256,
+                                    .u = (triangle[j].u - ux * 256) / 256,
+                                    .v = (triangle[j].v - uy * 256) / 256,
                                     .argb = color, .oargb = 0};
-                            if (picture < 0)
-                                for (unsigned j = 0; j < 4; ++j) {
-                                    v[j].u = texture_coordinate(tx, v[j].u, 0);
-                                    v[j].v = texture_coordinate(tx, v[j].v, 1);
-                                }
-                            if (append_texture(&header, v, picture < 0 ? tx.page : NULL,
+                            for (unsigned j = 0; j < 4; ++j) {
+                                v[j].u = texture_coordinate(tx, v[j].u, 0);
+                                v[j].v = texture_coordinate(tx, v[j].v, 1);
+                            }
+                            if (append_texture(&header, v, tx.page, tx.region,
                                                min_u, max_u + 1, min_v, max_v + 1,
                                                error, size)) return -1;
                             if (count == 4) break;
@@ -2358,7 +2893,6 @@ static int __attribute__((noinline)) polygon_pieces(const gex_gpu_vertex q[4], i
                 }
             }
         }
-    if ((sampled[0] || sampled[1]) && finish(error, size)) return -1;
     return 0;
 }
 
@@ -2425,10 +2959,6 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
         return fail(error, size, "PVR polygon texture coordinates out of range");
     if (x1 <= left || x0 >= right || y1 <= top || y0 >= bottom)
         return 0;
-    int indexed_samples[2] = {0, 0};
-    if (textured && format < 2)
-        for (unsigned plane = 0; plane < 2; ++plane)
-            indexed_samples[plane] = samples_picture(m, plane, u0, u1, v0, v1);
     float sample_u0 = u0, sample_u1 = u1, sample_v0 = v0, sample_v1 = v1;
     float cx0 = x0 > left ? x0 : left, cx1 = x1 < right ? x1 : right;
     float cy0 = y0 > top ? y0 : top, cy1 = y1 < bottom ? y1 : bottom;
@@ -2452,12 +2982,11 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
         sample_u0 = a < b ? a : b; sample_u1 = a > b ? a : b;
         sample_v0 = c < d ? c : d; sample_v1 = c > d ? c : d;
     }
-    if (textured && format < 2)
+    if (textured)
         for (unsigned plane = 0; plane < 2; ++plane)
-            if (indexed_samples[plane] &&
-                samples_picture(m, plane, sample_u0, sample_u1, sample_v0, sample_v1)) {
+            if (samples_picture(m, plane, sample_u0, sample_u1, sample_v0, sample_v1)) {
                 snprintf(error, size,
-                         "PVR indexed framebuffer sampling: page=%x clut=%x plane=%u UV=%.2f,%.2f..%.2f,%.2f XY=%.1f,%.1f..%.1f,%.1f",
+                         "PVR framebuffer sampling is unsupported: page=%x clut=%x plane=%u UV=%.2f,%.2f..%.2f,%.2f XY=%.1f,%.1f..%.1f,%.1f",
                          m->page, m->clut, plane, u0, v0, u1, v1, x0, y0, x1, y1);
                 return -1;
             }
@@ -2467,33 +2996,25 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
     int max_v = rectangle ? (int)sample_v1 : (int)pixel_ceil(sample_v1);
     if (min_u < 0 || max_u > 255) { min_u = 0; max_u = 255; }
     if (min_v < 0 || max_v > 255) { min_v = 0; max_v = 255; }
+    if (textured && format < 2) {
+        unsigned clut = m->clut * 32 & 0xfffff;
+        for (unsigned plane = 0; plane < 2; ++plane)
+            if (pictures[plane] && pictures[plane]->atlas == m->atlas &&
+                write_overlap(clut, format == 0 ? 32 : 512,
+                              (8 + plane * 240) * 2048, 2048, 640, 224))
+                return fail(error, size, "PVR framebuffer-as-CLUT is unsupported without readback");
+    }
     draw_texture tx = {0};
     int bank = 0;
-    int sampled[2] = {0, 0};
-    if (textured && format == 2)
-        for (unsigned plane = 0; plane < 2; ++plane) {
-            if (samples_picture(m, plane, u0, u1, v0, v1)) {
-                /* Freeze source slots on the GPU before any command-buffer
-                 * drain can overwrite a self-sampled ping-pong target. */
-                if (finish(error, size) || snapshot_picture(plane, error, size))
-                    return -1;
-                sampled[plane] = 1;
-            }
-        }
-    if (textured && !sampled[0] && !sampled[1]) {
+    if (textured) {
         if (native_texture_region(m, min_u, max_u + 1, min_v, max_v + 1,
                                   &tx, &bank, error, size)) return -1;
     }
     if (bank < 0)
         return -1;
-    if (textured && format < 2) {
-        unsigned clut = m->clut * 32 & 0xfffff, cy = clut / 2048, cx = clut & 2047;
-        if (cx < 640 && ((pictures[0] && pictures[0]->atlas == m->atlas && cy >= 8 && cy < 232) ||
-                         (pictures[1] && pictures[1]->atlas == m->atlas && cy >= 248 && cy < 472)))
-            return fail(error, size, "PVR framebuffer-as-CLUT is unsupported without readback");
-    }
-    unsigned passes = textured && format == 2 && (m->opcode & 2) ? 2 : 1;
-    if (!sampled[0] && !sampled[1] && rectangle) {
+    unsigned passes = textured && (format == 2 || tx.converted) &&
+                      (m->opcode & 2) ? 2 : 1;
+    if (rectangle) {
         int first_u = texel_floor(a / 256.0f), last_u = texel_floor(b / 256.0f);
         int first_v = texel_floor(c / 256.0f), last_v = texel_floor(d / 256.0f);
         if (!textured || (first_u == last_u && first_v == last_v)) {
@@ -2519,7 +3040,7 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
             }
             for (unsigned pass = 0; pass < passes; ++pass) {
                 pvr_poly_hdr_t header;
-                uint32_t color = polygon_header(m, tx, bank, pass, -1, &header);
+                uint32_t color = polygon_header(m, tx, bank, pass, &header);
                 pvr_vertex_t vertices[4];
                 for (unsigned i = 0; i < 4; ++i)
                     vertices[i] = (pvr_vertex_t){
@@ -2527,22 +3048,25 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
                         .x = rectangle[i & 1], .y = rectangle[2 + (i >> 1)], .z = 1,
                         .u = rectangle[4 + (i & 1)], .v = rectangle[6 + (i >> 1)],
                         .argb = color, .oargb = 0};
-                if (append_texture(&header, vertices, tx.page,
+                if (append_texture(&header, vertices, tx.page, tx.region,
                                    min_u, max_u + 1, min_v, max_v + 1, error, size)) return -1;
             }
             return 0;
         }
     }
     const float bounds[] = {x0, x1, y0, y1, u0, u1, v0, v1};
-    return polygon_pieces(q, left, top, right, bottom, m, tx, bank, sampled, bounds, error, size);
+    return polygon_pieces(q, left, top, right, bottom, m, tx, bank, bounds, error, size);
 }
 
 static int native_polygon_prepare(void *data, const gex_gpu_vertex input[4], int left, int top, int right,
                                   int bottom, const gex_gpu_material *m, background_polygon *prepared,
                                   char *error, size_t size) {
     PROFILE_BEGIN();
+    transient_pin pin = {NULL, active_transient_pin};
+    active_transient_pin = &pin;
     int result = native_polygon_prepare_impl(data, input, left, top, right, bottom,
                                             m, prepared, error, size);
+    active_transient_pin = pin.previous;
     PROFILE_END(prepare);
     return result;
 }
@@ -2552,8 +3076,8 @@ static int native_polygon_draw(void *data, const gex_gpu_vertex input[4], int le
     return native_polygon_prepare(data, input, left, top, right, bottom, m, NULL, error, size);
 }
 
-static int background_draw(target *t, const background_polygon *p, unsigned rgb,
-                           char *error, size_t size) {
+static int background_draw_impl(target *t, const background_polygon *p, unsigned rgb,
+                                char *error, size_t size) {
     gex_gpu_material material = p->material;
     material.rgb = rgb;
     if (!p->prepared_valid)
@@ -2570,52 +3094,44 @@ static int background_draw(target *t, const background_polygon *p, unsigned rgb,
                                   p->region[2], p->region[3], &tx, &bank, error, size)) return -1;
     }
     if (bank < 0) return -1;
-    pvr_poly_hdr_t header;
-    uint32_t color = polygon_header(&material, tx, bank, 0, -1, &header);
     float u[2], v[2];
     for (unsigned i = 0; i < 2; ++i) {
         u[i] = texture_coordinate(tx, p->prepared[4 + i], 0);
         v[i] = texture_coordinate(tx, p->prepared[6 + i], 1);
     }
-    pvr_vertex_t vertices[4];
-    for (unsigned i = 0; i < 4; ++i)
-        vertices[i] = (pvr_vertex_t){
-            .flags = i == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX,
-            .x = p->prepared[i & 1], .y = p->prepared[2 + (i >> 1)],
-            .z = 1, .u = u[i & 1], .v = v[i >> 1],
-            .argb = color, .oargb = 0};
-    return append_texture(&header, vertices, tx.page, p->region[0], p->region[1],
-                          p->region[2], p->region[3], error, size);
+    unsigned passes = tx.converted && (material.opcode & 2) ? 2 : 1;
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        pvr_poly_hdr_t header;
+        uint32_t color = polygon_header(&material, tx, bank, pass, &header);
+        pvr_vertex_t vertices[4];
+        for (unsigned i = 0; i < 4; ++i)
+            vertices[i] = (pvr_vertex_t){
+                .flags = i == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX,
+                .x = p->prepared[i & 1], .y = p->prepared[2 + (i >> 1)],
+                .z = 1, .u = u[i & 1], .v = v[i >> 1],
+                .argb = color, .oargb = 0};
+        if (append_texture(&header, vertices, tx.page, tx.region, p->region[0], p->region[1],
+                           p->region[2], p->region[3], error, size)) return -1;
+    }
+    return 0;
+}
+
+static int background_draw(target *t, const background_polygon *p, unsigned rgb,
+                           char *error, size_t size) {
+    transient_pin pin = {NULL, active_transient_pin};
+    active_transient_pin = &pin;
+    int result = background_draw_impl(t, p, rgb, error, size);
+    active_transient_pin = pin.previous;
+    return result;
 }
 
 /* Only an exact prefix after a black clear is reusable. This preserves packet
  * order without assuming that all tile packets precede objects or HUD draws. */
-static int background_capture_impl(target *t, unsigned count, char *error, size_t size) {
+static void background_accept(target *t, unsigned count) {
     t->background_mode = BACKGROUND_IDLE;
     t->background_at = 0;
-    t->background_valid = 0;
-    t->background_count = 0;
-    if (count < BACKGROUND_MINIMUM) return 0;
-    WORK(captures, 1);
-    if (select_target(t, error, size) || finish(error, size)) return -1;
-    if (!t->background_image) t->background_image = pvr_mem_malloc(TW * TH * 2);
-    if (!t->background_image) return fail(error, size, "cannot allocate PVR background texture");
-    /* The finished prefix is already an immutable RTT image. Retain that
-     * slot as the background instead of rendering a second copy of it. */
-    pvr_ptr_t spare = t->background_image;
-    t->background_image = t->image[t->current];
-    t->image[t->current] = spare;
-    t->background_source = 1;
-    t->background_count = count;
-    t->background_valid = 1;
-    return 0;
-}
-
-static int background_capture(target *t, unsigned count, char *error, size_t size) {
-    PROFILE_BEGIN();
-    int result = background_capture_impl(t, count, error, size);
-    PROFILE_END(capture);
-    return result;
+    t->background_valid = count >= BACKGROUND_MINIMUM;
+    t->background_count = t->background_valid ? count : 0;
 }
 
 static int background_replay(target *t, char *error, size_t size) {
@@ -2651,11 +3167,12 @@ static int background_stop(target *t, char *error, size_t size) {
         t->background_at = 0;
         return 0;
     }
-    if (t->background_mode == BACKGROUND_VERIFY)
-        return background_capture(t, count, error, size);
+    if (t->background_mode == BACKGROUND_VERIFY) {
+        background_accept(t, count);
+        return 0;
+    }
     if (background_replay(t, error, size)) return -1;
-    /* Verify a shortened prefix next frame before paying for a new image.
-     * A transient mismatch must not capture moving objects into the cache. */
+    /* Verify a shortened prefix next frame before reusing its records. */
     t->background_mode = BACKGROUND_IDLE;
     t->background_at = 0;
     t->background_count = count;
@@ -2671,19 +3188,11 @@ static int background_advance(target *t, char *error, size_t size) {
         t->background_at = 0;
         return 0;
     }
-    if (t->background_mode == BACKGROUND_VERIFY)
-        return background_capture(t, t->background_at, error, size);
-    pvr_poly_cxt_t c;
-    pvr_poly_hdr_t header;
-    pvr_vertex_t v[4];
-    context(&c, t->background_image, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH);
-    c.blend.src = PVR_BLEND_ONE;
-    c.blend.dst = PVR_BLEND_ZERO;
-    pvr_poly_compile(&header, &c);
-    vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH, 0xffffffff);
-    t->background_mode = BACKGROUND_IDLE;
-    t->background_at = 0;
-    return append_replacement(&header, v, error, size);
+    if (t->background_mode == BACKGROUND_VERIFY) {
+        background_accept(t, t->background_at);
+        return 0;
+    }
+    return background_replay(t, error, size);
 }
 
 static void background_dependencies(target *t, const gex_gpu_vertex input[4],
@@ -2888,7 +3397,7 @@ static int draw(void *data, const gex_gpu_span *spans, size_t count, const gex_g
     texture *t = textured ? page_texture(m, spans, count, error, size) : NULL;
     if (textured && !t)
         return -1;
-    int bank = textured && format < 2 ? palette(m, 0, error, size) : 0;
+    int bank = textured && format < 2 ? palette(m, 0, 1, error, size) : 0;
     if (bank < 0)
         return -1;
     unsigned passes = textured && format == 2 && (m->opcode & 2) ? 2 : 1;
@@ -2967,7 +3476,7 @@ static int draw(void *data, const gex_gpu_span *spans, size_t count, const gex_g
                     vertices(v, (float)(s->x + x), (float)(s->y + row), (float)run, (float)block,
                              tu / 256, sample_v / 256, step * run / 256,
                              vertical ? (float)block / 256 : 0, color[pass]);
-                    if (append_texture(&header[pass], v, t, 0, 256, 0, 256, error, size))
+                    if (append_texture(&header[pass], v, t, NULL, 0, 256, 0, 256, error, size))
                         return -1;
                 }
                 row += block;

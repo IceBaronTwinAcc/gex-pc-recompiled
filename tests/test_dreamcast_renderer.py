@@ -8,6 +8,308 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DreamcastRendererTests(unittest.TestCase):
+    def test_pvr_fractional_rectangle_fit(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        start = source.index("static int fit_rectangle_axis(")
+        helper = source[start:source.index("static int native_polygon_prepare_impl(", start)]
+        harness = r"""
+#include <math.h>
+#include <stdio.h>
+#include "src/platform/dreamcast/sampling.h"
+static int texel_floor(float value) {
+    int truncated = (int)value;
+    return truncated - (value < truncated);
+}
+"""
+        harness += helper
+        harness += r"""
+int main(void) {
+    const int origins[] = {0, 32, 220, 255};
+    for (int width = 2; width <= 64; ++width)
+        for (int span = -40; span <= 40; ++span)
+            for (int flip = 0; flip < 2; ++flip)
+                for (int clip = 0; clip < 3; ++clip)
+                    for (unsigned o = 0; o < sizeof origins / sizeof *origins; ++o) {
+                        int origin = origins[o], position = flip ? 100 + width : 100;
+                        int end = flip ? 100 : 100 + width;
+                        int low = 100 + (clip == 1 ? width / 4 : 0);
+                        int high = 100 + width - (clip == 2 ? width / 4 : 0);
+                        int first = flip ? position - high : low - position;
+                        int count = high - low;
+                        int64_t fixed = (int64_t)span * 65536 / width;
+                        int mismatch = 0;
+                        for (int i = first; i < first + count; ++i) {
+                            int expected = origin + flip +
+                                (int)floor((double)i * fixed / 65536);
+                            float old = origin + flip + i * ((float)span / width) + 1.0f / 1024;
+                            if (span % width && texel_floor(old) != expected) mismatch = 1;
+                        }
+                        float a, b;
+                        int fitted = fit_rectangle_axis(position, end, origin, origin + span,
+                                                        low, high, &a, &b);
+                        if (fitted != mismatch) {
+                            fprintf(stderr, "fit skipped: w=%d span=%d flip=%d clip=%d origin=%d\n",
+                                    width, span, flip, clip, origin);
+                            return 1;
+                        }
+                        if (fitted)
+                            for (int i = first; i < first + count; ++i) {
+                                int expected = origin + flip +
+                                    (int)floor((double)i * fixed / 65536);
+                                float sample = a + (i - first + 0.5f) * ((b - a) / count);
+                                if (!(sample > expected && sample < expected + 1)) return 1;
+                            }
+                    }
+    const int widths[] = {96, 128, 255, 256, 319, 320, 500, 1024, 32767};
+    const int spans[] = {-256, -31, -2, 2, 15, 16, 22, 31, 255, 256};
+    for (unsigned w = 0; w < sizeof widths / sizeof *widths; ++w)
+        for (unsigned s = 0; s < sizeof spans / sizeof *spans; ++s)
+            for (int flip = 0; flip < 2; ++flip)
+                for (int clip = 0; clip < 3; ++clip)
+                    for (unsigned o = 0; o < sizeof origins / sizeof *origins; ++o) {
+                        int width = widths[w], span = spans[s], origin = origins[o];
+                        int count = width < 320 ? width : 320;
+                        int first = clip == 0 ? 0 : clip == 1 ? (width - count) / 2 : width - count;
+                        int position = flip ? width : 0, end = flip ? 0 : width;
+                        int low = flip ? width - first - count : first;
+                        int high = low + count;
+                        int64_t fixed = (int64_t)span * 65536 / width;
+                        int mismatch = 0;
+                        for (int i = first; i < first + count; ++i) {
+                            int expected = origin + flip +
+                                (int)floor((double)i * fixed / 65536);
+                            float old = origin + flip + i * ((float)span / width) + 1.0f / 1024;
+                            if (span % width && texel_floor(old) != expected) mismatch = 1;
+                        }
+                        float a, b;
+                        int fitted = fit_rectangle_axis(position, end, origin, origin + span,
+                                                        low, high, &a, &b);
+                        if (fitted != mismatch) {
+                            fprintf(stderr, "wide fit skipped: w=%d span=%d flip=%d clip=%d origin=%d\n",
+                                    width, span, flip, clip, origin);
+                            return 1;
+                        }
+                    }
+    unsigned random = 1;
+    for (int test = 0; test < 120000; ++test) {
+        random = random * 1664525u + 1013904223u;
+        int width = 1 + (int)(random % 32767);
+        random = random * 1664525u + 1013904223u;
+        int span = (int)(random % 513) - 256;
+        random = random * 1664525u + 1013904223u;
+        int count = 1 + (int)(random % (width < 320 ? width : 320));
+        random = random * 1664525u + 1013904223u;
+        int first = (int)(random % (width - count + 1));
+        random = random * 1664525u + 1013904223u;
+        int origin = (int)(random % 256), flip = random >> 31;
+        int position = flip ? width : 0, end = flip ? 0 : width;
+        int low = flip ? width - first - count : first, high = low + count;
+        int64_t fixed = (int64_t)span * 65536 / width;
+        int mismatch = 0;
+        for (int i = first; i < first + count; ++i) {
+            int expected = origin + flip + (int)floor((double)i * fixed / 65536);
+            float old = origin + flip + i * ((float)span / width) + 1.0f / 1024;
+            if (span % width && texel_floor(old) != expected) mismatch = 1;
+        }
+        float a, b;
+        int fitted = fit_rectangle_axis(position, end, origin, origin + span,
+                                        low, high, &a, &b);
+        if (fitted != mismatch) {
+            fprintf(stderr, "random fit skipped: w=%d span=%d first=%d count=%d origin=%d\n",
+                    width, span, first, count, origin);
+            return 1;
+        }
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-rectangle-fit-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", "-I", str(ROOT),
+                            str(work / "test.c"), "-lm", "-o", str(work / "test")],
+                           check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_fractional_axis_fit(self):
+        harness = r"""
+#include <math.h>
+#include <stdio.h>
+#include "src/platform/dreamcast/sampling.h"
+
+static int check(int width, int span, int first, int count) {
+    gex_pvr_axis_fit fit;
+    if (!gex_pvr_fit_axis(width, span, first, count, &fit)) {
+        fprintf(stderr, "fit failed: %d %d %d %d\n", width, span, first, count);
+        return 1;
+    }
+    int step = (int)((long long)span * 65536 / width);
+    for (int i = 0; i < count; ++i) {
+        int expected = (int)floor((double)(first + i) * step / 65536);
+        float actual = fit.first + i * fit.step;
+        if (!(actual > expected && actual < expected + 1)) {
+            fprintf(stderr, "fit mismatch: %d %d %d %d i=%d actual=%.9f expected=%d\n",
+                    width, span, first, count, i, actual, expected);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    for (int width = 1; width <= 96; ++width)
+        for (int span = -40; span <= 40; ++span)
+            if (check(width, span, 0, width) ||
+                check(width, span, width / 4, width - width / 4))
+                return 1;
+    if (check(320, 256, 0, 320) ||
+        check(320, 256, 127, 97) ||
+        check(320, -256, 0, 320))
+        return 1;
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-axis-fit-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", "-I", str(ROOT),
+                            str(work / "test.c"), "-lm", "-o", str(work / "test")],
+                           check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_texture_clear_uses_word_stores(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        start = source.index("static void zero_texture_memory(pvr_ptr_t memory, size_t bytes) {")
+        helper = source[start:source.index("static texture *texture_region_base(", start)]
+        create = source[source.index("static void *create("):source.index("static void destroy(")]
+        self.assertIn("zero_texture_memory(t->image[i], TW * TH * 2)", create)
+        harness = r"""
+#include <stdint.h>
+#include <stddef.h>
+typedef void *pvr_ptr_t;
+"""
+        harness += helper
+        harness += r"""
+int main(void) {
+    uint32_t data[130];
+    for (size_t words = 0; words <= 128; ++words) {
+        for (size_t i = 0; i < 130; ++i) data[i] = 0x5a5a5a5a;
+        zero_texture_memory(data + 1, words * sizeof *data);
+        if (data[0] != 0x5a5a5a5a) return 1;
+        for (size_t i = 1; i <= words; ++i)
+            if (data[i] != 0) return 1;
+        for (size_t i = words + 1; i < 130; ++i)
+            if (data[i] != 0x5a5a5a5a) return 1;
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-clear-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_vram_copy_handles_unaligned_sources(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        start = source.index("static void copy_vram_words(")
+        helper = source[start:source.index("static void update_row(", start)]
+        harness = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+"""
+        harness += helper
+        harness += r"""
+int main(void) {
+    union { uint32_t align; uint8_t bytes[2080]; } input, output;
+    for (unsigned i = 0; i < sizeof input.bytes; ++i)
+        input.bytes[i] = (uint8_t)(i * 73 + 19);
+    for (unsigned src = 0; src < 8; ++src)
+        for (unsigned dst = 0; dst < 8; dst += 2)
+            for (unsigned words = 0; words <= 1024; ++words) {
+                memset(output.bytes, 0x5a, sizeof output.bytes);
+                copy_vram_words((uint16_t *)(output.bytes + dst + 8),
+                                input.bytes + src, words);
+                if (memcmp(output.bytes + dst + 8, input.bytes + src, words * 2))
+                    return 1;
+                for (unsigned i = 0; i < dst + 8; ++i)
+                    if (output.bytes[i] != 0x5a) return 1;
+                for (unsigned i = dst + 8 + words * 2; i < sizeof output.bytes; ++i)
+                    if (output.bytes[i] != 0x5a) return 1;
+            }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-vram-copy-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_integral_rectangle_samples_texel_centers(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        start = source.index("static float integral_sample_bias(")
+        helper = source[start:source.index("static int fit_rectangle_axis(", start)]
+        harness = r"""
+#include <math.h>
+#include <stdio.h>
+"""
+        harness += helper
+        harness += r"""
+int main(void) {
+    const int origins[] = {0, 1, 32, 128, 220, 255};
+    for (int width = 1; width <= 320; ++width)
+        for (int step = -2; step <= 2; ++step)
+            for (unsigned o = 0; o < sizeof origins / sizeof *origins; ++o)
+                for (int flip = 0; flip < 2; ++flip) {
+                    float x0 = flip ? 400 : 80;
+                    float origin = origins[o];
+                    float bias = integral_sample_bias(x0, width, origin, step);
+                    if (bias != 0.5f) return 1;
+                    float u0 = origin + flip - step * 0.5f + bias;
+                    for (int x = 0; x < width; ++x) {
+                        int column = flip ? width - 1 - x : x;
+                        int expected = origins[o] + flip + column * step;
+                        float sample = u0 +
+                            ((flip ? 400 - width + x : 80 + x) + 0.5f - x0) *
+                            (flip ? -step : step);
+                        if (sample != expected + 0.5f) {
+                            fprintf(stderr, "width=%d step=%d flip=%d x=%d: %f != %d.5\n",
+                                    width, step, flip, x, sample, expected);
+                            return 1;
+                        }
+                    }
+                }
+    if (integral_sample_bias(0, 6, 32, 2.0f / 6) != 1.0f / 1024 ||
+        integral_sample_bias(0.25f, 6, 32, 1) != 1.0f / 1024 ||
+        integral_sample_bias(0, 6.5f, 32, 1) != 1.0f / 1024 ||
+        integral_sample_bias(0, 6, 32.5f, 1) != 1.0f / 1024 ||
+        integral_sample_bias(NAN, 6, 32, 1) != 1.0f / 1024 ||
+        integral_sample_bias(0, 6, 32, INFINITY) != 1.0f / 1024)
+        return 1;
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-integral-sampling-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
     def test_pvr_palette_writes_skip_unchanged_entries(self):
         source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
         start = source.rfind("static ", 0, source.index("program_palette("))

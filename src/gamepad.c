@@ -6,7 +6,8 @@
 static int axis_x, axis_y;
 static const struct { uint32_t key, scan; } bindings[GEX_KEY_COUNT] = {
     {0x25, 0x4B}, {0x27, 0x4D}, {0x26, 0x48}, {0x28, 0x50},
-    {'X', 0x2D}, {'Z', 0x2C}, {'C', 0x2E}, {'V', 0x2F}, {0x1B, 0x01}
+    {'X', 0x2D}, {'Z', 0x2C}, {'C', 0x2E}, {'V', 0x2F}, {0x1B, 0x01},
+    {0x13, 0x45}
 };
 static uint8_t keyboard[GEX_KEY_COUNT], pad[GEX_KEY_COUNT], sent[GEX_KEY_COUNT];
 static uint32_t blocked_buttons;
@@ -83,7 +84,8 @@ void gex_gamepad_pump(void) {
             pad[5] = (buttons & GEX_PAD_X) != 0;
             pad[6] = (buttons & GEX_PAD_B) != 0;
             pad[7] = (buttons & (GEX_PAD_Y | GEX_PAD_L | GEX_PAD_R)) != 0;
-            pad[8] = (buttons & (GEX_PAD_START | GEX_PAD_BACK)) != 0;
+            pad[GEX_KEY_ESCAPE] = (buttons & GEX_PAD_BACK) != 0;
+            pad[GEX_KEY_PAUSE] = (buttons & GEX_PAD_START) != 0;
         }
     }
     publish();

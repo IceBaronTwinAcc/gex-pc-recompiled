@@ -962,7 +962,7 @@ movies. `--trace` enables verbose runtime import diagnostics;
 `HLE_FILETRACE=1` traces asset paths.
 
 Controls follow the original game: arrows move, **X** jumps/enters a TV,
-**Z** tail-whips, **C** lashes the tongue, **V** runs, and **Esc** exits.
+**Z** tail-whips, **C** lashes the tongue, and **V** runs.
 At the world map, select the cemetery TV. At its entry node, press **Down**
 to reach the first TV, then **X** to enter the level.
 
@@ -2156,12 +2156,34 @@ mutation. PAL4/PAL8 twiddling, BGR555-to-ARGB1555 direct asset conversion and
 ARGB8888 palette packing still occur on uploads/cache misses or palette changes,
 not as conversions of completed frames.
 
-Native rectangular geometry aligns nearest texture samples with the original
-integer grid, including mirroring and fractional scale. Shared packet preparation
+The [PVR VRAM interface](https://mc.pp.se/dc/pvr.html) does not support byte
+writes. Cached atlas snapshots and the unaligned movie-upload path therefore
+use aligned 16- or 32-bit stores even when their RAM sources are unaligned.
+Initial framebuffer texture clears also use word stores: the linked SH-4
+`memset` uses byte stores for its final bytes even for aligned allocations.
+The host copy test covers source alignment and even byte counts; the strict
+PVR fixture also exercises an odd-addressed atlas and movie buffer. The
+reported hardware alignment symptom is not yet tied to either path.
+The user reports that most textures now map correctly on hardware, while some
+gameplay tiles and sprites still display incorrectly. A strict PVR fixture
+checks queued texture mutation across physical atlas rows and the 1 MiB atlas
+wrap for PAL4, PAL8 and direct-color pages, as well as a warmed PAL4 region
+with an odd texel origin and a queued mutation. Passing it in Flycast does not
+establish that the remaining hardware symptom is fixed.
+
+TODO: Document the `--uv-precision` diagnostic and its hardware results.
+
+Native rectangular geometry attempts to align nearest texture samples with the
+original integer grid, including mirroring and fractional scale. Shared packet preparation
 stores integral coordinates/UVs directly; general software interpolation retains
 its floating-point arithmetic. Ordinary axis-aligned rectangles clip and submit
 directly, choosing wrap from covered pixel-center samples. Actual wrap and skew
-retain general clipping. The backend, movie decoder/converter and
+retain general clipping. Textured rectangle axes with integral pixel positions,
+UV origins and texel steps sample at texel centers. The strict PVR fixture checks integral steps with
+clipping, mirroring and wrapped page coordinates. This does not establish
+whether centering fixes the reported real-hardware-only misalignment.
+TODO: Document fitted fractional sampling, scale handling and validation.
+The backend, movie decoder/converter and
 raster sources are compiled at `-O2`; lifted guest code uses `-Os` to retain
 movie-to-title heap headroom within 16 MiB. The shared scanline,
 compact-rectangle, upload/download and history contracts remain available only
@@ -2170,6 +2192,42 @@ the direct clears, keyed loading artwork and complete pause capture/dim/banner
 routine instead of running their old CPU pixel loops. Atlas uploads touching
 pictures become GPU asset blits; non-picture asset uploads retain the original
 CPU copy. Fill/reset still maintain non-picture texture data.
+
+The PVR float interpolation is not always equivalent to the original 16.16
+rectangle stepping. For a six-pixel quad spanning two texels, the original
+step is `21845` and the fourth sample is still the first texel.
+TODO: Document the fractional quad diagnostic and remaining limitations.
+An instrumented Flycast route observed fractional steps in the level map,
+including an axis of 12 output pixels spanning 22 texels. The fixed-point
+reference samples texel 10 at index 6; ideal float interpolation with the
+existing bias samples texel 11. This establishes that the discrepancy affects
+observed game geometry, but not that it causes the hardware-only symptom.
+The temporary instrumentation is not part of the build.
+The same route observed gameplay axes of nine pixels spanning 15 texels and
+ten pixels spanning 16 texels. The horizontal diagnostic reproduces reference
+sampling differences for both ratios in normal and mirrored geometry; it does
+not reproduce the user's reported hardware-only corruption.
+For this 12/22 axis, an ideal affine mapping can reproduce the reference
+samples with a slope of `20/11` texels per pixel and a `1/22`-texel offset
+at the first sample. Its maximum clearance from any texel boundary is only
+`1/22` texel: the first, seventh and twelfth samples bound that clearance.
+This arithmetic does not establish the PVR's interpolation precision on
+hardware, and the same construction does not by itself handle scaled logical
+pixels, clipping, wrapping or all other spans.
+
+For comparison, the [KOS texture example](https://github.com/KallistiOS/KallistiOS/blob/master/examples/dreamcast/pvr/texture_render/texture_render.c)
+uses normalized UVs and nearest filtering;
+[ClassiCube's Dreamcast renderer](https://github.com/ClassiCube/ClassiCube/blob/master/src/dreamcast/Graphics_Dreamcast.c)
+uses twiddled textures, packs indexed pixels in 2x2 blocks, and recommends
+separate 2048-byte VRAM allocation blocks for textures. The
+[KOS allocator](https://github.com/KallistiOS/KallistiOS/blob/master/kernel/arch/dreamcast/hardware/pvr/pvr_mem.c)
+asserts 32-byte alignment; the ClassiCube recommendation alone does not prove
+that Gex's allocations cause the hardware symptom. Sonic R
+[uploads twiddled textures](https://github.com/jnmartin84/sonic-r/blob/main/source/dc/src/render_pvr.c)
+and [selects nearest filtering](https://github.com/jnmartin84/sonic-r/blob/main/source/dc/src/r_pvr_backend.c)
+for sprite atlases.
+These approaches do not implement Gex's integer rectangle stepping or
+mirrored-axis rule.
 
 TODO: Document KOS scene submission, presentation, picture-sampling rejection,
 and hardware-validation status.
@@ -3891,11 +3949,11 @@ The Dreamcast Maple backend translates `CONT_START` to `GEX_PAD_START`
 correctly. A reported Start-to-jump fault came from `src/gamepad.c`'s fallback
 mapping: it combined A and Start into the guest X key. Dreamcast does not
 load the desktop Options bindings, so `gex_prefs.bindings_active` remains
-false and selects that fallback. Desktop Options defaults already map Start
-to the Escape key used for pause.
+false and selects that fallback.
 
-The fallback now maps A to X (jump/confirm) and Start or Back to Escape
-(pause/back), without changing configurable bindings or other action buttons.
+The fallback maps A to X (jump/confirm), Start to Pause (`0x13`), and Back
+to Escape (`0x1B`). Configurable Pause also maps to `0x13`; menu Back maps
+to Escape. Escape reaches the retail exit confirmation, not the pause toggle.
 Do not remap the controller in Flycast to compensate for this guest-input
 fault. To investigate a similar report:
 
@@ -3904,7 +3962,7 @@ fault. To investigate a similar report:
    then through the active or fallback mapping to the guest key.
 3. Test press, hold, release and simultaneous A/Start input. Start alone must
    never hold X; releasing A while Start remains held must release X and
-   retain Escape.
+   retain Pause.
 4. Run `portable-input-mapping` and the headless SDL `gamepad-input` check.
    The portable fixture also runs as `gex_input_mapping_test.elf` on real
    SH4/KOS in the supplied headless Flycast. Require exit zero.

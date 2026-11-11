@@ -32,7 +32,7 @@ int main(void) {
     CHECK(!gex_gamepad_init(1));
     snapshot.focused = snapshot.connected = 1;
     static const struct { uint32_t button, key; } mapping[] = {
-        {GEX_PAD_A, 'X'}, {GEX_PAD_START, 0x1B}, {GEX_PAD_B, 'C'},
+        {GEX_PAD_A, 'X'}, {GEX_PAD_START, 0x13}, {GEX_PAD_B, 'C'},
         {GEX_PAD_X, 'Z'}, {GEX_PAD_Y, 'V'}, {GEX_PAD_L, 'V'},
         {GEX_PAD_R, 'V'}, {GEX_PAD_BACK, 0x1B},
         {GEX_PAD_LEFT, 0x25}, {GEX_PAD_RIGHT, 0x27},
@@ -53,13 +53,13 @@ int main(void) {
     }
     snapshot.buttons = GEX_PAD_A | GEX_PAD_START;
     gex_gamepad_pump();
-    CHECK(held['X'] && held[0x1B]);
+    CHECK(held['X'] && held[0x13] && !held[0x1B]);
     snapshot.buttons = GEX_PAD_START;
     gex_gamepad_pump();
-    CHECK(!held['X'] && held[0x1B]);
+    CHECK(!held['X'] && held[0x13]);
     snapshot.buttons = 0;
     gex_gamepad_pump();
-    CHECK(!held['X'] && !held[0x1B]);
+    CHECK(!held['X'] && !held[0x13]);
     snapshot.x = 16000;
     gex_gamepad_pump();
     CHECK(!held[0x27]);
@@ -104,9 +104,14 @@ int main(void) {
     CHECK(!gex_gamepad_init(1));
     snapshot.buttons = GEX_PAD_START;
     gex_gamepad_pump();
-    CHECK(held[0x1B] && !held['X']); /* Pause is no longer conflated with Jump. */
+    CHECK(held[0x13] && !held[0x1B] && !held['X']);
     snapshot.buttons = 0;
     gex_gamepad_pump();
+    CHECK(gex_controls_keyboard(0x1B) == 1u << GEX_KEY_PAUSE);
+    CHECK(!gex_controls_bind(GEX_ACTION_PAUSE, 1, GEX_PAD_R, 0));
+    CHECK(gex_controls_gamepad(GEX_PAD_START) == 0);
+    CHECK(gex_controls_gamepad(GEX_PAD_R) == 1u << GEX_KEY_PAUSE);
+    CHECK(!gex_controls_bind(GEX_ACTION_PAUSE, 1, GEX_PAD_START, 0));
     CHECK(!gex_controls_bind(GEX_ACTION_LASH, 1, GEX_PAD_L, 0));
     snapshot.buttons = GEX_PAD_L;
     gex_gamepad_pump();
@@ -121,6 +126,8 @@ int main(void) {
     CHECK(gex_controls_bind(GEX_ACTION_BACK, 0, 0x0D, 0x1C) == -1);
     CHECK(gex_controls_bind(GEX_ACTION_BACK, 0, 0x20, 0x39) == -1);
     in_menu = 1;
+    CHECK(gex_controls_keyboard(0x1B) == 1u << GEX_KEY_ESCAPE);
+    CHECK(gex_controls_gamepad(GEX_PAD_B) == 1u << GEX_KEY_ESCAPE);
     snapshot.buttons = GEX_PAD_A;
     gex_gamepad_pump();
     CHECK(!held['X']); /* The opening press is blocked across context changes. */
@@ -131,6 +138,12 @@ int main(void) {
     CHECK(held['X']);
     snapshot.buttons = 0;
     gex_gamepad_pump();
+    snapshot.buttons = GEX_PAD_START;
+    gex_gamepad_pump();
+    CHECK(held[0x13] && !held[0x1B]);
+    snapshot.buttons = 0;
+    gex_gamepad_pump();
+    CHECK(!held[0x13]);
     CHECK(!gex_controls_bind(GEX_ACTION_CONFIRM, 1, GEX_PAD_START, 0));
     CHECK(gex_controls_gamepad(GEX_PAD_A) == 0);
     CHECK(gex_controls_gamepad(GEX_PAD_START) == 1u << GEX_KEY_X);

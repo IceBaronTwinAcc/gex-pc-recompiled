@@ -13,7 +13,8 @@ static uint8_t captured_keys[SDL_NUM_SCANCODES];
 void gex_desktop_key_code(int scancode, uint32_t *key, uint32_t *scan);
 static const SDL_Scancode scancodes[GEX_KEY_COUNT] = {
     SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT, SDL_SCANCODE_UP, SDL_SCANCODE_DOWN,
-    SDL_SCANCODE_X, SDL_SCANCODE_Z, SDL_SCANCODE_C, SDL_SCANCODE_V, SDL_SCANCODE_ESCAPE
+    SDL_SCANCODE_X, SDL_SCANCODE_Z, SDL_SCANCODE_C, SDL_SCANCODE_V,
+    SDL_SCANCODE_ESCAPE, SDL_SCANCODE_PAUSE
 };
 
 static int keyboard_event(int scancode, int down) {

@@ -47,6 +47,10 @@ typedef struct {
     /* Optional batched notification, with the same pre-write contract. */
     void (*atlas_write_rect)(const uint8_t *atlas, unsigned offset, size_t pitch,
                             size_t row_bytes, unsigned rows);
+    /* Optional polygon submission with the logical-to-output integer scale. */
+    int (*polygon_scaled)(void *target, const gex_gpu_vertex vertices[4],
+                          int left, int top, int right, int bottom, int scale,
+                          const gex_gpu_material *material, char *error, size_t size);
 } gex_gpu_native_ops;
 
 typedef struct {

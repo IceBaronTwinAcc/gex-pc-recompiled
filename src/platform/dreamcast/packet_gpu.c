@@ -10,6 +10,7 @@
 #include <string.h>
 #include "packet_gpu.h"
 #include "raster.h"
+#include "sampling.h"
 
 /* A single presorted translucent list preserves original packet order. */
 enum { TW = 512, TH = 256, CACHE_COUNT = 24, CACHE_BYTES = 4 * 1024 * 1024,
@@ -35,7 +36,7 @@ typedef struct {
     packet_key key;
     float prepared[8];
     uint16_t region[4];
-    unsigned prepared_valid;
+    unsigned prepared_valid, sample_scale;
 } background_polygon;
 typedef struct target {
     pvr_ptr_t image[2];
@@ -401,7 +402,7 @@ static void program_palette(unsigned offset, const uint32_t *colors, unsigned co
 }
 static int native_polygon_draw(void *data, const gex_gpu_vertex input[4],
                                int left, int top, int right, int bottom,
-                               const gex_gpu_material *m, char *error, size_t size);
+                               unsigned sample_scale, const gex_gpu_material *m, char *error, size_t size);
 static int background_replay(target *t, char *error, size_t size);
 static int background_stop(target *t, char *error, size_t size);
 static int background_advance(target *t, char *error, size_t size);
@@ -960,6 +961,8 @@ static void release_cache(void) {
     for (unsigned i = 0; i < SHARED_GROUPS; ++i) shared_groups[i].bank = -1;
 }
 
+static void zero_texture_memory(pvr_ptr_t memory, size_t bytes);
+
 static void *create(int width, int height, char *error, size_t size) {
     if (width != 320 || height != 240) {
         fail(error, size, "PVR packet targets require native 320x240");
@@ -1020,7 +1023,7 @@ static void *create(int width, int height, char *error, size_t size) {
     if (t) {
         for (unsigned i = 0; i < 2; ++i) {
             t->image[i] = pvr_mem_malloc(TW * TH * 2);
-            if (t->image[i]) memset(t->image[i], 0, TW * TH * 2);
+            if (t->image[i]) zero_texture_memory(t->image[i], TW * TH * 2);
         }
     }
     if (!t || !t->image[0] || !t->image[1]) {
@@ -1203,6 +1206,36 @@ static void pack_row(texture *t, const gex_gpu_material *m, int raw,
     }
 }
 
+/* PVR VRAM does not accept byte writes, even for an unaligned source. */
+static void copy_vram_words(volatile uint16_t *destination, const uint8_t *source,
+                            size_t words) {
+    typedef uint32_t alias32 __attribute__((__may_alias__));
+    if (words && ((uintptr_t)destination & 2)) {
+        *destination++ = (uint16_t)(source[0] | (unsigned)source[1] << 8);
+        source += 2;
+        --words;
+    }
+    if (!((uintptr_t)source & 3)) {
+        while (words >= 2) {
+            *(volatile uint32_t *)destination = *(const alias32 *)source;
+            destination += 2;
+            source += 4;
+            words -= 2;
+        }
+    } else {
+        while (words >= 2) {
+            uint32_t value = source[0] | (uint32_t)source[1] << 8 |
+                             (uint32_t)source[2] << 16 | (uint32_t)source[3] << 24;
+            *(volatile uint32_t *)destination = value;
+            destination += 2;
+            source += 4;
+            words -= 2;
+        }
+    }
+    if (words)
+        *destination = (uint16_t)(source[0] | (unsigned)source[1] << 8);
+}
+
 static void update_row(texture *t, const gex_gpu_material *m,
                        unsigned y, unsigned begin, unsigned end, int raw) {
     if (begin >= end) return;
@@ -1213,8 +1246,10 @@ static void update_row(texture *t, const gex_gpu_material *m,
     unsigned bytes = end - begin;
     WORK(refresh_bytes, bytes);
     unsigned first = bytes < 0x100000 - at ? bytes : 0x100000 - at;
-    memcpy(t->source + y * row + begin, m->atlas + at, first);
-    memcpy(t->source + y * row + begin + first, m->atlas, bytes - first);
+    /* Dirty blocks and the atlas wrap boundary are 16-byte aligned. */
+    copy_vram_words((uint16_t *)(t->source + y * row + begin), m->atlas + at, first / 2);
+    copy_vram_words((uint16_t *)(t->source + y * row + begin + first),
+                    m->atlas, (bytes - first) / 2);
     pack_row(t, m, raw, y, begin, end);
 }
 
@@ -1624,7 +1659,8 @@ rebuild:
      * GPU bytes are initialized only when requested, including equal zeros. */
     zero_texture_memory(t->source, source_bytes);
     t->page = m->page; t->rgb = rgb; t->opcode = opcode; t->raw = raw;
-    if (format == 2 && !raw) memcpy(t->source + bytes, m->modulation, 1024);
+    if (format == 2 && !raw)
+        copy_vram_words((uint16_t *)(t->source + bytes), m->modulation, 1024 / 2);
     unsigned top = format < 2 ? (unsigned)v0 & ~1u : (unsigned)v0;
     unsigned bottom = format < 2 ? ((unsigned)v1 + 1) & ~1u : (unsigned)v1;
     update_region(t, m, (unsigned)begin & ~15u, ((unsigned)end + 15) & ~15u,
@@ -2652,8 +2688,8 @@ static int native_movie(void *data, const uint8_t *pixels, int width, int height
         sq_unlock();
     } else {
         for (int row = 0; row < height; ++row)
-            memcpy((uint8_t *)frame->image[0] + row * TW * 2,
-                   pixels + row * pitch, (size_t)width * 2);
+            copy_vram_words((uint16_t *)frame->image[0] + row * TW,
+                            pixels + row * pitch, (size_t)width);
     }
     float w = 320, h = (float)height * 320 / width;
     if (h > 240) { h = 240; w = (float)width * 240 / height; }
@@ -2902,8 +2938,64 @@ static int finite_float(float value) {
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
+static float integral_sample_bias(float position, float extent, float origin, float step) {
+    if (position > -8388608.0f && position < 8388608.0f &&
+        extent > 0 && extent < 8388608.0f &&
+        origin > -1024 && origin < 1024 && step > -1024 && step < 1024 &&
+        position == (float)(int)position && extent == (float)(int)extent &&
+        origin == (float)(int)origin && step == (float)(int)step)
+        return 0.5f;
+    return 1.0f / 1024;
+}
+
+static int fit_rectangle_axis(float position, float end, float origin, float far,
+                              int clip_min, int clip_max, float *start_uv, float *end_uv) {
+    float extent = fabsf(end - position);
+    if (!(position > -8388608.0f && position < 8388608.0f &&
+          end > -8388608.0f && end < 8388608.0f &&
+          origin >= -1024 && origin <= 1024 && far >= -1024 && far <= 1024 &&
+          extent >= 1 && extent < 8388608.0f) ||
+        position != (float)(int)position || end != (float)(int)end ||
+        origin != (float)(int)origin || far != (float)(int)far)
+        return 0;
+    int width = (int)extent, span = (int)far - (int)origin;
+    if (span % width == 0) return 0;
+    int flip = position > end;
+    int low = (int)(flip ? end : position), high = (int)(flip ? position : end);
+    if (low < clip_min) low = clip_min;
+    if (high > clip_max) high = clip_max;
+    if (low >= high) return 0;
+    int first = flip ? (int)position - high : low - (int)position;
+    int count = high - low;
+    int64_t fixed_step = (int64_t)span * 65536 / width;
+    int mismatch = 0;
+    for (int i = first; i < first + count; ++i) {
+        int expected = (int)origin + flip + gex_pvr_fixed_floor((int64_t)i * fixed_step);
+        float current = origin + flip + i * ((float)span / width) + 1.0f / 1024;
+        if (texel_floor(current) != expected) {
+            mismatch = 1;
+            break;
+        }
+    }
+    if (!mismatch) return 0;
+    gex_pvr_axis_fit fit;
+    if (!gex_pvr_fit_axis(width, span, first, count, &fit)) return 0;
+    float a = origin + flip + fit.first - fit.step * 0.5f;
+    float b = a + fit.step * count;
+    if (!(a >= -1024 && a <= 1024 && b >= -1024 && b <= 1024)) return 0;
+    float actual_step = (b - a) / count;
+    for (int i = 0; i < count; ++i) {
+        int expected = (int)origin + flip + gex_pvr_fixed_floor((int64_t)(first + i) * fixed_step);
+        float sample = a + (i + 0.5f) * actual_step;
+        if (!(sample > expected && sample < expected + 1)) return 0;
+    }
+    *start_uv = a;
+    *end_uv = b;
+    return 1;
+}
+
 static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4], int left, int top, int right,
-                                  int bottom, const gex_gpu_material *m, background_polygon *prepared,
+                                  int bottom, unsigned sample_scale, const gex_gpu_material *m, background_polygon *prepared,
                                   char *error, size_t size) {
     WORK(polygons, 1);
     if (prepared) prepared->prepared_valid = 0;
@@ -2924,11 +3016,38 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
         if (!w || !h)
             return 0;
         float step_u = (q[3].u - q[0].u) / w, step_v = (q[3].v - q[0].v) / h;
-        float ou = (q[0].x > q[3].x ? 1 : 0) - step_u * 0.5f + 1.0f / 1024;
-        float ov = (q[0].y > q[3].y ? 1 : 0) - step_v * 0.5f + 1.0f / 1024;
+        float bias_u = textured && q[0].u == q[2].u && q[1].u == q[3].u ?
+            integral_sample_bias(q[0].x, w, q[0].u, step_u) : 1.0f / 1024;
+        float bias_v = textured && q[0].v == q[1].v && q[2].v == q[3].v ?
+            integral_sample_bias(q[0].y, h, q[0].v, step_v) : 1.0f / 1024;
+        float ou = (q[0].x > q[3].x ? 1 : 0) - step_u * 0.5f + bias_u;
+        float ov = (q[0].y > q[3].y ? 1 : 0) - step_v * 0.5f + bias_v;
         for (unsigned i = 0; i < 4; ++i) {
             q[i].u += ou;
             q[i].v += ov;
+        }
+        if (code == 0x2c && sample_scale == 1 &&
+            input[0].u == input[2].u && input[1].u == input[3].u &&
+            input[0].v == input[1].v && input[2].v == input[3].v) {
+            float start, end;
+            if (fit_rectangle_axis(input[0].x, input[3].x, input[0].u, input[3].u,
+                                   left, right, &start, &end)) {
+                float low = fmaxf(fminf(input[0].x, input[3].x), left);
+                float high = fminf(fmaxf(input[0].x, input[3].x), right);
+                q[0].x = q[2].x = input[0].x > input[3].x ? high : low;
+                q[1].x = q[3].x = input[0].x > input[3].x ? low : high;
+                q[0].u = q[2].u = start;
+                q[1].u = q[3].u = end;
+            }
+            if (fit_rectangle_axis(input[0].y, input[3].y, input[0].v, input[3].v,
+                                   top, bottom, &start, &end)) {
+                float low = fmaxf(fminf(input[0].y, input[3].y), top);
+                float high = fminf(fmaxf(input[0].y, input[3].y), bottom);
+                q[0].y = q[1].y = input[0].y > input[3].y ? high : low;
+                q[2].y = q[3].y = input[0].y > input[3].y ? low : high;
+                q[0].v = q[1].v = start;
+                q[2].v = q[3].v = end;
+            }
         }
     }
     int rectangle = q[0].x == q[2].x && q[1].x == q[3].x &&
@@ -3059,12 +3178,12 @@ static int native_polygon_prepare_impl(void *data, const gex_gpu_vertex input[4]
 }
 
 static int native_polygon_prepare(void *data, const gex_gpu_vertex input[4], int left, int top, int right,
-                                  int bottom, const gex_gpu_material *m, background_polygon *prepared,
+                                  int bottom, unsigned sample_scale, const gex_gpu_material *m, background_polygon *prepared,
                                   char *error, size_t size) {
     PROFILE_BEGIN();
     transient_pin pin = {NULL, active_transient_pin};
     active_transient_pin = &pin;
-    int result = native_polygon_prepare_impl(data, input, left, top, right, bottom,
+    int result = native_polygon_prepare_impl(data, input, left, top, right, bottom, sample_scale,
                                             m, prepared, error, size);
     active_transient_pin = pin.previous;
     PROFILE_END(prepare);
@@ -3072,8 +3191,8 @@ static int native_polygon_prepare(void *data, const gex_gpu_vertex input[4], int
 }
 
 static int native_polygon_draw(void *data, const gex_gpu_vertex input[4], int left, int top, int right,
-                               int bottom, const gex_gpu_material *m, char *error, size_t size) {
-    return native_polygon_prepare(data, input, left, top, right, bottom, m, NULL, error, size);
+                               int bottom, unsigned sample_scale, const gex_gpu_material *m, char *error, size_t size) {
+    return native_polygon_prepare(data, input, left, top, right, bottom, sample_scale, m, NULL, error, size);
 }
 
 static int background_draw_impl(target *t, const background_polygon *p, unsigned rgb,
@@ -3082,7 +3201,7 @@ static int background_draw_impl(target *t, const background_polygon *p, unsigned
     material.rgb = rgb;
     if (!p->prepared_valid)
         return native_polygon_draw(t, p->vertices, p->clip[0], p->clip[1],
-                                   p->clip[2], p->clip[3], &material, error, size);
+                                   p->clip[2], p->clip[3], p->sample_scale, &material, error, size);
     WORK(prepared, 1);
     if (select_target(t, error, size)) return -1;
     unsigned code = material.opcode & ~2u;
@@ -3286,7 +3405,7 @@ static int native_packet(void *data, const uint8_t *packet, const gex_raster_sta
 }
 
 static int native_polygon_impl(void *data, const gex_gpu_vertex input[4], int left, int top,
-                          int right, int bottom, const gex_gpu_material *m,
+                          int right, int bottom, unsigned sample_scale, const gex_gpu_material *m,
                           char *error, size_t size) {
     target *t = data;
     if (select_target(t, error, size)) {
@@ -3295,7 +3414,7 @@ static int native_polygon_impl(void *data, const gex_gpu_vertex input[4], int le
     }
     if (!t->background_mode) {
         t->pending_key.valid = 0;
-        return native_polygon_draw(t, input, left, top, right, bottom, m, error, size);
+        return native_polygon_draw(t, input, left, top, right, bottom, sample_scale, m, error, size);
     }
     packet_key key = t->pending_key;
     t->pending_key.valid = 0;
@@ -3326,13 +3445,14 @@ static int native_polygon_impl(void *data, const gex_gpu_vertex input[4], int le
         t->background_revision == atlas_revision) {
         background_polygon *p = &t->background[t->background_at];
         const gex_gpu_material *previous = &p->material;
-        if (!memcmp(input, p->vertices, sizeof p->vertices) &&
+        if (p->sample_scale == sample_scale &&
+            !memcmp(input, p->vertices, sizeof p->vertices) &&
             !memcmp(clip, p->clip, sizeof clip) &&
             m->page == previous->page && m->clut == previous->clut &&
             m->opcode == previous->opcode && m->rgb == previous->rgb &&
             m->atlas == previous->atlas && m->modulation == previous->modulation) {
             if (t->background_mode == BACKGROUND_VERIFY &&
-                native_polygon_prepare(t, input, left, top, right, bottom, m, p, error, size))
+                native_polygon_prepare(t, input, left, top, right, bottom, sample_scale, m, p, error, size))
                 return -1;
             p->key = key;
             return background_advance(t, error, size);
@@ -3349,13 +3469,14 @@ static int native_polygon_impl(void *data, const gex_gpu_vertex input[4], int le
     }
     background_polygon *record = t->background_mode == BACKGROUND_RECORD ?
                                  &t->background[t->background_at] : NULL;
-    if (native_polygon_prepare(t, input, left, top, right, bottom, m, record, error, size)) return -1;
+    if (native_polygon_prepare(t, input, left, top, right, bottom, sample_scale, m, record, error, size)) return -1;
     if (t->background_mode == BACKGROUND_RECORD) {
         background_polygon *p = &t->background[t->background_at++];
         memcpy(p->vertices, input, sizeof p->vertices);
         memcpy(p->clip, clip, sizeof clip);
         p->material = *m;
         p->key = key;
+        p->sample_scale = sample_scale;
         background_dependencies(t, input, m, p);
         if (t->background_at == BACKGROUND_POLYGONS)
             return background_stop(t, error, size);
@@ -3368,7 +3489,20 @@ static int native_polygon(void *data, const gex_gpu_vertex input[4], int left, i
                           char *error, size_t size) {
     NATIVE_DRAW_BEGIN();
     PROFILE_BEGIN();
-    int result = native_polygon_impl(data, input, left, top, right, bottom, m, error, size);
+    int result = native_polygon_impl(data, input, left, top, right, bottom, 0, m, error, size);
+    PROFILE_END(polygon);
+    NATIVE_DRAW_END(polygon);
+    return result;
+}
+
+static int native_polygon_scaled(void *data, const gex_gpu_vertex input[4], int left, int top,
+                                 int right, int bottom, int scale, const gex_gpu_material *m,
+                                 char *error, size_t size) {
+    NATIVE_DRAW_BEGIN();
+    PROFILE_BEGIN();
+    int result = scale > 0 ?
+        native_polygon_impl(data, input, left, top, right, bottom, (unsigned)scale, m, error, size) :
+        fail(error, size, "invalid PVR polygon scale");
     PROFILE_END(polygon);
     NATIVE_DRAW_END(polygon);
     return result;
@@ -3508,7 +3642,7 @@ const gex_packet_gpu *gex_packet_gpu_get(void) {
     static const gex_gpu_native_ops native = {native_clear,   native_copy, native_blit,
                                               native_present,                                               native_bind, native_polygon,
                                               native_movie, native_atlas_write, native_packet,
-                                              native_atlas_write_rect};
+                                              native_atlas_write_rect, native_polygon_scaled};
     static const gex_packet_gpu backend = {create, destroy, upload, download,
                                            draw,   history, 1,      &native};
     return &backend;

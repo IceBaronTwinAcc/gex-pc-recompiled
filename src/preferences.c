@@ -9,7 +9,7 @@ int (*gex_binding_key_filter)(int, uint32_t, uint32_t);
 int (*gex_binding_pad_filter)(uint32_t);
 static const unsigned destinations[GEX_ACTION_COUNT] = {
     GEX_KEY_C, GEX_KEY_C, GEX_KEY_Z, GEX_KEY_X,
-    GEX_KEY_V, GEX_KEY_ESCAPE, GEX_KEY_X, GEX_KEY_ESCAPE
+    GEX_KEY_V, GEX_KEY_PAUSE, GEX_KEY_X, GEX_KEY_ESCAPE
 };
 
 void gex_preferences_reset(void) {
@@ -50,6 +50,11 @@ uint32_t gex_controls_gamepad(uint32_t buttons) {
     for (unsigned i = menu ? GEX_ACTION_CONFIRM : 0;
          i < (menu ? GEX_ACTION_COUNT : GEX_ACTION_CONFIRM); ++i)
         if (buttons & gex_prefs.bindings[i].button) result |= 1u << destinations[i];
+    if (menu && (buttons & gex_prefs.bindings[GEX_ACTION_PAUSE].button) &&
+        !(gex_prefs.bindings[GEX_ACTION_PAUSE].button &
+          (gex_prefs.bindings[GEX_ACTION_CONFIRM].button |
+           gex_prefs.bindings[GEX_ACTION_BACK].button)))
+        result |= 1u << GEX_KEY_PAUSE;
     return result;
 }
 

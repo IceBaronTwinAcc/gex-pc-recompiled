@@ -595,10 +595,16 @@ static void raster_packet_decode(gex_raster *r, const uint8_t *p, const gex_rast
             vertices[i] = (gex_gpu_vertex){(float)(q[i].x * scale + ox),
                 (float)(q[i].y * scale + oy), (float)q[i].u, (float)q[i].v};
         char error[512] = {0};
-        if (r->gpu->native->polygon(r->device, vertices,
+        int result = r->gpu->native->polygon_scaled ?
+            r->gpu->native->polygon_scaled(r->device, vertices,
                 maximum(0, x0 * scale + ox), maximum(0, y0 * scale + oy),
                 minimum(r->width, x1 * scale + ox), minimum(r->height, y1 * scale + oy),
-                &r->material, error, sizeof error)) gpu_fail(error);
+                scale, &r->material, error, sizeof error) :
+            r->gpu->native->polygon(r->device, vertices,
+                maximum(0, x0 * scale + ox), maximum(0, y0 * scale + oy),
+                minimum(r->width, x1 * scale + ox), minimum(r->height, y1 * scale + oy),
+                &r->material, error, sizeof error);
+        if (result) gpu_fail(error);
         r->guest_newer = r->gpu_newer = 1;
         return;
     }

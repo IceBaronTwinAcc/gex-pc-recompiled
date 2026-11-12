@@ -108,6 +108,11 @@ elseif(NOT GEX_ENABLE_OPENGL_RENDERER)
     set(GEX_PACKET_GPU_SOURCE "${PROJECT_SOURCE_DIR}/src/platform/packet_gpu_none.c")
 endif()
 add_library(gex_packet_gpu STATIC "${GEX_PACKET_GPU_SOURCE}" src/platform/packet_gpu_select.c)
+if(GEX_ENABLE_PVR_RENDERER)
+    target_sources(gex_packet_gpu PRIVATE src/platform/dreamcast/title_cel.c
+        src/platform/dreamcast/title_layout.c src/platform/dreamcast/title_plan.c
+        src/platform/dreamcast/title_draw.c)
+endif()
 target_link_libraries(gex_packet_gpu PRIVATE gex_preferences)
 if(TARGET gex_app_icon)
     target_link_libraries(gex_packet_gpu PRIVATE gex_app_icon)
@@ -150,6 +155,18 @@ endif()
 if(BUILD_TESTING AND GEX_ENABLE_PVR_RENDERER)
     add_executable(gex_pvr_test tests/dreamcast_pvr.c)
     target_link_libraries(gex_pvr_test PRIVATE gex_renderer gex_packet_gpu)
+endif()
+if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
+    add_executable(gex_title_cel_test tests/dreamcast_title_cel.c
+        src/platform/dreamcast/title_cel.c src/platform/dreamcast/title_layout.c
+        src/platform/dreamcast/title_plan.c)
+    target_include_directories(gex_title_cel_test PRIVATE src)
+    add_test(NAME dreamcast-title-cel COMMAND gex_title_cel_test)
+    add_executable(gex_title_draw_test tests/dreamcast_title_draw.c
+        src/platform/dreamcast/title_cel.c src/platform/dreamcast/title_layout.c
+        src/platform/dreamcast/title_plan.c src/platform/dreamcast/title_draw.c)
+    target_include_directories(gex_title_draw_test PRIVATE src)
+    add_test(NAME dreamcast-title-draw COMMAND gex_title_draw_test)
 endif()
 if(GEX_PLATFORM_DESKTOP_TESTS)
     if(WIN32)

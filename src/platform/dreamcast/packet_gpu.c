@@ -11,12 +11,16 @@
 #include "packet_gpu.h"
 #include "raster.h"
 #include "sampling.h"
+#include "title_cel.h"
+#include "title_draw.h"
 
 /* A single presorted translucent list preserves original packet order. */
 enum { TW = 512, TH = 256, CACHE_COUNT = 24, CACHE_BYTES = 4 * 1024 * 1024,
        COMMAND_BYTES = 65536, COMMAND_MAX_BYTES = 196608,
        BACKGROUND_POLYGONS = 384, BACKGROUND_MINIMUM = 16,
-       REMAP_COUNT = 256, REMAP_BYTES = 512 * 1024, SHARED_GROUPS = 2,
+       REMAP_COUNT = 256, REMAP_BYTES = 512 * 1024, SNAPSHOT_BYTES = 512 * 1024,
+       TITLE_SNAPSHOT_BYTES = 2 * 1024 * 1024,
+       SHARED_GROUPS = 2,
        WARM_REGIONS = 4, WARM_BYTES = 128 * 128 };
 enum { BACKGROUND_IDLE, BACKGROUND_RECORD, BACKGROUND_REUSE, BACKGROUND_VERIFY,
        BACKGROUND_REDRAW };
@@ -107,9 +111,15 @@ typedef struct {
 typedef struct transient_texture {
     pvr_ptr_t image[2];
     const uint8_t *atlas;
-    uint64_t epoch;
+    uint64_t epoch, used, title_id;
+    size_t retained_bytes;
     unsigned page, clut, alpha, origin_u, origin_v, dimension;
+    uint32_t zero_mask[8];
     unsigned current, saved_refs;
+    uint16_t *direct_pixels;
+    size_t direct_count;
+    unsigned direct_width, direct_height, direct_passes;
+    uint32_t direct_hash;
     struct transient_texture *next;
 } transient_texture;
 typedef struct transient_pin {
@@ -155,6 +165,7 @@ static uint32_t programmed_palettes[32];
 static struct {
     const uint8_t *atlas;
     unsigned offset, count, alpha;
+    uint32_t zero_mask[8];
     int valid;
 } palette_keys[64];
 static struct {
@@ -172,6 +183,8 @@ static target *pictures[2];
 static const uint8_t *tracked_atlas;
 static uint64_t atlas_revision;
 static uint64_t atlas_write_epoch;
+static size_t retained_snapshot_bytes;
+static size_t retained_title_bytes;
 static transient_texture *transients;
 static transient_pin *active_transient_pin;
 static unsigned previous_scheduler_hz;
@@ -179,20 +192,51 @@ static target *last_presented;
 static unsigned last_present_vblank;
 static int presentation_paced;
 static int fail(char *error, size_t size, const char *message);
+static int transient_pinned(const transient_texture *t) {
+    for (transient_pin *pin = active_transient_pin; pin; pin = pin->previous)
+        if (pin->texture == t) return 1;
+    return 0;
+}
+
+static void free_transient(transient_texture **link) {
+    transient_texture *t = *link;
+    *link = t->next;
+    retained_snapshot_bytes -= t->retained_bytes;
+    if (t->title_id) retained_title_bytes -= t->retained_bytes;
+    cache_bytes -= t->retained_bytes;
+    for (unsigned i = 0; i < 2; ++i)
+        if (t->image[i]) pvr_mem_free(t->image[i]);
+    free(t->direct_pixels);
+    free(t);
+}
+
+static transient_texture **oldest_idle_snapshot_kind(int title) {
+    transient_texture **oldest = NULL;
+    for (transient_texture **link = &transients; *link; link = &(*link)->next) {
+        transient_texture *t = *link;
+        if (!t->retained_bytes || t->current || t->saved_refs || transient_pinned(t))
+            continue;
+        if (title >= 0 && !!t->title_id != title) continue;
+        if (!oldest || t->used < (*oldest)->used) oldest = link;
+    }
+    return oldest;
+}
+
+static transient_texture **oldest_idle_snapshot(void) {
+    return oldest_idle_snapshot_kind(-1);
+}
+
 static void release_transients(void) {
     transient_texture **link = &transients;
     while (*link) {
         transient_texture *t = *link;
-        transient_pin *pin = active_transient_pin;
-        while (pin && pin->texture != t) pin = pin->previous;
-        if (pin || t->current || t->saved_refs) {
+        if (transient_pinned(t) || t->current || t->saved_refs ||
+            (t->retained_bytes &&
+             ((t->direct_pixels || t->title_id) ? users != 0 : t->epoch == atlas_write_epoch))) {
             link = &t->next;
             continue;
         }
-        *link = t->next;
-        for (unsigned i = 0; i < 2; ++i)
-            if (t->image[i]) pvr_mem_free(t->image[i]);
-        free(t);
+        free_transient(link);
     }
 }
 static void clear_current_transients(void) {
@@ -455,15 +499,64 @@ static int remap_write_overlap(const remap_texture *t, unsigned offset,
                                size_t pitch, size_t bytes, unsigned rows) {
     unsigned base = (t->page & 15) * 128 + (t->page & 16 ? 0x80000 : 0);
     unsigned begin = base + t->origin_v * 2048 + t->origin_u / 2;
+    /* An odd starting nibble makes the final texel occupy an extra byte. */
+    unsigned width = (t->dimension + (t->origin_u & 1) + 1) / 2;
     if (pitch == 2048 && bytes <= 2048) {
         /* Atlas rows wrap at 1 MiB; a right-edge write can touch the next
          * row as well. Remapped regions themselves stay inside the page. */
-        return atlas_rect_write_overlap(begin, t->dimension / 2, t->dimension,
+        return atlas_rect_write_overlap(begin, width, t->dimension,
                                         offset, (unsigned)bytes, rows);
     }
     for (unsigned row = 0; row < rows; ++row)
         if (write_overlap((offset + (uint64_t)row * pitch) & 0xfffff, bytes,
-                          begin, 2048, t->dimension / 2, t->dimension)) return 1;
+                          begin, 2048, width, t->dimension)) return 1;
+    return 0;
+}
+
+static int snapshot_segment_overlap(unsigned begin, unsigned width, unsigned height,
+                                    unsigned offset, unsigned bytes, unsigned rows) {
+    unsigned first = height < 512 - begin / 2048 ? height : 512 - begin / 2048;
+    return atlas_rect_write_overlap(begin, width, first, offset, bytes, rows) ||
+           (height > first &&
+            atlas_rect_write_overlap(begin & 2047, width, height - first,
+                                     offset, bytes, rows));
+}
+
+static int snapshot_range_overlap(unsigned begin, unsigned width, unsigned offset, unsigned bytes) {
+    return (begin < offset + bytes && offset < begin + width) ||
+           (begin + 0x100000 < offset + bytes && offset < begin + 0x100000 + width) ||
+           (begin < offset + 0x100000 + bytes && offset + 0x100000 < begin + width);
+}
+
+static int snapshot_write_overlap(const transient_texture *t, unsigned offset,
+                                  size_t pitch, size_t bytes, unsigned rows) {
+    if (!bytes || !rows) return 0;
+    if (bytes >= 0x100000) return 1;
+    unsigned format = t->page >> 7 & 3;
+    unsigned base = (t->page & 15) * 128 + (t->page & 16 ? 0x80000 : 0);
+    unsigned column = format == 0 ? t->origin_u / 2 :
+                      format == 1 ? t->origin_u : t->origin_u * 2;
+    unsigned width = format == 0 ? (t->dimension + (t->origin_u & 1) + 1) / 2 :
+                     format == 1 ? t->dimension : t->dimension * 2;
+    unsigned begin = (base + t->origin_v * 2048 + column) & 0xfffff;
+    unsigned clut = (t->clut * 32) & 0xfffff;
+    unsigned clut_bytes = format == 0 ? 32 : format == 1 ? 512 : 0;
+    if (pitch == 2048 && bytes <= 2048) {
+        unsigned first = width < 2048 - (begin & 2047) ? width : 2048 - (begin & 2047);
+        return (clut_bytes && write_overlap(clut, clut_bytes, offset, pitch, bytes, rows)) ||
+               snapshot_segment_overlap(begin, first, t->dimension, offset, (unsigned)bytes, rows) ||
+               (width > first &&
+                snapshot_segment_overlap((begin + first) & 0xfffff, width - first, t->dimension,
+                                         offset, (unsigned)bytes, rows));
+    }
+    for (unsigned y = 0; y < rows; ++y) {
+        unsigned at = (offset + (uint64_t)y * pitch) & 0xfffff;
+        if (clut_bytes && snapshot_range_overlap(clut, clut_bytes, at, (unsigned)bytes))
+            return 1;
+        for (unsigned source_y = 0; source_y < t->dimension; ++source_y)
+            if (snapshot_range_overlap((begin + source_y * 2048) & 0xfffff, width,
+                                       at, (unsigned)bytes)) return 1;
+    }
     return 0;
 }
 
@@ -566,7 +659,14 @@ static void invalidate_rect(texture *t, unsigned offset, unsigned bytes, unsigne
 static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, size_t pitch,
                                         size_t bytes, unsigned rows) {
     WORK(writes, 1);
+    uint64_t previous_epoch = atlas_write_epoch;
     ++atlas_write_epoch;
+    if (tracked_atlas == atlas) {
+        for (transient_texture *t = transients; t; t = t->next)
+            if (t->atlas == atlas && t->epoch == previous_epoch &&
+                !snapshot_write_overlap(t, offset, pitch, bytes, rows))
+                t->epoch = atlas_write_epoch;
+    }
     if (tracked_atlas != atlas) {
         char error[256];
         if (active && background_replay(active, error, sizeof error)) {
@@ -717,6 +817,12 @@ static unsigned modulate(unsigned c, const gex_gpu_material *m, int mask) {
         result |= (unsigned)m->modulation[(((m->rgb >> (i * 8)) & 255) >> 3) * 32 +
                                           ((c >> (i * 5)) & 31)] << (i * 5);
     return result;
+}
+static int modulates_to_zero(unsigned c, const gex_gpu_material *m) {
+    return c && !(c & 0x8000) &&
+           !m->modulation[(m->rgb & 255) / 8 * 32 + (c & 31)] &&
+           !m->modulation[(m->rgb >> 8 & 255) / 8 * 32 + (c >> 5 & 31)] &&
+           !m->modulation[(m->rgb >> 16 & 255) / 8 * 32 + (c >> 10 & 31)];
 }
 
 static void context(pvr_poly_cxt_t *c, pvr_ptr_t image, int format, int w, int h) {
@@ -1088,6 +1194,7 @@ static void destroy(void *data) {
     free(t);
     if (!--users) {
         release_cache();
+        ++atlas_write_epoch;
         release_transients();
         tracked_atlas = NULL;
         memset(palette_keys, 0, sizeof palette_keys);
@@ -1185,12 +1292,13 @@ static void pack_row(texture *t, const gex_gpu_material *m, int raw,
     } else {
         for (unsigned x = begin / 2; x < end / 2; ++x) {
             unsigned c = word(t->source + y * row + x * 2);
+            int visible = c != 0;
             if (!raw && (m->opcode & ~2u) == 0x64 && !(m->opcode & 2) &&
                 (m->rgb & 255) != 128 && (m->rgb >> 8 & 255) != 128 &&
                 (m->rgb >> 16 & 255) != 128) c = modulate(c, m, 0);
             int masked = (m->opcode & 2) && (c & 0x8000);
             unsigned at = twiddle(y) | twiddle(x) << 1;
-            unsigned color = c ? argb1555(c) : 0;
+            unsigned color = visible ? argb1555(c) : 0;
             if (raw) {
                 ((uint16_t *)t->image[0])[at] = (uint16_t)color;
                 if (t->image[1]) {
@@ -1295,9 +1403,17 @@ static void update_region(texture *t, const gex_gpu_material *m,
     t->region_top = top; t->region_bottom = bottom;
 }
 
-static int evict_texture(texture *protected, size_t bytes, char *error, size_t size) {
+static int evict_texture(texture *protected, size_t bytes, int allow_snapshot,
+                         char *error, size_t size) {
     texture *victim = NULL;
     remap_texture *remapped = NULL;
+    transient_texture **snapshot = allow_snapshot ? oldest_idle_snapshot() : NULL;
+    if (snapshot) {
+        if (pvr_wait_render_done())
+            return hardware_fail(error, size, "PVR texture reclamation completion failed");
+        free_transient(snapshot);
+        return 0;
+    }
     for (unsigned fenced = 0; fenced < 2; ++fenced) {
         /* Prefer an allocation large enough to open the requested hole. */
         for (unsigned pass = 0; pass < 2; ++pass) {
@@ -1327,21 +1443,35 @@ static int evict_texture(texture *protected, size_t bytes, char *error, size_t s
 }
 
 static int reserve_texture(texture *t, size_t storage, char *error, size_t size) {
-    while (cache_bytes + storage > CACHE_BYTES)
-        if (evict_texture(t, 0, error, size)) return -1;
+    while (cache_bytes + storage > CACHE_BYTES ||
+           cache_bytes - retained_snapshot_bytes + storage > CACHE_BYTES - SNAPSHOT_BYTES) {
+        int page_pressure = cache_bytes - retained_snapshot_bytes + storage >
+                            CACHE_BYTES - SNAPSHOT_BYTES;
+        if (evict_texture(t, 0, !page_pressure, error, size)) return -1;
+    }
     return 0;
 }
 
 static int cache_can_reserve(texture *protected, size_t storage, size_t replaced) {
     size_t available = CACHE_BYTES - cache_bytes + replaced;
+    size_t page_available = CACHE_BYTES - SNAPSHOT_BYTES -
+                            (cache_bytes - retained_snapshot_bytes) + replaced;
+    for (transient_texture *t = transients; t; t = t->next)
+        if (t->retained_bytes && !t->current && !t->saved_refs && !transient_pinned(t))
+            available += t->retained_bytes;
     for (unsigned i = 0; i < CACHE_COUNT; ++i)
-        if (&cache[i] != protected && !cache[i].read_end)
+        if (&cache[i] != protected && !cache[i].read_end) {
             available += cache[i].storage;
+            page_available += cache[i].storage;
+        }
     for (unsigned i = 0; i < REMAP_COUNT; ++i)
-        if (remaps[i].image && !remaps[i].queued)
-            available += remaps[i].dimension * remaps[i].dimension *
-                         (remaps[i].group == SHARED_GROUPS ? 2u : 1u);
-    return available >= storage;
+        if (remaps[i].image && !remaps[i].queued) {
+            size_t bytes = remaps[i].dimension * remaps[i].dimension *
+                           (remaps[i].group == SHARED_GROUPS ? 2u : 1u);
+            available += bytes;
+            page_available += bytes;
+        }
+    return available >= storage && page_available >= storage;
 }
 
 static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
@@ -1364,7 +1494,7 @@ static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
                     "purpose=%s key=%x variant=%x flags=%x request=%lu cache=%lu free=%lu\n",
                     purpose, key, variant, flags, (unsigned long)bytes, (unsigned long)cache_bytes,
                     (unsigned long)pvr_mem_available());
-        if (evict_texture(protected, bytes, error, size)) {
+        if (evict_texture(protected, bytes, 1, error, size)) {
             pvr_mem_stats();
             return NULL;
         }
@@ -1384,8 +1514,9 @@ static pvr_ptr_t allocate_texture_without_drain(texture *protected, size_t bytes
         for (unsigned i = 0; i < REMAP_COUNT; ++i)
             if (remaps[i].image && !remaps[i].queued)
                 reclaimable = 1;
+        if (oldest_idle_snapshot()) reclaimable = 1;
         if (!reclaimable) return NULL;
-        if (evict_texture(protected, bytes, error, size)) return NULL;
+        if (evict_texture(protected, bytes, 1, error, size)) return NULL;
     }
 }
 
@@ -1429,6 +1560,7 @@ static unsigned sampled_color(const gex_gpu_material *m, unsigned u, unsigned v)
 static transient_texture *snapshot_texture(const gex_gpu_material *m,
                                            unsigned u0, unsigned u1,
                                            unsigned v0, unsigned v1,
+                                           const uint32_t zero_mask[8],
                                            char *error, size_t size) {
     unsigned dimension = 8, left = u0, top = v0;
     while (dimension < u1 - u0 || dimension < v1 - v0) dimension *= 2;
@@ -1443,7 +1575,9 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
             if (t->atlas == m->atlas && t->epoch == atlas_write_epoch &&
                 t->page == m->page && t->clut == m->clut &&
                 t->alpha == (m->opcode & 2) && t->origin_u == left &&
-                t->origin_v == top && t->dimension == dimension) {
+                t->origin_v == top && t->dimension == dimension &&
+                !memcmp(t->zero_mask, zero_mask, sizeof t->zero_mask)) {
+                t->used = ++cache_clock;
                 active_transient_pin->texture = t;
                 return t;
             }
@@ -1469,6 +1603,8 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
         free(t);
         return NULL;
     }
+    unsigned masked = 0;
+    for (unsigned i = 0; i < 8; ++i) masked |= zero_mask[i];
     for (unsigned y = 0; y < dimension; y += 2)
         for (unsigned x = 0; x < dimension; x += 2) {
             unsigned c[4] = {
@@ -1479,7 +1615,8 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
             };
             uint16_t opaque[4], alpha[4];
             for (unsigned i = 0; i < 4; ++i) {
-                unsigned value = c[i] ? argb1555(c[i]) : 0;
+                unsigned value = c[i] && (!masked || modulate(c[i], m, 1)) ?
+                    argb1555(c[i]) : 0;
                 int half = (m->opcode & 2) && (c[i] & 0x8000);
                 opaque[i] = half ? 0 : (uint16_t)value;
                 alpha[i] = half ? (uint16_t)value : 0;
@@ -1499,9 +1636,37 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
     t->page = m->page;
     t->clut = m->clut;
     t->alpha = m->opcode & 2;
+    memcpy(t->zero_mask, zero_mask, sizeof t->zero_mask);
     t->origin_u = left;
     t->origin_v = top;
     t->dimension = dimension;
+    t->used = ++cache_clock;
+    size_t storage = bytes * ((m->opcode & 2) ? 2 : 1);
+    if (m->atlas == tracked_atlas && storage <= SNAPSHOT_BYTES) {
+        int fenced = 0;
+        while (storage > SNAPSHOT_BYTES - (retained_snapshot_bytes - retained_title_bytes) ||
+               storage > CACHE_BYTES - cache_bytes) {
+            int kind = storage > SNAPSHOT_BYTES - (retained_snapshot_bytes - retained_title_bytes) ? 0 : -1;
+            transient_texture **victim = oldest_idle_snapshot_kind(kind);
+            if (!victim) break;
+            if (!fenced && pvr_wait_render_done()) {
+                active_transient_pin->texture = NULL;
+                free_transient(&transients);
+                hardware_fail(error, size, "PVR snapshot reclamation completion failed");
+                return NULL;
+            }
+            fenced = 1;
+            free_transient(victim);
+        }
+    }
+    if (m->atlas == tracked_atlas &&
+        storage <= SNAPSHOT_BYTES - (retained_snapshot_bytes - retained_title_bytes) &&
+        storage <= CACHE_BYTES - cache_bytes) {
+        t->retained_bytes = storage;
+        retained_snapshot_bytes += storage;
+        cache_bytes += storage;
+    }
+    WORK(snapshots, 1);
     return t;
 }
 
@@ -1770,6 +1935,7 @@ static int shared_bank(unsigned offset) {
 }
 
 static int palette(const gex_gpu_material *m, int raw, int allow_drain,
+                   const uint32_t zero_mask[8],
                    char *error, size_t size) {
     unsigned count = (m->page >> 7 & 3) == 0 ? 16 : 256;
     WORK(pal4_calls, count == 16);
@@ -1781,10 +1947,18 @@ static int palette(const gex_gpu_material *m, int raw, int allow_drain,
                 (palette_banks[i / 512] & (UINT32_C(1) << (i / 16 & 31))) &&
                 palette_keys[i / 16].valid && palette_keys[i / 16].atlas == m->atlas &&
                 palette_keys[i / 16].offset == source && palette_keys[i / 16].count == count &&
-                palette_keys[i / 16].alpha == (m->opcode & 2))
+                palette_keys[i / 16].alpha == (m->opcode & 2) &&
+                !memcmp(palette_keys[i / 16].zero_mask, zero_mask,
+                        sizeof palette_keys[i / 16].zero_mask))
                 return i / count;
     uint32_t decoded[256];
     uint32_t *colors = palette_colors(m, raw, count, decoded);
+    if (raw) {
+        if (colors != decoded) memcpy(decoded, colors, count * sizeof *colors);
+        colors = decoded;
+        for (unsigned i = 0; i < count; ++i)
+            if (zero_mask[i / 32] & (UINT32_C(1) << (i & 31))) colors[i] = 0;
+    }
     unsigned banks = count / 16;
     uint32_t mask = (UINT32_C(1) << banks) - 1;
     unsigned offset = 1024;
@@ -1819,6 +1993,8 @@ remembered:
     palette_keys[offset / 16].offset = source;
     palette_keys[offset / 16].count = count;
     palette_keys[offset / 16].alpha = m->opcode & 2;
+    if (raw) memcpy(palette_keys[offset / 16].zero_mask, zero_mask,
+                    sizeof palette_keys[offset / 16].zero_mask);
     palette_keys[offset / 16].valid = raw && m->atlas == tracked_atlas;
     return (int)(offset / count);
 }
@@ -1910,7 +2086,8 @@ static remap_texture *remapped_region_impl(const gex_gpu_material *m, int u0, in
     }
     if ((command_size || saved_count) &&
         (victim->image || remap_bytes + bytes > REMAP_BYTES ||
-         cache_bytes + bytes > CACHE_BYTES)) {
+         cache_bytes + bytes > CACHE_BYTES ||
+         cache_bytes - retained_snapshot_bytes + bytes > CACHE_BYTES - SNAPSHOT_BYTES)) {
         WORK(remap_queued, 1);
         defer_warming(m, u0, u1, v0, v1);
         return NULL;
@@ -2135,9 +2312,25 @@ static int prune_shared_colors(char *error, size_t size) {
 
 static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1, int v0, int v1,
                                  draw_texture *t, int *bank, char *error, size_t size) {
+    uint32_t zero_mask[8] = {0};
+    int masked = 0;
+    unsigned format = m->page >> 7 & 3;
+    if (format < 2) {
+        /* Software discards indexed colors after modulation, but PVR applies
+         * tint after palette lookup. Preserve those discarded indices in alpha. */
+        unsigned count = format == 0 ? 16 : 256;
+        for (unsigned i = 0; i < count; ++i) {
+            unsigned c = word(m->atlas + ((m->clut * 32 + i * 2) & 0xffffe));
+            if (modulates_to_zero(c, m)) {
+                zero_mask[i / 32] |= UINT32_C(1) << (i & 31);
+                masked = 1;
+            }
+        }
+    }
     char remap_error[256];
     remap_error[0] = 0;
-    if ((m->page >> 7 & 3) == 0 && active) {
+    /* Remapped images and shared palettes have tint-independent identities. */
+    if (format == 0 && active && !masked) {
         ++active->pal4_draws;
         /* Background retention can lower the live draw count without making
          * existing remaps obsolete. Pressure gates building, not cache hits. */
@@ -2155,7 +2348,7 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
                                       page_error, sizeof page_error);
         if (!t->page) {
             if (page_error[0]) return fail(error, size, page_error);
-            t->converted = snapshot_texture(m, u0, u1, v0, v1, error, size);
+            t->converted = snapshot_texture(m, u0, u1, v0, v1, zero_mask, error, size);
             if (!t->converted) return -1;
             *bank = 0;
             return 0;
@@ -2163,9 +2356,9 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     }
     *bank = t->region ? (t->region->group == SHARED_GROUPS ? 0 :
                         shared_palette(t->region->group, 0, error, size)) :
-        (m->page >> 7 & 3) < 2 ? palette(m, 1, 0, error, size) : 0;
+        format < 2 ? palette(m, 1, 0, zero_mask, error, size) : 0;
     if (*bank == -2) {
-        t->converted = snapshot_texture(m, u0, u1, v0, v1, error, size);
+        t->converted = snapshot_texture(m, u0, u1, v0, v1, zero_mask, error, size);
         if (!t->converted) return -1;
         t->page = NULL;
         t->region = NULL;
@@ -3531,7 +3724,7 @@ static int draw(void *data, const gex_gpu_span *spans, size_t count, const gex_g
     texture *t = textured ? page_texture(m, spans, count, error, size) : NULL;
     if (textured && !t)
         return -1;
-    int bank = textured && format < 2 ? palette(m, 0, 1, error, size) : 0;
+    int bank = textured && format < 2 ? palette(m, 0, 1, NULL, error, size) : 0;
     if (bank < 0)
         return -1;
     unsigned passes = textured && format == 2 && (m->opcode & 2) ? 2 : 1;
@@ -3638,11 +3831,196 @@ static uint16_t *history(void *data, size_t bytes, char *error, size_t size) {
     return t->history;
 }
 
+static uint32_t direct_image_hash(const gex_gpu_image *image, unsigned passes) {
+    uint32_t hash = 2166136261u;
+    size_t count = (size_t)image->width * image->height;
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        const uint16_t *pixels = pass ? image->half : image->opaque;
+        for (size_t i = 0; i < count; ++i) hash = (hash ^ pixels[i]) * 16777619u;
+    }
+    return hash;
+}
+
+static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
+                                int left, int top, int right, int bottom,
+                                const gex_gpu_image *image, uint64_t title_id,
+                                unsigned rgb, int vertex_tint,
+                                char *error, size_t size) {
+    if (!data || !q || !image || !image->opaque || !image->width || !image->height ||
+        image->width > 256 || image->height > 256)
+        return fail(error, size, "invalid PVR direct image");
+    for (unsigned i = 0; i < 4; ++i)
+        if (!finite_float(q[i].x) || !finite_float(q[i].y) ||
+            !finite_float(q[i].u) || !finite_float(q[i].v))
+            return fail(error, size, "invalid PVR direct image vertex");
+    if (q[0].x != q[2].x || q[1].x != q[3].x ||
+        q[0].y != q[1].y || q[2].y != q[3].y ||
+        q[0].u != q[2].u || q[1].u != q[3].u ||
+        q[0].v != q[1].v || q[2].v != q[3].v ||
+        q[0].x >= q[3].x || q[0].y >= q[3].y ||
+        q[0].u < 0 || q[0].v < 0 || q[3].u > image->width ||
+        q[3].v > image->height || q[0].u >= q[3].u || q[0].v >= q[3].v)
+        return fail(error, size, "unsupported PVR direct image geometry");
+    float x0 = fmaxf(q[0].x, left), x1 = fminf(q[3].x, right);
+    float y0 = fmaxf(q[0].y, top), y1 = fminf(q[3].y, bottom);
+    if (x0 >= x1 || y0 >= y1) return 0;
+    if (background_stop(data, error, size) || select_target(data, error, size)) return -1;
+    unsigned width = 8, height = 8;
+    while (width < image->width) width *= 2;
+    while (height < image->height) height *= 2;
+    size_t bytes = (size_t)width * height * sizeof(uint16_t);
+    unsigned passes = image->half ? 2 : 1;
+    size_t count = (size_t)image->width * image->height;
+    uint32_t hash = title_id ? 0 : direct_image_hash(image, passes);
+    transient_texture *texture = NULL;
+    for (transient_texture *t = transients; t; t = t->next)
+        if ((title_id ? t->title_id == title_id :
+             t->direct_pixels && !t->title_id && t->direct_hash == hash &&
+             t->direct_count == count &&
+             !memcmp(t->direct_pixels, image->opaque, count * sizeof(uint16_t)) &&
+             (passes == 1 || !memcmp(t->direct_pixels + count, image->half,
+                                     count * sizeof(uint16_t)))) &&
+            t->direct_width == image->width &&
+            t->direct_height == image->height && t->direct_passes == passes &&
+            t->direct_count == count) {
+            texture = t;
+            break;
+        }
+    transient_pin pin = {texture, active_transient_pin};
+    active_transient_pin = &pin;
+    int result = -1;
+    uint32_t *staging = NULL;
+    if (!texture) {
+        staging = malloc(bytes);
+        texture = calloc(1, sizeof *texture);
+        if (!staging || !texture) {
+            free(texture);
+            fail(error, size, "cannot allocate PVR direct image staging");
+            goto done;
+        }
+        texture->next = transients;
+        transients = texture;
+        pin.texture = texture;
+        gex_title_cel cel = {.width = image->width, .height = image->height};
+        for (unsigned pass = 0; pass < passes; ++pass) {
+            const uint16_t *pixels = pass ? image->half : image->opaque;
+            if (gex_title_cel_twiddle(&cel, pixels, count, width, height,
+                                      staging, bytes / sizeof *staging) != GEX_TITLE_CEL_OK) {
+                fail(error, size, "invalid PVR direct image staging");
+                goto done;
+            }
+            char allocation_error[256] = {0};
+            texture->image[pass] = allocate_texture_without_drain(NULL, bytes,
+                                                                   allocation_error, sizeof allocation_error);
+            if (!texture->image[pass]) {
+                fail(error, size, allocation_error[0] ? allocation_error :
+                     "cannot allocate PVR direct image texture");
+                goto done;
+            }
+            volatile uint32_t *destination = texture->image[pass];
+            for (size_t i = 0; i < bytes / sizeof *staging; ++i) destination[i] = staging[i];
+        }
+        size_t storage = bytes * passes;
+        size_t limit = title_id ? TITLE_SNAPSHOT_BYTES : SNAPSHOT_BYTES;
+        size_t used = title_id ? retained_title_bytes : retained_snapshot_bytes - retained_title_bytes;
+        if (storage <= limit) {
+            int fenced = 0;
+            while (storage > limit - used ||
+                   storage > CACHE_BYTES - cache_bytes) {
+                int kind = storage > limit - used ? !!title_id : -1;
+                transient_texture **victim = oldest_idle_snapshot_kind(kind);
+                if (!victim) break;
+                if (!fenced && pvr_wait_render_done()) {
+                    hardware_fail(error, size, "PVR direct image reclamation completion failed");
+                    goto done;
+                }
+                fenced = 1;
+                free_transient(victim);
+                used = title_id ? retained_title_bytes : retained_snapshot_bytes - retained_title_bytes;
+            }
+            if (storage <= limit - used &&
+                storage <= CACHE_BYTES - cache_bytes) {
+                if (!title_id) {
+                    texture->direct_pixels = malloc(count * passes * sizeof(uint16_t));
+                    if (!texture->direct_pixels) {
+                        fail(error, size, "cannot retain PVR direct image pixels");
+                        goto done;
+                    }
+                    memcpy(texture->direct_pixels, image->opaque, count * sizeof(uint16_t));
+                    if (passes == 2)
+                        memcpy(texture->direct_pixels + count, image->half,
+                               count * sizeof(uint16_t));
+                }
+                texture->title_id = title_id;
+                texture->direct_width = image->width;
+                texture->direct_height = image->height;
+                texture->direct_passes = passes;
+                texture->direct_count = count;
+                texture->direct_hash = hash;
+                texture->retained_bytes = storage;
+                retained_snapshot_bytes += storage;
+                if (title_id) retained_title_bytes += storage;
+                cache_bytes += storage;
+            }
+        }
+    }
+    texture->used = ++cache_clock;
+    float du = (q[3].u - q[0].u) / (q[3].x - q[0].x);
+    float dv = (q[3].v - q[0].v) / (q[3].y - q[0].y);
+    float ub = -du * 0.5f + integral_sample_bias(q[0].x, q[3].x - q[0].x, q[0].u, du);
+    float vb = -dv * 0.5f + integral_sample_bias(q[0].y, q[3].y - q[0].y, q[0].v, dv);
+    float u0 = (q[0].u + ub + (x0 - q[0].x) * du) / width;
+    float v0 = (q[0].v + vb + (y0 - q[0].y) * dv) / height;
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        pvr_poly_cxt_t c;
+        pvr_poly_hdr_t header;
+        pvr_vertex_t vertices_out[4];
+        context(&c, texture->image[pass], PVR_TXRFMT_ARGB1555, width, height);
+        pvr_poly_compile(&header, &c);
+        vertices(vertices_out, x0, y0, x1 - x0, y1 - y0, u0, v0,
+                 (x1 - x0) * du / width, (y1 - y0) * dv / height,
+                 vertex_tint ? tint(rgb, pass ? 128 : 255) :
+                               pass ? 0x80ffffff : 0xffffffff);
+        if (append(&header, vertices_out, error, size)) goto done;
+    }
+    result = 0;
+done:
+    free(staging);
+    active_transient_pin = pin.previous;
+    release_transients();
+    return result;
+}
+
+static int native_image(void *data, const gex_gpu_vertex q[4],
+                        int left, int top, int right, int bottom,
+                        const gex_gpu_image *image, char *error, size_t size) {
+    return native_image_with_id(data, q, left, top, right, bottom, image, 0, 0, 0, error, size);
+}
+
+static int native_title_image(void *data, const gex_gpu_vertex q[4],
+                              int left, int top, int right, int bottom,
+                              const gex_gpu_image *image, uint64_t title_id,
+                              unsigned rgb, int vertex_tint,
+                              char *error, size_t size) {
+    return native_image_with_id(data, q, left, top, right, bottom, image, title_id,
+                                rgb, vertex_tint, error, size);
+}
+
+static int native_title_packet(void *target, uint32_t address, const uint8_t *packet,
+                               const gex_raster_state *state, char *error, size_t size) {
+    return gex_dreamcast_title_packet(target, address, packet, state, native_title_image,
+                                      error, size);
+}
+
 const gex_packet_gpu *gex_packet_gpu_get(void) {
+    static const gex_gpu_title_ops title = {gex_dreamcast_title_record, native_title_packet,
+                                            gex_dreamcast_title_forget,
+                                            gex_dreamcast_title_reset};
     static const gex_gpu_native_ops native = {native_clear,   native_copy, native_blit,
                                               native_present,                                               native_bind, native_polygon,
                                               native_movie, native_atlas_write, native_packet,
-                                              native_atlas_write_rect, native_polygon_scaled};
+                                              native_atlas_write_rect, native_polygon_scaled,
+                                              native_image, &title};
     static const gex_packet_gpu backend = {create, destroy, upload, download,
                                            draw,   history, 1,      &native};
     return &backend;

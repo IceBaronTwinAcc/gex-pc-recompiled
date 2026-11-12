@@ -20,7 +20,34 @@ typedef struct {
 } gex_gpu_material;
 
 typedef struct { float x, y, u, v; } gex_gpu_vertex;
+
+/* CPU-owned, unpadded ARGB1555 planes. The optional second plane is blended
+ * at half opacity and must not overlap opaque pixels. Plane storage is only
+ * borrowed for the duration of a call. */
+typedef struct {
+    const uint16_t *opaque, *half;
+    unsigned width, height;
+} gex_gpu_image;
 struct gex_raster_state;
+
+typedef struct {
+    void *context;
+    int (*read)(void *context, uint32_t address, void *out, size_t size);
+    void (*write)(void *context, uint32_t address, const void *data, size_t size);
+    void (*allocated)(void *context, uint32_t next);
+    int (*matches)(void *context, uint32_t address, const void *data, size_t size);
+} gex_gpu_guest_io;
+
+typedef struct {
+    /* Return 1 when recorded, 0 to use the original generator, or -1 on error. */
+    int (*record)(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
+                  char *error, size_t size);
+    /* Return 1 when consumed, 0 for an ordinary packet, or -1 on error. */
+    int (*packet)(void *target, uint32_t address, const uint8_t *packet,
+                  const struct gex_raster_state *state, char *error, size_t size);
+    void (*forget)(uint32_t begin, uint32_t end);
+    void (*reset)(void);
+} gex_gpu_title_ops;
 
 /* GPU-owned pictures never need CPU materialization. Asset blits upload CPU
  * source data, while picture copies and sampling remain entirely on device. */
@@ -51,6 +78,12 @@ typedef struct {
     int (*polygon_scaled)(void *target, const gex_gpu_vertex vertices[4],
                           int left, int top, int right, int bottom, int scale,
                           const gex_gpu_material *material, char *error, size_t size);
+    /* Optional direct image submission, without a guest texture atlas. */
+    int (*image)(void *target, const gex_gpu_vertex vertices[4],
+                 int left, int top, int right, int bottom,
+                 const gex_gpu_image *image, char *error, size_t size);
+    /* Optional platform implementation of the game's deferred title draws. */
+    const gex_gpu_title_ops *title;
 } gex_gpu_native_ops;
 
 typedef struct {

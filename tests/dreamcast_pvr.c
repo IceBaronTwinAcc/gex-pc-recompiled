@@ -43,6 +43,302 @@ static void check(const gex_packet_gpu *gpu, void *t, gex_gpu_material *m,
     }
 }
 
+static uint8_t title_guest_memory[0x10000], title_guest_globals[0x1000], title_guest_colors[128];
+
+static uint8_t *title_guest_pointer(uint32_t address, size_t size) {
+    if (address < sizeof title_guest_memory && size <= sizeof title_guest_memory - address)
+        return title_guest_memory + address;
+    if (address >= 0x4a2000 && address - 0x4a2000 < sizeof title_guest_globals &&
+        size <= sizeof title_guest_globals - (address - 0x4a2000))
+        return title_guest_globals + address - 0x4a2000;
+    if (address >= 0x460048 && address - 0x460048 < sizeof title_guest_colors &&
+        size <= sizeof title_guest_colors - (address - 0x460048))
+        return title_guest_colors + address - 0x460048;
+    return NULL;
+}
+
+static int title_guest_read(void *context, uint32_t address, void *out, size_t size) {
+    (void)context;
+    uint8_t *source = title_guest_pointer(address, size);
+    if (!source) return -1;
+    memcpy(out, source, size);
+    return 0;
+}
+
+static int title_guest_matches(void *context, uint32_t address, const void *data, size_t size) {
+    (void)context;
+    uint8_t *source = title_guest_pointer(address, size);
+    return source && !memcmp(source, data, size);
+}
+
+static void title_guest_write(void *context, uint32_t address, const void *data, size_t size) {
+    (void)context;
+    uint8_t *destination = title_guest_pointer(address, size);
+    if (!destination) abort();
+    memcpy(destination, data, size);
+}
+
+static void title_guest_put32(uint32_t address, uint32_t value) {
+    uint8_t bytes[] = {value, value >> 8, value >> 16, value >> 24};
+    title_guest_write(NULL, address, bytes, sizeof bytes);
+}
+
+static void title_guest_allocated(void *context, uint32_t next) {
+    uint8_t bytes[4];
+    if (title_guest_read(context, 0x4a2ae4, bytes, sizeof bytes)) abort();
+    uint32_t begin = bytes[0] | (uint32_t)bytes[1] << 8 |
+                     (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+    gex_packet_gpu_get()->native->title->forget(begin, next);
+}
+
+static void title_image_regression(const gex_packet_gpu *gpu) {
+    enum { OBJECT = 0x1000, CEL = 0x2000, LIST = 0x3000, PART = 0x4000,
+           IMAGE = 0x5000, PALETTE = 0x6000, ARENA = 0x7000,
+           TAIL0 = 0x8000, TAIL1 = 0x8010 };
+    char error[128] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR title image target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    memset(title_guest_memory, 0, sizeof title_guest_memory);
+    memset(title_guest_globals, 0, sizeof title_guest_globals);
+    memset(title_guest_colors, 0, sizeof title_guest_colors);
+    title_guest_put32(CEL + 0x18, LIST);
+    title_guest_put32(LIST, PART);
+    title_guest_put32(PART + 8, IMAGE);
+    title_guest_put32(PART + 12, PALETTE);
+    title_guest_put32(PART + 16, 0x100);
+    title_guest_put32(IMAGE, 2u << 16);
+    title_guest_put32(IMAGE + 4, 2u << 16);
+    title_guest_memory[IMAGE + 20] = 44;
+    title_guest_memory[IMAGE + 22] = 2;
+    title_guest_memory[IMAGE + 23] = 2;
+    title_guest_memory[IMAGE + 44] = 0x11;
+    title_guest_memory[IMAGE + 48] = 0x11;
+    title_guest_memory[PALETTE + 2] = 0x1f;
+    title_guest_put32(OBJECT + 0x78, 10u << 16);
+    title_guest_put32(OBJECT + 0x7c, 20u << 16);
+    title_guest_put32(OBJECT + 0xe0, 0x01000000);
+    title_guest_put32(0x4a2afc, 0x00808080);
+    title_guest_put32(0x46004c, 0x00808080);
+    title_guest_put32(0x4a2ae0, ARENA);
+    title_guest_put32(0x4a2adc, ARENA + 1024);
+    title_guest_put32(0x4a2ae4, ARENA);
+    title_guest_put32(0x4a2b18, TAIL0);
+    title_guest_put32(0x4a2b14, TAIL1);
+    gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write, title_guest_allocated,
+                           title_guest_matches};
+    gex_raster_state state = {.modulation = table, .left = 0, .top = 8,
+                              .right = 320, .bottom = 232, .layout = 1};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(gpu->native->title->record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    EXPECT(gpu->native->title->packet(t, ARENA, title_guest_memory + ARENA,
+                                      &state, error, sizeof error) == 1);
+    size_t cached = pvr_mem_available();
+    EXPECT(gpu->native->title->packet(t, ARENA + 8, title_guest_memory + ARENA + 8,
+                                      &state, error, sizeof error) == 1);
+    EXPECT(pvr_mem_available() == cached);
+    title_guest_memory[PALETTE + 2] = 0;
+    title_guest_memory[PALETTE + 3] = 0x7c;
+    title_guest_put32(OBJECT + 0x78, 20u << 16);
+    EXPECT(gpu->native->title->record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    EXPECT(gpu->native->title->packet(t, ARENA + 16, title_guest_memory + ARENA + 16,
+                                      &state, error, sizeof error) == 1);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 0x001f);
+    EXPECT(pixels[20 * 320 + 20] == 0x7c00);
+    title_guest_memory[ARENA + 4] = 0x4d;
+    title_guest_memory[ARENA + 5] = 0x4d;
+    title_guest_memory[ARENA + 6] = 0x4d;
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    atlas[1024] = atlas[1024 + 2048] = 0x11;
+    put(0xc0002, 0x001f);
+    gex_gpu_material faded = {8, 0x6000, 0x64, 0x4d4d4d, atlas, table};
+    gex_gpu_vertex reference[] = {{30, 20, 0, 0}, {32, 20, 2, 0},
+                                  {30, 22, 0, 2}, {32, 22, 2, 2}};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    size_t before_fade = pvr_mem_available();
+    EXPECT(gpu->native->title->packet(t, ARENA, title_guest_memory + ARENA,
+                                      &state, error, sizeof error) == 1);
+    EXPECT(pvr_mem_available() == before_fade);
+    int faded_result = gpu->native->polygon(t, reference, 0, 0, 320, 240,
+                                             &faded, error, sizeof error);
+    if (faded_result) printf("PVR title fade reference: %s\n", error);
+    EXPECT(!faded_result);
+    int faded_download = gpu->download(t, pixels, error, sizeof error);
+    if (faded_download) printf("PVR title fade download: %s\n", error);
+    EXPECT(!faded_download);
+    EXPECT(pixels[20 * 320 + 10] == pixels[20 * 320 + 30]);
+    EXPECT(pixels[20 * 320 + 10] == 19);
+    gpu->native->title->reset();
+    gpu->destroy(t);
+}
+
+static void direct_image_regression(const gex_packet_gpu *gpu) {
+    char error[128] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR direct image target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0x03e0;
+    EXPECT(!gpu->upload(t, pixels, error, sizeof error));
+    uint16_t opaque[] = {0xfc00, 0, 0x8000, 0};
+    uint16_t half[] = {0, 0x801f, 0, 0};
+    gex_gpu_image image = {opaque, half, 2, 2};
+    gex_gpu_vertex q[] = {{10, 10, 0, 0}, {12, 10, 2, 0},
+                          {10, 12, 0, 2}, {12, 12, 2, 2}};
+    EXPECT(gpu->native->image != NULL);
+    EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+    size_t cached = pvr_mem_available();
+    q[0].x = q[2].x = 14;
+    q[1].x = q[3].x = 16;
+    EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+    EXPECT(pvr_mem_available() == cached);
+    memset(opaque, 0, sizeof opaque);
+    memset(half, 0, sizeof half);
+    void *secondary = gpu->create(320, 240, error, sizeof error);
+    EXPECT(secondary != NULL);
+    if (secondary) EXPECT(!gpu->upload(secondary, pixels, error, sizeof error));
+    gpu->native->atlas_write(atlas, 1024, 2);
+    put(1024, 0xfc00);
+    gex_gpu_material material = {8 | 256, 0, 0x66, 0x808080, atlas, table};
+    gex_gpu_span reference = {11, 20, 1, 1, 0, 0, 65536, 0, 1, 0, {0, 0}};
+    EXPECT(!gpu->draw(t, &reference, 1, &material, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[10 * 320 + 10] == 0x001f);
+    EXPECT(pixels[10 * 320 + 11] == pixels[20 * 320 + 11]);
+    EXPECT(pixels[11 * 320 + 10] == 0);
+    EXPECT(pixels[11 * 320 + 11] == 0x03e0);
+    opaque[0] = 0xfc00;
+    opaque[2] = 0x8000;
+    half[1] = 0x801f;
+    q[0].x = q[2].x = 24;
+    q[1].x = q[3].x = 26;
+    cached = pvr_mem_available();
+    EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+    EXPECT(pvr_mem_available() == cached);
+    opaque[0] = 0x801f;
+    q[0].x = q[2].x = 28;
+    q[1].x = q[3].x = 30;
+    EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+    EXPECT(pvr_mem_available() < cached);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[10 * 320 + 24] == 0x001f);
+    EXPECT(pixels[10 * 320 + 28] == 0x7c00);
+    if (secondary) gpu->destroy(secondary);
+    opaque[0] = 0xfc00;
+    opaque[1] = 0x801f;
+    image.half = NULL;
+    q[0].x = q[2].x = 20;
+    q[1].x = q[3].x = 22;
+    EXPECT(!gpu->native->image(t, q, 21, 0, 320, 240, &image, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[10 * 320 + 20] == 0x03e0);
+    EXPECT(pixels[10 * 320 + 21] == 0x7c00);
+    q[1].x = q[3].x = 9;
+    EXPECT(gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error) != 0);
+
+    uint16_t rectangular[13 * 5];
+    for (unsigned i = 0; i < 13 * 5; ++i)
+        rectangular[i] = (uint16_t)(0x8000 | (1 + i % 31) << 10);
+    gex_gpu_image wide = {rectangular, NULL, 13, 5};
+    gex_gpu_vertex wide_quad[] = {{40, 40, 0, 0}, {53, 40, 13, 0},
+                                  {40, 45, 0, 5}, {53, 45, 13, 5}};
+    gex_gpu_image tall = {rectangular, NULL, 5, 13};
+    gex_gpu_vertex tall_quad[] = {{60, 40, 0, 0}, {65, 40, 5, 0},
+                                  {60, 53, 0, 13}, {65, 53, 5, 13}};
+    EXPECT(!gpu->native->image(t, wide_quad, 0, 0, 320, 240, &wide, error, sizeof error));
+    EXPECT(!gpu->native->image(t, tall_quad, 0, 0, 320, 240, &tall, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    for (unsigned y = 0; y < 5; ++y)
+        for (unsigned x = 0; x < 13; ++x)
+            EXPECT(pixels[(40 + y) * 320 + 40 + x] == 1 + (y * 13 + x) % 31);
+    for (unsigned y = 0; y < 13; ++y)
+        for (unsigned x = 0; x < 5; ++x)
+            EXPECT(pixels[(40 + y) * 320 + 60 + x] == 1 + (y * 5 + x) % 31);
+    gpu->destroy(t);
+}
+
+static void direct_image_cache_budget_regression(const gex_packet_gpu *gpu) {
+    char error[128] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR direct image pressure target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    static uint16_t source[128 * 128];
+    gex_gpu_image image = {source, NULL, 128, 128};
+    gex_gpu_vertex q[] = {{0, 0, 0, 0}, {128, 0, 128, 0},
+                          {0, 128, 0, 128}, {128, 128, 128, 128}};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    size_t before = pvr_mem_available();
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        for (unsigned i = 0; i < 8; ++i) {
+            unsigned color = 1 + frame * 8 + i;
+            for (unsigned p = 0; p < 128 * 128; ++p)
+                source[p] = 0x8000 | color << 10;
+            EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+        }
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        EXPECT(pixels[20 * 320 + 20] == (frame + 1) * 8);
+        size_t available = pvr_mem_available();
+        EXPECT(available <= before && before - available <= 512 * 1024 + 4096);
+    }
+    gpu->destroy(t);
+}
+
+static void dark_direct_sprite_span_regression(const gex_packet_gpu *gpu) {
+    char error[128] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR direct sprite target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    const unsigned colors[] = {0, 0x0c63, 0x8000, 0x7fff};
+    for (unsigned i = 0; i < 4; ++i) put(1024 + 16 * 2048 + (16 + i) * 2, colors[i]);
+    for (unsigned i = 0; i < 320 * 240; ++i) pixels[i] = 0x1f;
+    EXPECT(!gpu->upload(t, pixels, error, sizeof error));
+    gex_gpu_material material = {8 | 256, 0, 0x64, 0x262626, atlas, table};
+    check(gpu, t, &material, 10, 10, 4, 16, 16);
+    EXPECT(pixels[10 * 320 + 10] == 0x1f);
+    EXPECT(pixels[10 * 320 + 11] == 0);
+    EXPECT(pixels[10 * 320 + 12] == 0);
+    EXPECT(pixels[10 * 320 + 13] == 0x1ce7);
+#if GEX_ENABLE_SOFTWARE_RENDERER
+    gex_raster *cpu = gex_raster_create(320, 240);
+    if (!cpu) {
+        printf("PVR direct sprite reference initialization failed\n");
+        ++failures;
+    } else {
+        gex_raster_fill(cpu, 0, 0, 320, 240, 0xff);
+        gex_raster_state state = {atlas, table, 8 | 256, 0, 8, 320, 248, 0};
+        uint8_t packet[20] = {0};
+        packet[4] = packet[5] = packet[6] = 0x26;
+        packet[7] = 0x64;
+        packet[8] = 10; packet[10] = 18;
+        packet[12] = packet[13] = 16;
+        packet[16] = 4; packet[18] = 1;
+        gex_raster_packet(cpu, packet, &state);
+        const uint16_t *reference = (const uint16_t *)gex_raster_pixels(cpu);
+        for (unsigned i = 0; i < 4; ++i)
+            EXPECT(pixels[10 * 320 + 10 + i] == reference[10 * 320 + 10 + i]);
+        gex_raster_destroy(cpu);
+    }
+#endif
+    gpu->destroy(t);
+}
+
 static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular_reset) {
     const gex_gpu_native_ops *native = gpu->native;
     char error[256] = {0};
@@ -160,9 +456,9 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
             EXPECT(pixels[at + 2] == 0);
         }
     }
-    if (warmed_storage < 236 * 96 || warmed_storage > 256 * 160)
+    if (warmed_storage < 236 * 96 || warmed_storage > 256 * 160 + 512 * 1024)
         printf("PVR warmed storage: %lld\n", (long long)warmed_storage);
-    EXPECT(warmed_storage >= 236 * 96 && warmed_storage <= 256 * 160);
+    EXPECT(warmed_storage >= 236 * 96 && warmed_storage <= 256 * 160 + 512 * 1024);
     /* Game initialization invalidates, clears GPU targets, then resets CPU
      * atlas data. Deferred warming must not rebuild from the old pixels. */
     if (rectangular_reset)
@@ -1788,11 +2084,15 @@ static void deferred_palette_regression(const gex_packet_gpu *gpu) {
         for (unsigned j = 0; j < 16; ++j)
             put(0xc0000 + i * 32 + j * 2, 1 + i * 16 + j);
     gex_gpu_material material = {8, 0x6000, 0x2c, 0x808080, atlas, table};
-    for (unsigned frame = 0; frame < 2; ++frame) {
-        if (frame) {
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        if (frame == 1) {
             gpu->native->atlas_write(atlas, 0xc0000 + 64 * 32 + 2, 2);
             put(0xc0000 + 64 * 32 + 2, 0x8000 | 0x3e0);
             material.opcode = 0x2e;
+        } else if (frame == 2) {
+            gpu->native->atlas_write(atlas, 0xc0000 + 64 * 32 + 2, 2);
+            put(0xc0000 + 64 * 32 + 2, 0xc63);
+            material.opcode = 0x2c;
         }
         vid_waitvbl();
         pvr_stats_t before, after;
@@ -1807,6 +2107,7 @@ static void deferred_palette_regression(const gex_packet_gpu *gpu) {
         }
         for (unsigned i = 0; i < 65; ++i) {
             material.clut = 0x6000 + i;
+            material.rgb = frame == 2 && i == 64 ? 0x262626 : 0x808080;
             float x = 10 + i;
             gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
                                      {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
@@ -1824,13 +2125,137 @@ static void deferred_palette_regression(const gex_packet_gpu *gpu) {
             EXPECT(pixels[20 * 320 + 10 + i] == 2 + i * 16);
         if (!frame) {
             EXPECT(pixels[20 * 320 + 74] == 2 + 64 * 16);
-        } else {
+        } else if (frame == 1) {
             unsigned c = pixels[20 * 320 + 74];
             EXPECT((c & 31) >= 14 && (c & 31) <= 16);
             EXPECT((c >> 5 & 31) >= 14 && (c >> 5 & 31) <= 16);
             EXPECT((c >> 10 & 31) == 0);
-        }
+        } else EXPECT(pixels[20 * 320 + 74] == 31);
     }
+    gpu->destroy(t);
+}
+
+static void retained_texture_snapshot_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR texture pressure target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    atlas[1024] = 1;
+    for (unsigned i = 0; i < 5; ++i)
+        put(0xc0000 + i * 512 + 2, i + 1);
+    put(0xc0000 + 4 * 512 + 4, 0x7c00);
+    gex_gpu_material material = {8 | 128, 0x6000, 0x2c, 0x808080, atlas, table};
+    size_t retained = 0;
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        if (frame == 1) {
+            gpu->native->atlas_write_rect(atlas, 0x70000, 2048, 4, 2);
+            atlas[0x70000] = 7;
+        }
+        size_t before = 0, after = 0;
+        for (unsigned i = 0; i < 5; ++i) {
+            material.clut = 0x6000 + i * 16;
+            float x = 10 + i;
+            gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                     {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+            if (i == 4) before = pvr_mem_available();
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+            if (i == 4) after = pvr_mem_available();
+        }
+        if (!frame) {
+            EXPECT(before > after);
+            retained = after;
+        } else if (frame == 1) {
+            EXPECT(before == retained);
+            EXPECT(after == before);
+            gpu->native->atlas_write(atlas, 0xc0000 + 4 * 512 + 2, 2);
+            put(0xc0000 + 4 * 512 + 2, 0x3e0);
+            gex_gpu_vertex cell[] = {{30, 20, 0, 0}, {31, 20, 1, 0},
+                                     {30, 21, 0, 1}, {31, 21, 1, 1}};
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        } else if (frame == 2) {
+            gpu->native->atlas_write(atlas, 1024, 1);
+            atlas[1024] = 2;
+            gex_gpu_vertex cell[] = {{30, 20, 0, 0}, {31, 20, 1, 0},
+                                     {30, 21, 0, 1}, {31, 21, 1, 1}};
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        if (!frame) EXPECT(pvr_mem_available() == retained);
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        for (unsigned i = 0; i < 4; ++i)
+            EXPECT(pixels[20 * 320 + 10 + i] == i + 1);
+        EXPECT(pixels[20 * 320 + 14] == (frame == 2 ? 0x3e0 : 5));
+        if (frame == 1) EXPECT(pixels[20 * 320 + 30] == 0x3e0);
+        if (frame == 2) EXPECT(pixels[20 * 320 + 30] == 0x7c00);
+    }
+    gpu->destroy(t);
+}
+
+static void retained_texture_snapshot_budget_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR texture pressure target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    for (unsigned y = 0; y < 128; ++y)
+        memset(atlas + 1024 + y * 2048, 1, 128);
+    for (unsigned i = 0; i < 40; ++i)
+        put(0xc0000 + i * 512 + 2, i + 1);
+    gex_gpu_material material = {8 | 128, 0x6000, 0x2c, 0x808080, atlas, table};
+    size_t before = 0, retained = 0;
+    for (unsigned frame = 0; frame < 2; ++frame) {
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        for (unsigned n = 0; n < 40; ++n) {
+            unsigned i = frame ? (n ? n - 1 : 39) : n;
+            material.clut = 0x6000 + i * 16;
+            gex_gpu_vertex cell[] = {{0, 0, 0, 0}, {128, 0, 128, 0},
+                                     {0, 128, 0, 128}, {128, 128, 128, 128}};
+            if (!frame && i == 4) before = pvr_mem_available();
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        if (frame) {
+            material.clut = 0x6000 + 39 * 16;
+            gex_gpu_vertex cell[] = {{0, 0, 0, 0}, {128, 0, 128, 0},
+                                     {0, 128, 0, 128}, {128, 128, 128, 128}};
+            EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                         &material, error, sizeof error));
+        }
+        EXPECT(!gpu->native->present(t, error, sizeof error));
+        if (!frame) {
+            retained = pvr_mem_available();
+            EXPECT(before >= retained);
+            if (before - retained < 15 * 128 * 128 * 2)
+                printf("PVR warmed storage: %lld\n", (long long)(before - retained));
+            EXPECT(before - retained >= 15 * 128 * 128 * 2);
+            EXPECT(before - retained <= 512 * 1024 + 4096);
+        } else EXPECT(pvr_mem_available() == retained);
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        EXPECT(pixels[20 * 320 + 20] == 40);
+    }
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    material.clut = 0x6000 + 39 * 16;
+    gex_gpu_vertex cell[] = {{0, 0, 0, 0}, {128, 0, 128, 0},
+                             {0, 128, 0, 128}, {128, 128, 128, 128}};
+    size_t before_reuse = pvr_mem_available();
+    EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
+    EXPECT(pvr_mem_available() == before_reuse);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 20] == 40);
     gpu->destroy(t);
 }
 
@@ -1852,7 +2277,11 @@ static void deferred_pal8_regression(const gex_packet_gpu *gpu) {
     put(0xc0000 + 4 * 512 + 4, 0x8000 | 0x3e0);
     put(0xc0000 + 4 * 512 + 6, 0);
     gex_gpu_material material = {8 | 128, 0x6000, 0x2e, 0x808080, atlas, table};
-    for (unsigned frame = 0; frame < 2; ++frame) {
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        if (frame == 2) {
+            gpu->native->atlas_write(atlas, 0xc0000 + 4 * 512 + 2, 2);
+            put(0xc0000 + 4 * 512 + 2, 0xc63);
+        }
         vid_waitvbl();
         pvr_stats_t before, after;
         EXPECT(!pvr_get_stats(&before));
@@ -1873,11 +2302,22 @@ static void deferred_pal8_regression(const gex_packet_gpu *gpu) {
         }
         for (unsigned i = 0; i < 5; ++i) {
             material.clut = 0x6000 + i * 16;
+            material.rgb = frame == 2 && i == 4 ? 0x262626 : 0x808080;
             float x = 10 + i * 10;
             gex_gpu_vertex block[] = {{x, 20, 0, 0}, {x + 3, 20, 3, 0},
                                       {x, 22, 0, 2}, {x + 3, 22, 3, 2}};
             EXPECT(!gpu->native->polygon(t, block, 0, 0, 320, 240,
                                          &material, error, sizeof error));
+        }
+        if (frame == 2) {
+            for (unsigned i = 0; i < 2; ++i) {
+                material.rgb = i ? 0x262626 : 0x808080;
+                float x = 60 + i * 10;
+                gex_gpu_vertex block[] = {{x, 20, 0, 0}, {x + 3, 20, 3, 0},
+                                          {x, 22, 0, 2}, {x + 3, 22, 3, 2}};
+                EXPECT(!gpu->native->polygon(t, block, 0, 0, 320, 240,
+                                             &material, error, sizeof error));
+            }
         }
         if (!frame) {
             vid_waitvbl();
@@ -1886,15 +2326,20 @@ static void deferred_pal8_regression(const gex_packet_gpu *gpu) {
         }
         EXPECT(!gpu->native->present(t, error, sizeof error));
         EXPECT(!gpu->download(t, pixels, error, sizeof error));
-        EXPECT(pixels[20 * 320 + 50] == 1 + 4 * 256 + 1);
+        EXPECT(pixels[20 * 320 + 50] == (frame == 2 ? 31 : 1 + 4 * 256 + 1));
         EXPECT(pixels[20 * 320 + 52] == 31);
         EXPECT(pixels[21 * 320 + 50] == 31);
-        EXPECT(pixels[21 * 320 + 52] == 1 + 4 * 256 + 1);
-        for (unsigned y = 20; y < 22; ++y) {
-            unsigned c = pixels[y * 320 + 51];
-            EXPECT((c & 31) >= 14 && (c & 31) <= 16);
-            EXPECT((c >> 5 & 31) >= 14 && (c >> 5 & 31) <= 16);
-            EXPECT((c >> 10 & 31) == 0);
+        EXPECT(pixels[21 * 320 + 52] == (frame == 2 ? 31 : 1 + 4 * 256 + 1));
+        if (frame == 2) {
+            EXPECT(pixels[20 * 320 + 60] == 0xc63);
+            EXPECT(pixels[20 * 320 + 70] == 31);
+        } else {
+            for (unsigned y = 20; y < 22; ++y) {
+                unsigned c = pixels[y * 320 + 51];
+                EXPECT((c & 31) >= 14 && (c & 31) <= 16);
+                EXPECT((c >> 5 & 31) >= 14 && (c >> 5 & 31) <= 16);
+                EXPECT((c >> 10 & 31) == 0);
+            }
         }
     }
     gpu->destroy(t);
@@ -2213,7 +2658,7 @@ static void wrapped_page_mutation_regression(const gex_packet_gpu *gpu) {
     }
 }
 
-static void odd_remap_mutation_regression(const gex_packet_gpu *gpu) {
+static void odd_remap_mutation_regression(const gex_packet_gpu *gpu, int tail, int alpha) {
     char error[256] = {0};
     void *t = gpu->create(320, 240, error, sizeof error);
     if (!t) {
@@ -2226,7 +2671,8 @@ static void odd_remap_mutation_regression(const gex_packet_gpu *gpu) {
     native->bind(t, atlas, 0);
     native->atlas_write(atlas, 0, sizeof atlas);
     memset(atlas, 0, sizeof atlas);
-    for (unsigned i = 0; i < 8; ++i) put(0xc8000 + i * 2, 0x8000 | colors[i]);
+    for (unsigned i = 0; i < 8; ++i)
+        put(0x200 + i * 2, colors[i] | (alpha ? 0 : 0x8000));
     for (unsigned y = 0; y < 16; ++y)
         for (unsigned u = 0; u < 32; ++u) {
             unsigned at = 1024 + y * 2048 + u / 2;
@@ -2234,7 +2680,7 @@ static void odd_remap_mutation_regression(const gex_packet_gpu *gpu) {
             unsigned index = 1 + (u * 3 + y * 5) % 7;
             atlas[at] = (uint8_t)((atlas[at] & ~(15u << shift)) | index << shift);
         }
-    gex_gpu_material material = {8, 0x6400, 0x2c, 0x808080, atlas, table};
+    gex_gpu_material material = {8, 0x10, alpha ? 0x2e : 0x2c, 0x808080, atlas, table};
     EXPECT(!native->clear(t, error, sizeof error));
     for (unsigned i = 0; i < 65; ++i) {
         gex_gpu_vertex q[] = {{10, 10, 15, 2}, {20, 10, 25, 2},
@@ -2245,9 +2691,12 @@ static void odd_remap_mutation_regression(const gex_packet_gpu *gpu) {
     EXPECT(!native->clear(t, error, sizeof error));
     for (unsigned draw = 0; draw < 2; ++draw) {
         if (draw) {
-            unsigned at = 1024 + 3 * 2048 + 19 / 2;
-            native->atlas_write(atlas, at, 1);
-            atlas[at] = (uint8_t)((atlas[at] & 15) | 7u << 4);
+            unsigned u = tail ? 24 : 19;
+            unsigned at = 1024 + 3 * 2048 + u / 2;
+            unsigned shift = (u & 1) * 4;
+            if (tail == 2) native->atlas_write_rect(atlas, at, 2048, 1, 1);
+            else native->atlas_write(atlas, at, 1);
+            atlas[at] = (uint8_t)((atlas[at] & ~(15u << shift)) | 7u << shift);
         }
         float x = 10 + draw * 20;
         gex_gpu_vertex q[] = {{x, 10, 15, 2}, {x + 10, 10, 25, 2},
@@ -2258,12 +2707,12 @@ static void odd_remap_mutation_regression(const gex_packet_gpu *gpu) {
     for (unsigned draw = 0; draw < 2; ++draw)
         for (unsigned y = 0; y < 4; ++y)
             for (unsigned x = 0; x < 10; ++x) {
-                unsigned index = draw && x == 4 && y == 1 ? 7 :
+                unsigned index = draw && x == (tail ? 9u : 4u) && y == 1 ? 7 :
                                  1 + ((15 + x) * 3 + (2 + y) * 5) % 7;
                 unsigned actual = pixels[(10 + y) * 320 + 10 + draw * 20 + x];
                 if (actual != colors[index]) {
-                    printf("PVR odd remap mismatch draw=%u x=%u y=%u actual=%x expected=%x\n",
-                           draw, x, y, actual, colors[index]);
+                    printf("PVR odd remap mismatch tail=%d alpha=%d draw=%u x=%u y=%u actual=%x expected=%x\n",
+                           tail, alpha, draw, x, y, actual, colors[index]);
                     ++failures;
                 }
             }
@@ -2504,6 +2953,312 @@ static void fractional_raster_regression(const gex_packet_gpu *gpu) {
     }
     gex_raster_destroy(raster);
 }
+
+#if GEX_ENABLE_SOFTWARE_RENDERER
+static void observed_quad_reference_regression(const gex_packet_gpu *gpu) {
+    static const unsigned shapes[][4] = {
+        {32, 32, 32, 31}, {5, 5, 23, 15}, {7, 6, 23, 23},
+        {22, 17, 23, 17}, {22, 24, 23, 24}, {12, 7, 23, 15},
+        {10, 12, 23, 22}, {15, 12, 23, 17}, {16, 16, 23, 23},
+        {19, 16, 23, 18}, {8, 7, 31, 23}, {20, 13, 31, 20},
+        {14, 13, 23, 21}, {9, 13, 15, 20}, {9, 8, 15, 12},
+        {14, 11, 23, 16}
+    };
+    char error[256] = {0};
+    gex_packet_gpu native = *gpu;
+    native.create = remember_device;
+    gex_raster *cpu = gex_raster_create(320, 240);
+    gex_raster *pvr = gex_raster_create(320, 240);
+    if (!cpu || !pvr || gex_raster_enable_gpu(pvr, &native)) {
+        printf("PVR reference quad initialization failed\n");
+        ++failures;
+        gex_raster_destroy(cpu);
+        gex_raster_destroy(pvr);
+        return;
+    }
+    gex_raster_bind(pvr, atlas, 0);
+    for (unsigned format = 0; format < 3; ++format) {
+        gpu->native->atlas_write(atlas, 0, sizeof atlas);
+        memset(atlas, 0, sizeof atlas);
+        for (unsigned i = 0; i < 256; ++i)
+            put(512 + i * 2, (i & 31) | ((i >> 5) << 5) | 0x400);
+        for (unsigned y = 0; y < 128; ++y)
+            for (unsigned x = 0; x < 128; ++x) {
+                unsigned index = format == 0 ? 1 + (x * 3 + y * 5) % 15 :
+                                               (x * 13 + y * 17) & 255;
+                unsigned at = 1024 + y * 2048 +
+                              (format == 0 ? x / 2 : format == 1 ? x : x * 2);
+                if (format == 0) {
+                    unsigned shift = (x & 1) * 4;
+                    atlas[at] = (uint8_t)((atlas[at] & ~(15u << shift)) | index << shift);
+                } else if (format == 1) atlas[at] = (uint8_t)index;
+                else put(at, (x & 31) | ((y & 31) << 5) |
+                             ((((x >> 5) ^ (y >> 5)) + 1) << 10));
+            }
+        for (unsigned flip = 0; flip < 4; ++flip) {
+            gex_raster_clear(cpu);
+            gex_raster_clear(pvr);
+            gex_raster_state state = {atlas, table, 8 | format << 7, 0, 8, 320, 248, 0};
+            for (unsigned test = 0; test < sizeof shapes / sizeof *shapes; ++test) {
+                uint8_t packet[40] = {0};
+                packet[4] = packet[5] = packet[6] = 128;
+                packet[7] = 0x2c;
+                packet[14] = 0x10;
+                packet[22] = (uint8_t)(8 | format << 7);
+                packet[23] = (uint8_t)((8 | format << 7) >> 8);
+                unsigned x = 10 + test % 6 * 48, y = 20 + test / 6 * 60;
+                for (unsigned i = 0; i < 4; ++i) {
+                    unsigned px = x + ((!!(i & 1) ^ !!(flip & 1)) ? shapes[test][0] : 0);
+                    unsigned py = y + ((!!(i & 2) ^ !!(flip & 2)) ? shapes[test][1] : 0) + 8;
+                    unsigned u = 32 + (i & 1 ? shapes[test][2] : 0);
+                    unsigned v = 32 + (i & 2 ? shapes[test][3] : 0);
+                    packet[8 + i * 8] = (uint8_t)px;
+                    packet[9 + i * 8] = (uint8_t)(px >> 8);
+                    packet[10 + i * 8] = (uint8_t)py;
+                    packet[11 + i * 8] = (uint8_t)(py >> 8);
+                    packet[12 + i * 8] = (uint8_t)u;
+                    packet[13 + i * 8] = (uint8_t)v;
+                }
+                gex_raster_packet(cpu, packet, &state);
+                gex_raster_packet(pvr, packet, &state);
+            }
+            EXPECT(!download_presented(gpu, raster_device, pixels, error, sizeof error));
+            const uint16_t *reference = (const uint16_t *)gex_raster_pixels(cpu);
+            for (unsigned y = 0; y < 240; ++y)
+                for (unsigned x = 0; x < 320; ++x)
+                    if (pixels[y * 320 + x] != reference[y * 320 + x]) {
+                        printf("PVR reference quad mismatch format=%u flip=%u x=%u y=%u actual=%x expected=%x\n",
+                               format, flip, x, y, pixels[y * 320 + x], reference[y * 320 + x]);
+                        ++failures;
+                        goto next_frame;
+                    }
+        next_frame:;
+        }
+    }
+    gex_raster_destroy(cpu);
+    gex_raster_destroy(pvr);
+}
+
+static void wrapped_sprite_reference_regression(const gex_packet_gpu *gpu) {
+    static const unsigned origins[] = {0, 7, 63, 127, 248, 255};
+    char error[256] = {0};
+    gex_packet_gpu native = *gpu;
+    native.create = remember_device;
+    gex_raster *cpu = gex_raster_create(320, 240);
+    gex_raster *pvr = gex_raster_create(320, 240);
+    if (!cpu || !pvr || gex_raster_enable_gpu(pvr, &native)) {
+        printf("PVR wrapped sprite initialization failed\n");
+        ++failures;
+        gex_raster_destroy(cpu);
+        gex_raster_destroy(pvr);
+        return;
+    }
+    gex_raster_bind(pvr, atlas, 0);
+    for (unsigned format = 0; format < 3; ++format) {
+        gpu->native->atlas_write(atlas, 0, sizeof atlas);
+        memset(atlas, 0, sizeof atlas);
+        for (unsigned i = 0; i < 256; ++i)
+            put(0xc0000 + i * 2, 0x400 | (i & 31) | ((i >> 5) << 5) |
+                                     ((i & 1) ? 0x8000 : 0));
+        for (unsigned y = 0; y < 256; ++y)
+            for (unsigned x = 0; x < 256; ++x) {
+                unsigned index = (x * 13 + y * 17) & (format == 0 ? 15 : 255);
+                unsigned at = 1024 + y * 2048 +
+                              (format == 0 ? x / 2 : format == 1 ? x : x * 2);
+                if (format == 0) {
+                    unsigned shift = (x & 1) * 4;
+                    atlas[at] = (uint8_t)((atlas[at] & ~(15u << shift)) | index << shift);
+                } else if (format == 1) atlas[at] = (uint8_t)index;
+                else put(at, 0x400 | (x & 31) | ((y & 31) << 5) |
+                             (((x >> 5) ^ (y >> 5)) << 11) |
+                             ((x & 1) ? 0x8000 : 0));
+            }
+        gex_raster_clear(cpu);
+        gex_raster_clear(pvr);
+        for (unsigned i = 0; i < 36; ++i) {
+            unsigned x = 4 + i % 6 * 50, y = 4 + i / 6 * 37;
+            unsigned width = 8 + i % 3, height = 8 + i % 4;
+            gex_raster_state state = {atlas, table, 8 | format << 7,
+                (int)x + (i & 1), (int)y + 8 + (i >> 1 & 1),
+                (int)(x + width - (i >> 2 & 1)),
+                (int)(y + height + 8 - (i >> 3 & 1)), 0};
+            uint8_t packet[20] = {0};
+            packet[4] = packet[5] = packet[6] = 128;
+            packet[7] = 0x64;
+            packet[8] = (uint8_t)x; packet[9] = (uint8_t)(x >> 8);
+            packet[10] = (uint8_t)(y + 8); packet[11] = (uint8_t)((y + 8) >> 8);
+            packet[12] = (uint8_t)origins[i % 6];
+            packet[13] = (uint8_t)origins[i / 6];
+            packet[15] = 0x60;
+            packet[16] = (uint8_t)width;
+            packet[18] = (uint8_t)height;
+            gex_raster_packet(cpu, packet, &state);
+            gex_raster_packet(pvr, packet, &state);
+        }
+        EXPECT(!download_presented(gpu, raster_device, pixels, error, sizeof error));
+        const uint16_t *reference = (const uint16_t *)gex_raster_pixels(cpu);
+        for (unsigned y = 0; y < 240; ++y)
+            for (unsigned x = 0; x < 320; ++x) {
+                unsigned at = y * 320 + x;
+                if (pixels[at] != (reference[at] & 0x7fff)) {
+                    printf("PVR wrapped sprite mismatch format=%u x=%u y=%u actual=%x expected=%x\n",
+                           format, x, y, pixels[at], reference[at] & 0x7fff);
+                    ++failures;
+                    goto next_format;
+                }
+            }
+    next_format:;
+        gex_raster_clear(cpu);
+        gex_raster_clear(pvr);
+        for (unsigned y = 0; y < 240; ++y)
+            for (unsigned alpha = 0; alpha < 2; ++alpha) {
+                unsigned x = alpha ? 166 : 5, width = 128;
+                gex_raster_state state = {atlas, table, 8 | format << 7,
+                    (int)x + (int)(y & 1), (int)y + 8,
+                    (int)(x + width - (y >> 1 & 1)), (int)y + 9, 0};
+                uint8_t packet[20] = {0};
+                packet[4] = packet[5] = packet[6] = 128;
+                packet[7] = 0x64 | alpha << 1;
+                packet[8] = (uint8_t)x; packet[9] = (uint8_t)(x >> 8);
+                packet[10] = (uint8_t)(y + 8);
+                packet[11] = (uint8_t)((y + 8) >> 8);
+                packet[12] = (uint8_t)(y * 13 + alpha * 101);
+                packet[13] = (uint8_t)(y * 17 + alpha * 47);
+                packet[15] = 0x60;
+                packet[16] = (uint8_t)width;
+                packet[18] = 1;
+                gex_raster_packet(cpu, packet, &state);
+                gex_raster_packet(pvr, packet, &state);
+            }
+        EXPECT(!download_presented(gpu, raster_device, pixels, error, sizeof error));
+        reference = (const uint16_t *)gex_raster_pixels(cpu);
+        for (unsigned y = 0; y < 240; ++y)
+            for (unsigned x = 0; x < 320; ++x) {
+                unsigned actual = pixels[y * 320 + x];
+                unsigned expected = reference[y * 320 + x] & 0x7fff;
+                if (abs((int)(actual & 31) - (int)(expected & 31)) > 1 ||
+                    abs((int)(actual >> 5 & 31) - (int)(expected >> 5 & 31)) > 1 ||
+                    abs((int)(actual >> 10 & 31) - (int)(expected >> 10 & 31)) > 1) {
+                    printf("PVR scanline sprite mismatch format=%u x=%u y=%u actual=%x expected=%x\n",
+                           format, x, y, actual, expected);
+                    ++failures;
+                    goto next_scanline_format;
+                }
+            }
+    next_scanline_format:;
+    }
+    gex_raster_destroy(cpu);
+    gex_raster_destroy(pvr);
+}
+
+static void tinted_palette_reference_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    gex_packet_gpu native = *gpu;
+    native.create = remember_device;
+    gex_raster *cpu = gex_raster_create(320, 240);
+    gex_raster *pvr = gex_raster_create(320, 240);
+    if (!cpu || !pvr || gex_raster_enable_gpu(pvr, &native)) {
+        printf("PVR tinted palette initialization failed\n");
+        ++failures;
+        gex_raster_destroy(cpu);
+        gex_raster_destroy(pvr);
+        return;
+    }
+    gex_raster_bind(pvr, atlas, 0);
+    for (unsigned format = 0; format < 2; ++format) {
+        gpu->native->atlas_write(atlas, 0, sizeof atlas);
+        memset(atlas, 0, sizeof atlas);
+        put(514, 0xc63);
+        put(516, 0x8c63);
+        for (unsigned y = 16; y < 20; ++y) {
+            unsigned at = 1024 + y * 2048;
+            if (!format) memset(atlas + at + 8, 0x21, 2);
+            else for (unsigned x = 0; x < 4; ++x) atlas[at + 16 + x] = 1 + (x & 1);
+        }
+        if (!format) {
+            gex_gpu_material material = {8, 0x10, 0x2c, 0x808080, atlas, table};
+            gex_gpu_vertex cell[] = {{10, 10, 16, 16}, {14, 10, 20, 16},
+                                     {10, 14, 16, 20}, {14, 14, 20, 20}};
+            for (unsigned frame = 0; frame < 3; ++frame) {
+                EXPECT(!gpu->native->clear(raster_device, error, sizeof error));
+                for (unsigned i = 0; i < 70; ++i) {
+                    material.opcode = 0x2c | (i & 1) << 1;
+                    EXPECT(!gpu->native->polygon(raster_device, cell, 0, 0, 320, 240,
+                                                 &material, error, sizeof error));
+                }
+                EXPECT(!gpu->native->present(raster_device, error, sizeof error));
+            }
+        }
+        gex_raster_state state = {atlas, table, 8 | format << 7, 0, 8, 320, 248, 0};
+        gex_raster_clear(cpu);
+        gex_raster_clear(pvr);
+        gex_raster_fill(cpu, 0, 10, 40, 4, 0xff0000);
+        gex_raster_fill(pvr, 0, 10, 40, 4, 0xff0000);
+        for (unsigned alpha = 0; alpha < 2; ++alpha)
+            for (unsigned draw = 0; draw < 3; ++draw) {
+                uint8_t packet[40] = {0};
+                packet[4] = packet[5] = packet[6] = draw == 1 ? 0x26 : 0x80;
+                packet[7] = 0x2c | alpha << 1;
+                packet[14] = 0x10;
+                packet[22] = (uint8_t)state.page;
+                unsigned x = 2 + (alpha * 3 + draw) * 6;
+                for (unsigned i = 0; i < 4; ++i) {
+                    packet[8 + i * 8] = x + (i & 1 ? 4 : 0);
+                    packet[10 + i * 8] = 18 + (i & 2 ? 4 : 0);
+                    packet[12 + i * 8] = 16 + (i & 1 ? 4 : 0);
+                    packet[13 + i * 8] = 16 + (i & 2 ? 4 : 0);
+                }
+                gex_raster_packet(cpu, packet, &state);
+                gex_raster_packet(pvr, packet, &state);
+            }
+        EXPECT(!download_presented(gpu, raster_device, pixels, error, sizeof error));
+        const uint16_t *reference = (const uint16_t *)gex_raster_pixels(cpu);
+        for (unsigned y = 10; y < 14; ++y)
+            for (unsigned x = 0; x < 40; ++x) {
+                unsigned at = y * 320 + x;
+                unsigned actual = pixels[at], expected = reference[at] & 0x7fff;
+                int tolerance = x >= 20 ? 1 : 0;
+                if (abs((int)(actual & 31) - (int)(expected & 31)) > tolerance ||
+                    abs((int)(actual >> 5 & 31) - (int)(expected >> 5 & 31)) > tolerance ||
+                    abs((int)(actual >> 10 & 31) - (int)(expected >> 10 & 31)) > tolerance) {
+                    printf("PVR tinted palette mismatch format=%u x=%u y=%u actual=%x expected=%x\n",
+                           format, x, y, actual, expected);
+                    ++failures;
+                    goto next_format;
+                }
+            }
+    next_format:;
+        gex_raster_clear(cpu);
+        gex_raster_clear(pvr);
+        gex_raster_fill(cpu, 0, 10, 12, 4, 0xff0000);
+        gex_raster_fill(pvr, 0, 10, 12, 4, 0xff0000);
+        uint8_t packet[40] = {0};
+        packet[4] = packet[5] = packet[6] = 0x26;
+        packet[7] = 0x2c;
+        packet[14] = 0x10;
+        packet[22] = (uint8_t)state.page;
+        for (unsigned i = 0; i < 4; ++i) {
+            packet[8 + i * 8] = 2 + (i & 1 ? 4 : 0);
+            packet[10 + i * 8] = 18 + (i & 2 ? 4 : 0);
+            packet[12 + i * 8] = 16 + (i & 1 ? 4 : 0);
+            packet[13 + i * 8] = 16 + (i & 2 ? 4 : 0);
+        }
+        gex_raster_packet(cpu, packet, &state);
+        gex_raster_packet(pvr, packet, &state);
+        gpu->native->atlas_write(atlas, 514, 2);
+        put(514, 5);
+        for (unsigned i = 0; i < 4; ++i) packet[8 + i * 8] += 6;
+        gex_raster_packet(cpu, packet, &state);
+        gex_raster_packet(pvr, packet, &state);
+        EXPECT(!download_presented(gpu, raster_device, pixels, error, sizeof error));
+        reference = (const uint16_t *)gex_raster_pixels(cpu);
+        EXPECT(pixels[10 * 320 + 2] == (reference[10 * 320 + 2] & 0x7fff));
+        EXPECT(pixels[10 * 320 + 8] == (reference[10 * 320 + 8] & 0x7fff));
+    }
+    gex_raster_destroy(cpu);
+    gex_raster_destroy(pvr);
+}
+#endif
 
 static void uv_precision_regression(const gex_packet_gpu *gpu, int hold) {
     char error[256] = {0};
@@ -3194,6 +3949,7 @@ static int test_mode(void) {
         if (!strcmp(token, "--fractional-quad")) return 3;
         if (!strcmp(token, "--uv-precision")) return 4;
         if (!strcmp(token, "--uv-precision-hold")) return 5;
+        if (!strcmp(token, "--direct-image")) return 6;
         token = strtok_r(NULL, " \r\n\t", &save);
     }
     return 0;
@@ -3228,7 +3984,9 @@ int main(void) {
         unaligned_atlas_regression(gpu);
         integral_quad_regression(gpu);
         wrapped_page_mutation_regression(gpu);
-        odd_remap_mutation_regression(gpu);
+        for (int alpha = 0; alpha < 2; ++alpha)
+            for (int tail = 0; tail < 3; ++tail)
+                odd_remap_mutation_regression(gpu, tail, alpha);
         bound_destroy_regression(gpu, 0);
         bound_destroy_regression(gpu, 1);
         presented_feedback_regression(gpu);
@@ -3244,6 +4002,8 @@ int main(void) {
         inactive_picture_regression(gpu);
         inactive_texture_replay_regression(gpu);
         inactive_movie_replay_regression(gpu);
+        retained_texture_snapshot_regression(gpu);
+        retained_texture_snapshot_budget_regression(gpu);
         bound_command_capacity_regression(gpu);
         movie_upload_regression(gpu);
         mmu_shutdown_basic();
@@ -3252,13 +4012,29 @@ int main(void) {
         return failures ? 1 : 0;
     }
     if (mode == 3) {
+        direct_image_regression(gpu);
+        dark_direct_sprite_span_regression(gpu);
         fractional_quad_regression(gpu);
         fractional_clipped_regression(gpu);
         fractional_wide_regression(gpu);
         fractional_scaled_compatibility(gpu);
         fractional_raster_regression(gpu);
+#if GEX_ENABLE_SOFTWARE_RENDERER
+        observed_quad_reference_regression(gpu);
+        wrapped_sprite_reference_regression(gpu);
+        tinted_palette_reference_regression(gpu);
+#endif
         mmu_shutdown_basic();
         printf("Dreamcast PVR fractional quad diagnostic: %s (%d failures)\n",
+               failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    if (mode == 6) {
+        direct_image_regression(gpu);
+        direct_image_cache_budget_regression(gpu);
+        title_image_regression(gpu);
+        mmu_shutdown_basic();
+        printf("Dreamcast PVR direct image diagnostic: %s (%d failures)\n",
                failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
@@ -3290,6 +4066,8 @@ int main(void) {
     deferred_texture_pressure_regression(gpu, 2);
     deferred_alpha_texture_pressure_regression(gpu);
     deferred_palette_regression(gpu);
+    retained_texture_snapshot_regression(gpu);
+    retained_texture_snapshot_budget_regression(gpu);
     deferred_pal8_regression(gpu);
     deferred_eviction_regression(gpu);
     fragmented_feedback_regression(gpu);

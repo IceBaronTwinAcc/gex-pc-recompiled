@@ -21,6 +21,9 @@ PACKET_OLD = f"{PACKET_ENTRY}\n    gex_graphics_draw_packet(MEM32(esp + 4));"
 PACKET_BEGIN = (f"{PACKET_ENTRY}\n"
                 "    if (gex_graphics_draw_packet(MEM32(esp + 4))) {\n"
                 "        RECOMP_FLAGS_OUT(); esp += 4; return;\n    }")
+TITLE_ANCHOR = "    if (TEST_Z(_flag_a, _flag_b)) goto L_004447EF; /* 0x004445A8: je 0x4447ef */"
+TITLE_HOOK = (f"{TITLE_ANCHOR}\n"
+              "    if (gex_graphics_title_try(MEM32(esp + 0x3C), ecx)) goto L_004447EF;")
 FRAME_RETURN = "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x0044516D: ret  */"
 FRAME_END = f"    gex_graphics_end_frame();\n{FRAME_RETURN}"
 ARENA_RETURN = "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x0044114B: ret  */"
@@ -155,6 +158,7 @@ def rewrite_graphics(text):
     text = text.replace(FRAME_BEGIN, FRAME_ENTRY).replace(FRAME_ENTRY, FRAME_BEGIN)
     text = text.replace(PACKET_OLD, PACKET_ENTRY)
     text = text.replace(PACKET_BEGIN, PACKET_ENTRY).replace(PACKET_ENTRY, PACKET_BEGIN)
+    text = text.replace(TITLE_HOOK, TITLE_ANCHOR).replace(TITLE_ANCHOR, TITLE_HOOK)
     text = text.replace(FRAME_END, FRAME_RETURN).replace(FRAME_RETURN, FRAME_END)
     for anchor, hook in VIEW_HOOKS.items():
         text = text.replace(f"{anchor}\n{hook}", anchor)

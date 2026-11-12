@@ -58,7 +58,9 @@ target_compile_options(gex_game PRIVATE -Os -g -fomit-frame-pointer -fno-lto
 target_compile_options(gex_renderer PRIVATE -O2 -g -fomit-frame-pointer -fno-lto -fno-fast-math
     -ffp-contract=off -ffunction-sections -fdata-sections)
 set_source_files_properties(src/main.c src/platform/dreamcast/renderer.c
-    src/platform/dreamcast/packet_gpu.c src/platform/gl/packet_gpu.c src/sha256.c
+    src/platform/dreamcast/packet_gpu.c src/platform/dreamcast/title_cel.c
+    src/platform/dreamcast/title_draw.c src/platform/dreamcast/title_layout.c
+    src/platform/dreamcast/title_plan.c src/platform/gl/packet_gpu.c src/sha256.c
     "${PCRECOMP_DIR}/runtime/win32hle/dsound.c"
     PROPERTIES COMPILE_OPTIONS -O2)
 set_source_files_properties(src/graphics_guest.c

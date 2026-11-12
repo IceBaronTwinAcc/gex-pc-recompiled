@@ -123,6 +123,18 @@ static void gpu_submit(gex_raster *r) {
 
 int gex_raster_gpu_owned(const gex_raster *r) { return r && r->gpu && r->gpu->native; }
 
+int gex_raster_title_packet(gex_raster *r, uint32_t address, const uint8_t *packet,
+                            const gex_raster_state *state) {
+    if (!gex_raster_gpu_owned(r) || !r->gpu->native->title ||
+        !r->gpu->native->title->packet) return 0;
+    char error[512] = {0};
+    int result = r->gpu->native->title->packet(r->device, address, packet, state,
+                                                error, sizeof error);
+    if (result < 0) gpu_fail(error);
+    if (result) r->guest_newer = r->gpu_newer = 1;
+    return result;
+}
+
 void gex_raster_bind(gex_raster *r, const uint8_t *atlas, unsigned plane) {
     if (gex_raster_gpu_owned(r)) r->gpu->native->bind(r->device, atlas, plane);
 }

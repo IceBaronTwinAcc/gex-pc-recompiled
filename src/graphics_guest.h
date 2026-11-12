@@ -53,6 +53,7 @@ void gex_graphics_resolution(void);
 void gex_graphics_begin_frame(void);
 void gex_graphics_end_frame(void);
 int gex_graphics_draw_packet(uint32_t packet);
+int gex_graphics_title_try(uint32_t object, uint32_t cel);
 void gex_graphics_flush(void);
 void gex_graphics_forbidden(void);
 

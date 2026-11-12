@@ -143,10 +143,15 @@ void gex_graphics_transition_end(void) {
 }
 
 void gex_graphics_packet_allocated(uint32_t next) {
-    if (!render_width || !packet_bytes) return;
+    if (!packet_bytes) return;
     uint32_t begin = MEM32(0x4A2AE4);
     if (next < begin) begin = packet_address;
     if (begin == next) return;
+    if (gex_graphics_gpu_owned()) {
+        const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+        if (native->title && native->title->forget) native->title->forget(begin, next);
+    }
+    if (!render_width) return;
     /* Packet addresses are recycled. Retire only the overwritten bytes,
      * leaving cached display lists elsewhere in the arena classified. */
     for (size_t i = 0; i < backdrop_count;) {
@@ -687,6 +692,10 @@ void gex_graphics_shutdown(void) {
     memset(&menu_clip, 0, sizeof menu_clip);
     pictures_bound = 0;
     bound_atlas = NULL;
+    if (gex_graphics_gpu_owned()) {
+        const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+        if (native->title && native->title->reset) native->title->reset();
+    }
     for (int i = 0; i < 2; ++i) {
         gex_raster_destroy(targets[i]); targets[i] = NULL;
     }
@@ -988,12 +997,53 @@ int gex_graphics_draw_packet(uint32_t packet) {
         state.world_left = world_clip[0]; state.world_top = world_clip[1];
         state.world_right = world_clip[2]; state.world_bottom = world_clip[3];
     }
+    if (gex_raster_title_packet(targets[origin / 240], packet,
+                                (const uint8_t *)ADDR(packet), &state))
+        return exclusive_gpu;
     /* Sprite packets inherit the texture page; quad packets carry their own. */
     uint32_t offset = MEM32(0x4A2F78) - MEM32(0x4A33AC);
     state.page |= ((offset & 0x7FFFF) / 128) & 15;
     if (offset & 0x80000) state.page |= 16;
     gex_raster_packet(targets[origin / 240], (const uint8_t *)ADDR(packet), &state);
     return exclusive_gpu;
+}
+
+static int title_guest_read(void *context, uint32_t address, void *out, size_t size) {
+    (void)context;
+    if (!address || size > UINT32_MAX - address) return -1;
+    memcpy(out, (const void *)ADDR(address), size);
+    return 0;
+}
+
+static int title_guest_matches(void *context, uint32_t address, const void *data, size_t size) {
+    (void)context;
+    if (!address || size > UINT32_MAX - address) return 0;
+    return memcmp((const void *)ADDR(address), data, size) == 0;
+}
+
+static void title_guest_write(void *context, uint32_t address, const void *data, size_t size) {
+    (void)context;
+    memcpy((void *)ADDR(address), data, size);
+}
+
+static void title_guest_allocated(void *context, uint32_t next) {
+    (void)context;
+    gex_graphics_packet_allocated(next);
+}
+
+int gex_graphics_title_try(uint32_t object, uint32_t cel) {
+    if (!cel || !packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || MEM32(0x4A2964) != 63 || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native->title || !native->title->record) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    char error[512] = {0};
+    int result = native->title->record(&io, object, cel, error, sizeof error);
+    if (result < 0) hle_fatal("[packet-gpu] %s", error);
+    return result;
 }
 
 void gex_graphics_end_frame(void) {

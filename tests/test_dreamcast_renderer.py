@@ -511,6 +511,182 @@ int main(void) {
                             "-o", str(work / "test")], check=True)
             subprocess.run([str(work / "test")], check=True, timeout=30)
 
+    def test_pvr_remap_invalidation_never_misses_written_texels(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        helpers = source[source.index("static int interval_overlap("):
+                         source.index("static int snapshot_segment_overlap(")]
+        harness = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef struct {
+    unsigned page, origin_u, origin_v, dimension;
+} remap_texture;
+"""
+        harness += helpers
+        harness += r"""
+static uint32_t seed = 0x7d1b3f09;
+static unsigned random_value(void) {
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    return seed;
+}
+static int expected_overlap(const remap_texture *t, unsigned offset,
+                            size_t pitch, unsigned bytes, unsigned rows) {
+    unsigned source_x = (t->page & 15) * 128 + t->origin_u / 2;
+    unsigned source_y = (t->page & 16 ? 256 : 0) + t->origin_v;
+    unsigned source_end = source_x + (t->dimension + (t->origin_u & 1) + 1) / 2;
+    for (unsigned row = 0; row < rows; ++row)
+        for (unsigned byte = 0; byte < bytes; ++byte) {
+            unsigned at = (offset + row * pitch + byte) & 0xfffff;
+            unsigned y = at / 2048, x = at % 2048;
+            if (y >= source_y && y < source_y + t->dimension &&
+                x >= source_x && x < source_end) return 1;
+        }
+    return 0;
+}
+int main(void) {
+    remap_texture odd = {.page = 15, .origin_u = 1, .origin_v = 16, .dimension = 8};
+    unsigned last = (odd.page & 15) * 128 + odd.origin_v * 2048 + 4;
+    if (!expected_overlap(&odd, last, 2048, 1, 1) ||
+        !remap_write_overlap(&odd, last, 2048, 1, 1) ||
+        !remap_write_overlap(&odd, last, 0, 1, 1)) {
+        fprintf(stderr, "missed final byte of odd-origin remap\n");
+        return 1;
+    }
+    for (unsigned i = 0; i < 100000; ++i) {
+        remap_texture t = {.page = random_value() & 31,
+            .dimension = 8u << (random_value() % 6)};
+        t.origin_u = random_value() % (257 - t.dimension);
+        t.origin_v = random_value() % (257 - t.dimension);
+        unsigned begin = (t.page & 15) * 128 + (t.page & 16 ? 0x80000 : 0) +
+                         t.origin_v * 2048 + t.origin_u / 2;
+        unsigned offset = i & 1 ? random_value() & 0xfffff :
+            (begin + (random_value() % (t.dimension + 8)) * 2048 +
+             random_value() % 300 - 150) & 0xfffff;
+        unsigned bytes = 1 + random_value() % 257;
+        unsigned rows = 1 + random_value() % 16;
+        size_t pitch = i % 4 ? 2048 : random_value() % 4097;
+        int actual = remap_write_overlap(&t, offset, pitch, bytes, rows);
+        int expected = expected_overlap(&t, offset, pitch, bytes, rows);
+        if (expected && !actual) {
+            fprintf(stderr, "missed remap: page=%x u=%u v=%u dimension=%u "
+                    "offset=%x pitch=%zu bytes=%u rows=%u\n",
+                    t.page, t.origin_u, t.origin_v, t.dimension,
+                    offset, pitch, bytes, rows);
+            return 1;
+        }
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-remap-invalidation-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
+    def test_pvr_snapshot_invalidation_matches_byte_dependencies(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        helpers = source[source.index("static int interval_overlap("):
+                         source.index("static int remap_write_overlap(")]
+        helpers += source[source.index("static int snapshot_segment_overlap("):
+                          source.index("static void dependency_range(")]
+        harness = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef struct {
+    unsigned page, clut, origin_u, origin_v, dimension;
+} transient_texture;
+"""
+        harness += helpers
+        harness += r"""
+static uint32_t seed = 0x9f87d2ab;
+static unsigned random_value(void) {
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    return seed;
+}
+static int circular_overlap(unsigned a, unsigned alen, unsigned b, unsigned blen) {
+    if (!alen || !blen) return 0;
+    if (alen >= 0x100000 || blen >= 0x100000) return 1;
+    a &= 0xfffff; b &= 0xfffff;
+    unsigned a_first = alen < 0x100000 - a ? alen : 0x100000 - a;
+    unsigned b_first = blen < 0x100000 - b ? blen : 0x100000 - b;
+    return (a < b + b_first && b < a + a_first) ||
+           (alen > a_first && b < alen - a_first) ||
+           (blen > b_first && a < blen - b_first) ||
+           (alen > a_first && blen > b_first);
+}
+static int expected(const transient_texture *t, unsigned offset, size_t pitch,
+                    unsigned bytes, unsigned rows) {
+    unsigned format = t->page >> 7 & 3;
+    unsigned base = (t->page & 15) * 128 + (t->page & 16 ? 0x80000 : 0);
+    unsigned column = format == 0 ? t->origin_u / 2 :
+                      format == 1 ? t->origin_u : t->origin_u * 2;
+    unsigned width = format == 0 ? (t->dimension + (t->origin_u & 1) + 1) / 2 :
+                     format == 1 ? t->dimension : t->dimension * 2;
+    unsigned clut_bytes = format == 0 ? 32 : format == 1 ? 512 : 0;
+    for (unsigned y = 0; y < rows; ++y) {
+        unsigned at = (offset + (uint64_t)y * pitch) & 0xfffff;
+        if (circular_overlap(t->clut * 32, clut_bytes, at, bytes)) return 1;
+        for (unsigned sy = 0; sy < t->dimension; ++sy)
+            if (circular_overlap(base + (t->origin_v + sy) * 2048 + column,
+                                 width, at, bytes)) return 1;
+    }
+    return 0;
+}
+static int check(const transient_texture *t, unsigned offset, size_t pitch,
+                 unsigned bytes, unsigned rows) {
+    int actual = snapshot_write_overlap(t, offset, pitch, bytes, rows);
+    int reference = expected(t, offset, pitch, bytes, rows);
+    if (actual == reference) return 0;
+    fprintf(stderr, "snapshot mismatch: page=%x u=%u v=%u dim=%u clut=%x "
+            "offset=%x pitch=%zu bytes=%u rows=%u: %d != %d\n",
+            t->page, t->origin_u, t->origin_v, t->dimension, t->clut,
+            offset, pitch, bytes, rows, actual, reference);
+    return 1;
+}
+int main(void) {
+    transient_texture edge = {.page = 31 | 256, .origin_u = 248,
+                              .origin_v = 248, .dimension = 8};
+    if (check(&edge, 0x170, 2048, 8, 1) ||
+        !snapshot_write_overlap(&edge, 0x170, 2048, 8, 1))
+        return 1;
+    const unsigned widths[] = {0, 1, 2, 31, 32, 127, 511, 512, 2048, 2049, 0x100000};
+    for (unsigned i = 0; i < 25000; ++i) {
+        unsigned format = i % 3;
+        transient_texture t = {.page = (random_value() & 31) | format << 7,
+            .clut = random_value() & 0x7fff, .dimension = 8u << (random_value() % 6)};
+        t.origin_u = random_value() % (257 - t.dimension);
+        t.origin_v = random_value() % (257 - t.dimension);
+        unsigned column = format == 0 ? t.origin_u / 2 :
+                          format == 1 ? t.origin_u : t.origin_u * 2;
+        unsigned base = (t.page & 15) * 128 + (t.page & 16 ? 0x80000 : 0) +
+                        t.origin_v * 2048 + column;
+        unsigned offset = i % 3 == 0 ? random_value() :
+                          i % 3 == 1 ? base + (random_value() % (t.dimension + 2)) * 2048 +
+                                       random_value() % 600 - 300 :
+                                       t.clut * 32 + random_value() % 700 - 100;
+        size_t pitch = i % 3 ? 2048 : random_value() % 70000;
+        unsigned bytes = widths[random_value() % (sizeof widths / sizeof *widths)];
+        unsigned rows = random_value() % 17;
+        if (check(&t, offset, pitch, bytes, rows)) return 1;
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-snapshot-invalidation-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
     def test_native_video_and_store_queue_pixels(self):
         with tempfile.TemporaryDirectory(prefix="gex-dc-renderer-") as work:
             work = Path(work)

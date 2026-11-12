@@ -2197,6 +2197,11 @@ The PVR float interpolation is not always equivalent to the original 16.16
 rectangle stepping. For a six-pixel quad spanning two texels, the original
 step is `21845` and the fourth sample is still the first texel.
 TODO: Document the fractional quad diagnostic and remaining limitations.
+TODO: Document the software-versus-PVR comparison using observed quad sizes.
+TODO: Document indexed tint-dependent transparency and palette cache handling.
+TODO: Document the clipped and page-wrapping sprite reference comparison.
+TODO: Document the per-scanline opaque and translucent sprite comparison.
+TODO: Document direct-color span transparency before and after modulation.
 An instrumented Flycast route observed fractional steps in the level map,
 including an axis of 12 output pixels spanning 22 texels. The fixed-point
 reference samples texel 10 at index 6; ideal float interpolation with the
@@ -2226,6 +2231,7 @@ that Gex's allocations cause the hardware symptom. Sonic R
 [uploads twiddled textures](https://github.com/jnmartin84/sonic-r/blob/main/source/dc/src/render_pvr.c)
 and [selects nearest filtering](https://github.com/jnmartin84/sonic-r/blob/main/source/dc/src/r_pvr_backend.c)
 for sprite atlases.
+TODO: Document the remap page-sharing measurements and isolated-allocation experiment.
 These approaches do not implement Gex's integer rectangle stepping or
 mirrored-axis rule.
 
@@ -2901,6 +2907,11 @@ ordered blending, fixed cache limits, ownership restrictions and GPU fences:
   original overlap path. The replacement matched the old algorithm in 6,000
   deterministic comparisons, and the native fixture covers warmed rectangular
   mutations and newly introduced source indices.
+- TODO: Document odd-origin PAL4 remap invalidation and its targeted regression.
+- TODO: Document randomized remap invalidation against the byte-level reference.
+- TODO: Document bounded converted-texture retention, invalidation, and performance measurements.
+- TODO: Document the experimental Dreamcast title CEL snapshots, deferred replay
+  requirements, direct-image texture retention, and validation status.
 
 Detailed diagnostic busy windows originally spent up to 9.76 ms/frame inside
 atlas invalidation; subsequent busy windows spent about 1.5--1.9 ms there.

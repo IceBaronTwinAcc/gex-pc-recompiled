@@ -44,5 +44,7 @@ void gex_raster_remember(gex_raster *raster, const uint8_t *picture, int pitch);
 void gex_raster_export(gex_raster *raster, uint8_t *picture, int pitch);
 void gex_raster_packet(gex_raster *raster, const uint8_t *packet,
                        const gex_raster_state *state);
+int gex_raster_title_packet(gex_raster *raster, uint32_t address, const uint8_t *packet,
+                            const gex_raster_state *state);
 
 #endif

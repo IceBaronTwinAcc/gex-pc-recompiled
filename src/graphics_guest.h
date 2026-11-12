@@ -2,6 +2,7 @@
 #define GEX_GRAPHICS_GUEST_H
 
 #include <stdint.h>
+#include "packet_gpu.h"
 
 /* Configure before guest graphics initialization; not a live resize API. */
 int gex_graphics_set_render_size(int width, int height);
@@ -29,6 +30,16 @@ int gex_graphics_view_height(void);
 /* Map a presented authored screen to its 320x240 menu coordinates. */
 int gex_graphics_screen_point(int *x, int *y);
 int gex_graphics_draw_tiles(void);
+int gex_graphics_map_chunk_try(uint32_t chunk, uint32_t definitions, int32_t x, int32_t y);
+int gex_graphics_map_flipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                     uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                     uint16_t wrap_x, uint16_t wrap_y, uint16_t palette,
+                                     uint32_t *previous_tail);
+int gex_graphics_map_unflipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                       uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                       uint16_t wrap_x, uint16_t wrap_y, uint16_t palette,
+                                       gex_gpu_cel_result *result);
+int gex_graphics_map_scaled_cel_try(const gex_gpu_scaled_cel_draw *draw, uint32_t *last_atlas);
 void gex_graphics_packet_arena(void);
 void gex_graphics_packet_allocated(uint32_t next);
 void gex_graphics_scene_begin(void);
@@ -38,6 +49,7 @@ void gex_graphics_camera_barrier(uint32_t object);
 void gex_graphics_draw_player_sprite(void);
 void gex_graphics_backdrop_begin(void);
 void gex_graphics_backdrop_end(void);
+int gex_graphics_backdrop_try(void);
 void gex_graphics_transition_begin(void);
 void gex_graphics_transition_end(void);
 void gex_graphics_pause_begin(void);

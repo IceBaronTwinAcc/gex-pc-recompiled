@@ -4,7 +4,10 @@ import unittest
 
 from tools.graphics_rewrite import (
     FUNCTIONS, FRAME_BEGIN, FRAME_ENTRY, FRAME_END, FRAME_RETURN,
-    PACKET_BEGIN, PACKET_ENTRY, TITLE_ANCHOR, TITLE_HOOK, ARENA_RETURN, ARENA_HOOK, VIEW_HOOKS,
+    PACKET_BEGIN, PACKET_ENTRY, TITLE_ANCHOR, TITLE_HOOK, BACKDROP_ANCHOR, BACKDROP_HOOK,
+    MAP_CHUNK_CALL, MAP_CHUNK_HOOK, MAP_FLIPPED_ANCHOR, MAP_FLIPPED_HOOK,
+    MAP_SCALED_ANCHOR, MAP_SCALED_HOOK,
+    ARENA_RETURN, ARENA_HOOK, VIEW_HOOKS,
     VIEW_BOUNDS, TILE_EDGES, SCREEN_HOOKS, HUD_DRAWS, PLAYER_DRAWS, rewrite_graphics,
 )
 
@@ -19,6 +22,34 @@ class GraphicsRewriteTests(unittest.TestCase):
         self.assertEqual(rewrite_graphics(result), result)
         self.assertEqual(rewrite_graphics(source.replace("004445A8", "004445A9")),
                          source.replace("004445A8", "004445A9"))
+
+    def test_backdrop_hook_follows_page_setup_and_is_idempotent(self):
+        source = BACKDROP_ANCHOR + "\n"
+        result = rewrite_graphics(source)
+        self.assertEqual(result, BACKDROP_HOOK + "\n")
+        self.assertEqual(rewrite_graphics(result), result)
+        unchanged = source.replace("0043F14F", "0043F150")
+        self.assertEqual(rewrite_graphics(unchanged), unchanged)
+
+    def test_map_chunk_hook_is_idempotent(self):
+        source = MAP_CHUNK_CALL + "\n"
+        result = rewrite_graphics(source)
+        self.assertEqual(result, MAP_CHUNK_HOOK + "\n")
+        self.assertEqual(rewrite_graphics(result), result)
+
+    def test_map_flipped_hook_is_idempotent(self):
+        source = MAP_FLIPPED_ANCHOR + "\n"
+        result = rewrite_graphics(source)
+        self.assertEqual(result, MAP_FLIPPED_HOOK + "\n")
+        self.assertEqual(rewrite_graphics(result), result)
+        unchanged = source.replace("0043DCEE", "0043DCEF")
+        self.assertEqual(rewrite_graphics(unchanged), unchanged)
+
+    def test_map_scaled_hook_is_idempotent(self):
+        source = MAP_SCALED_ANCHOR + "\n"
+        result = rewrite_graphics(source)
+        self.assertEqual(result, MAP_SCALED_HOOK + "\n")
+        self.assertEqual(rewrite_graphics(result), result)
 
     def test_tv_collapse_loops_are_paced_without_changing_animation_steps(self):
         source = (ROOT / "src/recomp/gen/recomp_0015.c").read_text()

@@ -12,6 +12,10 @@ typedef int (*gex_title_image_submit)(void *target, const gex_gpu_vertex vertice
 
 int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
                                char *error, size_t size);
+int gex_dreamcast_backdrop_record(const gex_gpu_guest_io *io, uint32_t scene,
+                                  char *error, size_t size);
+int gex_dreamcast_map_cel_record(const gex_gpu_guest_io *io, uint32_t scene,
+                                 uint32_t object, uint32_t cel, char *error, size_t size);
 int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *packet,
                                const gex_raster_state *state, gex_title_image_submit submit,
                                char *error, size_t size);

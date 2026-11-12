@@ -111,7 +111,8 @@ add_library(gex_packet_gpu STATIC "${GEX_PACKET_GPU_SOURCE}" src/platform/packet
 if(GEX_ENABLE_PVR_RENDERER)
     target_sources(gex_packet_gpu PRIVATE src/platform/dreamcast/title_cel.c
         src/platform/dreamcast/title_layout.c src/platform/dreamcast/title_plan.c
-        src/platform/dreamcast/title_draw.c)
+        src/platform/dreamcast/title_draw.c src/platform/dreamcast/map_plan.c
+        src/platform/dreamcast/map_draw.c)
 endif()
 target_link_libraries(gex_packet_gpu PRIVATE gex_preferences)
 if(TARGET gex_app_icon)
@@ -121,6 +122,7 @@ set_source_files_properties("${GEX_PACKET_GPU_SOURCE}" PROPERTIES
     COMPILE_DEFINITIONS gex_packet_gpu_get=gex_packet_gpu_platform_get)
 target_include_directories(gex_packet_gpu PUBLIC src)
 target_compile_definitions(gex_packet_gpu PRIVATE
+    ${GEX_PLATFORM_PACKET_GPU_DEFINITIONS}
     GEX_ENABLE_GLDC_RENDERER=$<BOOL:${GEX_ENABLE_GLDC_RENDERER}>
     GEX_ENABLE_BGFX_RENDERER=$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>
     GEX_PROFILE_RENDERER=$<BOOL:${GEX_PROFILE_RENDERER}>)
@@ -167,6 +169,14 @@ if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
         src/platform/dreamcast/title_plan.c src/platform/dreamcast/title_draw.c)
     target_include_directories(gex_title_draw_test PRIVATE src)
     add_test(NAME dreamcast-title-draw COMMAND gex_title_draw_test)
+    add_executable(gex_map_plan_test tests/dreamcast_map_plan.c
+        src/platform/dreamcast/map_plan.c)
+    target_include_directories(gex_map_plan_test PRIVATE src)
+    add_test(NAME dreamcast-map-plan COMMAND gex_map_plan_test)
+    add_executable(gex_map_draw_test tests/dreamcast_map_draw.c
+        src/platform/dreamcast/map_plan.c src/platform/dreamcast/map_draw.c)
+    target_include_directories(gex_map_draw_test PRIVATE src)
+    add_test(NAME dreamcast-map-draw COMMAND gex_map_draw_test)
 endif()
 if(GEX_PLATFORM_DESKTOP_TESTS)
     if(WIN32)

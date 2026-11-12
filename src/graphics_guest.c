@@ -73,6 +73,14 @@ static int fixed_screen(void) {
     return scene && scene == MEM32(0x455B84);
 }
 
+static uint32_t displayed_level(void) {
+    uint32_t level = MEM32(0x4A2964), scene = MEM32(0x4A2990);
+    if (!((level >= 49 && level <= 55) || level == 63 || level == 66 || level == 68) &&
+        scene && fixed_map && scene == fixed_scene && MEM32(scene + 4) == fixed_map)
+        return fixed_level;
+    return level;
+}
+
 int gex_graphics_view_width(void) { return render_width && !fixed_screen() ? render_width : 320; }
 int gex_graphics_view_height(void) { return render_height && !fixed_screen() ? render_height + 16 : 240; }
 
@@ -1033,17 +1041,96 @@ static void title_guest_allocated(void *context, uint32_t next) {
 
 int gex_graphics_title_try(uint32_t object, uint32_t cel) {
     if (!cel || !packet_bytes || render_width != 320 || render_height != 240 ||
-        transition_active || MEM32(0x4A2964) != 63 || !gex_graphics_gpu_owned() ||
+        transition_active || !gex_graphics_gpu_owned() ||
         MEM32(0x451040) || !MEM32(0x4A33AC))
         return 0;
     const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
-    if (!native->title || !native->title->record) return 0;
+    if (!native || !native->title) return 0;
     const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
                                   title_guest_allocated, title_guest_matches};
     char error[512] = {0};
-    int result = native->title->record(&io, object, cel, error, sizeof error);
+    uint32_t scene = displayed_level();
+    int result;
+    if (MEM32(0x4A2964) == 63 && native->title->record)
+        result = native->title->record(&io, object, cel, error, sizeof error);
+    else if (native->title->record_scene)
+        result = native->title->record_scene(&io, scene, object, cel, error, sizeof error);
+    else return 0;
     if (result < 0) hle_fatal("[packet-gpu] %s", error);
     return result;
+}
+
+int gex_graphics_backdrop_try(void) {
+    if (!packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->title || !native->title->backdrop) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    char error[512] = {0};
+    int result = native->title->backdrop(&io, displayed_level(), error, sizeof error);
+    if (result < 0) hle_fatal("[packet-gpu] %s", error);
+    return result;
+}
+
+int gex_graphics_map_chunk_try(uint32_t chunk, uint32_t definitions, int32_t x, int32_t y) {
+    if (!packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->map_chunk) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    return native->map_chunk(&io, chunk, definitions, x, y, 320, 240);
+}
+
+int gex_graphics_map_flipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                     uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                     uint16_t wrap_x, uint16_t wrap_y, uint16_t palette,
+                                     uint32_t *previous_tail) {
+    if (!(flags & 0xc0000000u) || !packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->map_flipped_cel) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    const gex_gpu_cel_draw draw = {image, atlas, flags, tint, rgb,
+                                   x, y, wrap_x, wrap_y, palette};
+    return native->map_flipped_cel(&io, &draw, previous_tail);
+}
+
+int gex_graphics_map_unflipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                       uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                       uint16_t wrap_x, uint16_t wrap_y, uint16_t palette,
+                                       gex_gpu_cel_result *result) {
+    if ((flags & 0xc0000000u) || !packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->map_unflipped_cel) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    const gex_gpu_cel_draw draw = {image, atlas, flags, tint, rgb,
+                                   x, y, wrap_x, wrap_y, palette};
+    return native->map_unflipped_cel(&io, &draw, result);
+}
+
+int gex_graphics_map_scaled_cel_try(const gex_gpu_scaled_cel_draw *draw, uint32_t *last_atlas) {
+    if (!packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->map_scaled_cel) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches};
+    return native->map_scaled_cel(&io, draw, last_atlas);
 }
 
 void gex_graphics_end_frame(void) {

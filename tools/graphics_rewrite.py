@@ -24,6 +24,50 @@ PACKET_BEGIN = (f"{PACKET_ENTRY}\n"
 TITLE_ANCHOR = "    if (TEST_Z(_flag_a, _flag_b)) goto L_004447EF; /* 0x004445A8: je 0x4447ef */"
 TITLE_HOOK = (f"{TITLE_ANCHOR}\n"
               "    if (gex_graphics_title_try(MEM32(esp + 0x3C), ecx)) goto L_004447EF;")
+BACKDROP_ANCHOR = "    MEM32(0x4A2B14) = ecx; /* 0x0043F14F: mov dword ptr [0x4a2b14], ecx */"
+BACKDROP_HOOK = (f"{BACKDROP_ANCHOR}\n"
+                 "    if (gex_graphics_backdrop_try()) { edx = 0x100; goto L_0043F221; }")
+MAP_CHUNK_CALL = "    RECOMP_CALL(sub_0043FCE0); /* 0x0043FCA7: call 0x43fce0 */"
+MAP_CHUNK_HOOK = (
+    "    if (!gex_graphics_map_chunk_try(MEM32(esp), MEM32(esp + 4),\n"
+    "                                    (int32_t)MEM32(esp + 8), (int32_t)MEM32(esp + 12)))\n"
+    f"    {MAP_CHUNK_CALL}")
+MAP_FLIPPED_ANCHOR = ("    esp = esp + 4; /* 0x0043DCEE: add esp, 4 */\n"
+                      "    _flag_k = FK_ADD;")
+MAP_FLIPPED_HOOK = (
+    f"{MAP_FLIPPED_ANCHOR}\n"
+    "    uint32_t map_previous_tail;\n"
+    "    if (gex_graphics_map_flipped_cel_try(ebx - 0x14, MEM8(esp + 0x2C) ?\n"
+    "            MEM32(esp + 0x20) : MEM32(esp + 0x1C), MEM32(esp + 0x4C),\n"
+    "            MEM32(esp + 0x48), MEM32(esp + 0x28), MEM16(esp + 0x3C),\n"
+    "            MEM16(esp + 0x40), MEM16(esp + 0x50), MEM16(esp + 0x54),\n"
+    "            MEM16(esp + 0x16), &map_previous_tail)) {\n"
+    "        eax = map_previous_tail; edx = MEM32(0x4A2B14); ecx = MEM16(0x4A2B20);\n"
+    "        goto L_0043E2B2;\n"
+    "    }\n"
+    "    gex_gpu_cel_result map_result;\n"
+    "    if (gex_graphics_map_unflipped_cel_try(ebx - 0x14, MEM8(esp + 0x2C) ?\n"
+    "            MEM32(esp + 0x20) : MEM32(esp + 0x1C),\n"
+    "            MEM32(esp + 0x4C), MEM32(esp + 0x48), MEM32(esp + 0x28),\n"
+    "            MEM16(esp + 0x3C), MEM16(esp + 0x40), MEM16(esp + 0x50),\n"
+    "            MEM16(esp + 0x54), MEM16(esp + 0x16), &map_result)) {\n"
+    "        eax = map_result.eax; ecx = map_result.ecx; edx = map_result.edx;\n"
+    "        goto L_0043DEDA;\n"
+    "    }")
+MAP_SCALED_ANCHOR = "L_00443895:"
+MAP_SCALED_HOOK = (
+    f"{MAP_SCALED_ANCHOR}\n"
+    "    {\n"
+    "        gex_gpu_scaled_cel_draw map_scaled = {\n"
+    "            MEM32(esp + 0x18), ebx, MEM8(MEM32(esp + 0x18) + 0x10) & 0x40 ?\n"
+    "                MEM32(esp + 0x30) : MEM32(esp + 0x24),\n"
+    "            MEM32(esp + 0x54), MEM32(esp + 0x60),\n"
+    "            (int32_t)MEM32(esp + 0x34), (int32_t)MEM32(esp + 0x3C),\n"
+    "            (int32_t)MEM32(esp + 0x38), (int32_t)MEM32(esp + 0x4C),\n"
+    "            MEM16(esp + 0x1C), MEM16(esp + 0x20), MEM16(esp + 0x14),\n"
+    "            MEM16(esp + 0x16), MEM16(esp + 0x12)};\n"
+    "        if (gex_graphics_map_scaled_cel_try(&map_scaled, &edx)) goto L_00443AB4;\n"
+    "    }")
 FRAME_RETURN = "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x0044516D: ret  */"
 FRAME_END = f"    gex_graphics_end_frame();\n{FRAME_RETURN}"
 ARENA_RETURN = "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x0044114B: ret  */"
@@ -159,6 +203,12 @@ def rewrite_graphics(text):
     text = text.replace(PACKET_OLD, PACKET_ENTRY)
     text = text.replace(PACKET_BEGIN, PACKET_ENTRY).replace(PACKET_ENTRY, PACKET_BEGIN)
     text = text.replace(TITLE_HOOK, TITLE_ANCHOR).replace(TITLE_ANCHOR, TITLE_HOOK)
+    text = text.replace(BACKDROP_HOOK, BACKDROP_ANCHOR).replace(BACKDROP_ANCHOR, BACKDROP_HOOK)
+    text = text.replace(MAP_CHUNK_HOOK, MAP_CHUNK_CALL).replace(MAP_CHUNK_CALL, MAP_CHUNK_HOOK)
+    text = text.replace(MAP_FLIPPED_HOOK, MAP_FLIPPED_ANCHOR).replace(
+        MAP_FLIPPED_ANCHOR, MAP_FLIPPED_HOOK)
+    text = text.replace(MAP_SCALED_HOOK, MAP_SCALED_ANCHOR).replace(
+        MAP_SCALED_ANCHOR, MAP_SCALED_HOOK)
     text = text.replace(FRAME_END, FRAME_RETURN).replace(FRAME_RETURN, FRAME_END)
     for anchor, hook in VIEW_HOOKS.items():
         text = text.replace(f"{anchor}\n{hook}", anchor)

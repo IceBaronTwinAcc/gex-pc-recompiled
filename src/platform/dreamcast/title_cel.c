@@ -7,6 +7,35 @@ static unsigned word(const uint8_t *p) {
     return p[0] | (unsigned)p[1] << 8;
 }
 
+int gex_title_cel_decompress(const uint8_t *source, size_t source_size,
+                             uint8_t *output, size_t output_size) {
+    if (!source || !output || source_size < 4 || (output_size & 3))
+        return GEX_TITLE_CEL_INVALID;
+    size_t data = (size_t)source[0] | (size_t)source[1] << 8 |
+                  (size_t)source[2] << 16 | (size_t)source[3] << 24;
+    if (data < 4 || data > source_size) return GEX_TITLE_CEL_INVALID;
+    size_t control = 4, control_end = data, written = 0;
+    while (written < output_size) {
+        if (control >= control_end) return GEX_TITLE_CEL_INVALID;
+        unsigned command = source[control++];
+        size_t words = command & 0x7f;
+        if (!words) words = 128;
+        if (words > (output_size - written) / 4) return GEX_TITLE_CEL_INVALID;
+        size_t bytes = words * 4;
+        size_t read_size = command & 0x80 ? 4 : bytes;
+        if (read_size > source_size - data) return GEX_TITLE_CEL_INVALID;
+        if (command & 0x80) {
+            for (size_t i = 0; i < bytes; i += 4)
+                memcpy(output + written + i, source + data, 4);
+        } else {
+            memcpy(output + written, source + data, bytes);
+        }
+        data += read_size;
+        written += bytes;
+    }
+    return GEX_TITLE_CEL_OK;
+}
+
 int gex_title_cel_bounds(const uint8_t *image, size_t size, gex_title_cel *out) {
     if (!image || !out || size < 28) return GEX_TITLE_CEL_INVALID;
     unsigned format = image[16] & 3;
@@ -76,9 +105,77 @@ static int capture_read(gex_title_cel_read read, void *context, uint32_t base,
     return read(context, base + (uint32_t)offset, out, size);
 }
 
-int gex_title_cel_capture(gex_title_cel_read read, void *context,
-                          uint32_t image, uint32_t palette,
-                          gex_title_cel_snapshot *out) {
+static int capture_compressed(gex_title_cel_read read, void *context, uint32_t image,
+                              const uint8_t *records, unsigned tiles, unsigned format,
+                              uint8_t **raw, size_t *raw_size, uint8_t **decoded,
+                              size_t *decoded_size) {
+    enum { MAX_EXPANDED = 512 * 1024, MAX_CONTROLS = 128 * 1024 };
+    size_t records_size = 20 + ((size_t)tiles + 1) * 8;
+    size_t expanded = 0, previous = 0;
+    for (unsigned i = 0; i < tiles; ++i) {
+        const uint8_t *record = records + 20 + i * 8;
+        size_t source = word(record), width = record[2], height = record[3];
+        size_t padded = (width + 7) & ~(size_t)7;
+        size_t pitch = format == 0 ? padded / 2 : format == 1 ? padded : padded * 2;
+        size_t bytes = pitch * height;
+        if (source < previous || (source > previous && source != records_size + expanded))
+            return GEX_TITLE_CEL_UNSUPPORTED;
+        if (source > previous) {
+            if (bytes > MAX_EXPANDED - expanded) return GEX_TITLE_CEL_UNSUPPORTED;
+            expanded += bytes;
+            previous = source;
+        }
+    }
+    if (!expanded || (expanded & 3)) return GEX_TITLE_CEL_INVALID;
+    uint8_t header[4];
+    if (capture_read(read, context, image, records_size, header, sizeof header))
+        return GEX_TITLE_CEL_INVALID;
+    size_t data_offset = (size_t)header[0] | (size_t)header[1] << 8 |
+                         (size_t)header[2] << 16 | (size_t)header[3] << 24;
+    if (data_offset < 4 || data_offset > MAX_CONTROLS) return GEX_TITLE_CEL_INVALID;
+    size_t control = 4, used = 0, produced = 0;
+    while (produced < expanded) {
+        uint8_t command;
+        if (control >= data_offset ||
+            capture_read(read, context, image, records_size + control, &command, 1))
+            return GEX_TITLE_CEL_INVALID;
+        ++control;
+        size_t words = command & 0x7f;
+        if (!words) words = 128;
+        if (words > (expanded - produced) / 4) return GEX_TITLE_CEL_INVALID;
+        produced += words * 4;
+        used += command & 0x80 ? 4 : words * 4;
+    }
+    size_t compressed_size = records_size + data_offset + used;
+    size_t expanded_size = records_size + expanded;
+    uint8_t *snapshot = malloc(compressed_size);
+    uint8_t *plain = malloc(expanded_size);
+    if (!snapshot || !plain) {
+        free(snapshot);
+        free(plain);
+        return GEX_TITLE_CEL_NO_MEMORY;
+    }
+    int status = GEX_TITLE_CEL_INVALID;
+    if (capture_read(read, context, image, 0, snapshot, compressed_size)) goto done;
+    memcpy(plain, snapshot, records_size);
+    plain[16] &= (uint8_t)~4u;
+    status = gex_title_cel_decompress(snapshot + records_size, compressed_size - records_size,
+                                      plain + records_size, expanded);
+    if (status != GEX_TITLE_CEL_OK) goto done;
+    *raw = snapshot;
+    *raw_size = compressed_size;
+    *decoded = plain;
+    *decoded_size = expanded_size;
+    return GEX_TITLE_CEL_OK;
+done:
+    free(snapshot);
+    free(plain);
+    return status;
+}
+
+static int capture(gex_title_cel_read read, void *context,
+                   uint32_t image, uint32_t palette, int compressed_allowed,
+                   gex_title_cel_snapshot *out) {
     if (!out) return GEX_TITLE_CEL_INVALID;
     memset(out, 0, sizeof *out);
     if (!read || !image) return GEX_TITLE_CEL_INVALID;
@@ -86,7 +183,8 @@ int gex_title_cel_capture(gex_title_cel_read read, void *context,
     if (capture_read(read, context, image, 0, records, 20))
         return GEX_TITLE_CEL_INVALID;
     unsigned format = records[16] & 3;
-    if (format == 3 || (records[16] & 0x44)) return GEX_TITLE_CEL_UNSUPPORTED;
+    if (format == 3 || (records[16] & 0x40) ||
+        ((records[16] & 4) && !compressed_allowed)) return GEX_TITLE_CEL_UNSUPPORTED;
     size_t end = 20;
     unsigned tiles;
     for (tiles = 0; tiles <= 512; ++tiles) {
@@ -105,18 +203,26 @@ int gex_title_cel_capture(gex_title_cel_read read, void *context,
         if (end < limit) end = limit;
     }
     if (!tiles) return GEX_TITLE_CEL_INVALID;
-    uint8_t *buffer = calloc(1, end);
-    if (!buffer) return GEX_TITLE_CEL_NO_MEMORY;
-    memcpy(buffer, records, 20 + (tiles + 1) * 8);
     int result = GEX_TITLE_CEL_OK;
-    for (unsigned i = 0; i < tiles; ++i) {
-        const uint8_t *record = records + 20 + i * 8;
-        unsigned source = word(record), width = record[2], height = record[3];
-        unsigned padded = (width + 7) & ~7u;
-        size_t pitch = format == 0 ? padded / 2 : format == 1 ? padded : padded * 2;
-        if (capture_read(read, context, image, source, buffer + source, pitch * height)) {
-            result = GEX_TITLE_CEL_INVALID;
-            goto done;
+    uint8_t *buffer = NULL, *compressed = NULL;
+    size_t compressed_size = 0;
+    if (records[16] & 4) {
+        result = capture_compressed(read, context, image, records, tiles, format,
+                                    &compressed, &compressed_size, &buffer, &end);
+        if (result != GEX_TITLE_CEL_OK) return result;
+    } else {
+        buffer = calloc(1, end);
+        if (!buffer) return GEX_TITLE_CEL_NO_MEMORY;
+        memcpy(buffer, records, 20 + (tiles + 1) * 8);
+        for (unsigned i = 0; i < tiles; ++i) {
+            const uint8_t *record = records + 20 + i * 8;
+            unsigned source = word(record), width = record[2], height = record[3];
+            unsigned padded = (width + 7) & ~7u;
+            size_t pitch = format == 0 ? padded / 2 : format == 1 ? padded : padded * 2;
+            if (capture_read(read, context, image, source, buffer + source, pitch * height)) {
+                result = GEX_TITLE_CEL_INVALID;
+                goto done;
+            }
         }
     }
     result = gex_title_cel_bounds(buffer, end, &out->cel);
@@ -134,16 +240,30 @@ int gex_title_cel_capture(gex_title_cel_read read, void *context,
         capture_read(read, context, palette, 0, out->palette, out->palette_size)))
         result = GEX_TITLE_CEL_INVALID;
     if (result == GEX_TITLE_CEL_OK) {
-        out->source = buffer;
-        out->source_size = end;
+        out->source = compressed ? compressed : buffer;
+        out->source_size = compressed ? compressed_size : end;
         out->image_address = image;
         out->palette_address = palette;
-        buffer = NULL;
+        if (compressed) compressed = NULL;
+        else buffer = NULL;
     }
 done:
+    free(compressed);
     free(buffer);
     if (result != GEX_TITLE_CEL_OK) gex_title_cel_release(out);
     return result;
+}
+
+int gex_title_cel_capture(gex_title_cel_read read, void *context,
+                          uint32_t image, uint32_t palette,
+                          gex_title_cel_snapshot *out) {
+    return capture(read, context, image, palette, 0, out);
+}
+
+int gex_title_cel_capture_map(gex_title_cel_read read, void *context,
+                              uint32_t image, uint32_t palette,
+                              gex_title_cel_snapshot *out) {
+    return capture(read, context, image, palette, 1, out);
 }
 
 void gex_title_cel_release(gex_title_cel_snapshot *snapshot) {
@@ -177,6 +297,9 @@ static int matches_bytes(gex_title_cel_read read, gex_title_cel_match match,
 int gex_title_cel_matches_image(gex_title_cel_read read, gex_title_cel_match match, void *context,
                                 uint32_t image, const gex_title_cel_snapshot *snapshot) {
     if (!read || !snapshot || !snapshot->source || image != snapshot->image_address) return 0;
+    if (snapshot->source_size > 16 && (snapshot->source[16] & 4))
+        return matches_bytes(read, match, context, image, 0, snapshot->source,
+                             snapshot->source_size);
     size_t records = 20 + ((size_t)snapshot->cel.tiles + 1) * 8;
     if (records > snapshot->source_size ||
         !matches_bytes(read, match, context, image, 0, snapshot->source, records))

@@ -39,6 +39,21 @@ typedef struct {
 } gex_gpu_guest_io;
 
 typedef struct {
+    uint32_t image, atlas, flags, tint, rgb;
+    uint16_t x, y, wrap_x, wrap_y, palette;
+} gex_gpu_cel_draw;
+
+typedef struct {
+    uint32_t eax, ecx, edx;
+} gex_gpu_cel_result;
+
+typedef struct {
+    uint32_t image, tiles, atlas, tint, rgb;
+    int32_t span_x, span_y, divisor_x, divisor_y;
+    uint16_t x, y, wrap_x, wrap_y, palette;
+} gex_gpu_scaled_cel_draw;
+
+typedef struct {
     /* Return 1 when recorded, 0 to use the original generator, or -1 on error. */
     int (*record)(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
                   char *error, size_t size);
@@ -47,6 +62,11 @@ typedef struct {
                   const struct gex_raster_state *state, char *error, size_t size);
     void (*forget)(uint32_t begin, uint32_t end);
     void (*reset)(void);
+    /* Optional deferred generation for a repeated backdrop. */
+    int (*backdrop)(const gex_gpu_guest_io *io, uint32_t scene, char *error, size_t size);
+    /* Optional deferred generation for other authored scenes. */
+    int (*record_scene)(const gex_gpu_guest_io *io, uint32_t scene,
+                        uint32_t object, uint32_t cel, char *error, size_t size);
 } gex_gpu_title_ops;
 
 /* GPU-owned pictures never need CPU materialization. Asset blits upload CPU
@@ -84,6 +104,15 @@ typedef struct {
                  const gex_gpu_image *image, char *error, size_t size);
     /* Optional platform implementation of the game's deferred title draws. */
     const gex_gpu_title_ops *title;
+    /* Return 1 when a chunk was generated, or 0 to use the original. */
+    int (*map_chunk)(const gex_gpu_guest_io *io, uint32_t chunk, uint32_t definitions,
+                     int32_t x, int32_t y, int width, int height);
+    int (*map_flipped_cel)(const gex_gpu_guest_io *io, const gex_gpu_cel_draw *draw,
+                           uint32_t *previous_tail);
+    int (*map_unflipped_cel)(const gex_gpu_guest_io *io, const gex_gpu_cel_draw *draw,
+                             gex_gpu_cel_result *result);
+    int (*map_scaled_cel)(const gex_gpu_guest_io *io, const gex_gpu_scaled_cel_draw *draw,
+                          uint32_t *last_atlas);
 } gex_gpu_native_ops;
 
 typedef struct {

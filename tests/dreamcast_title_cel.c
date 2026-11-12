@@ -72,6 +72,28 @@ int main(void) {
     uint32_t pixels[256];
     gex_title_cel cel;
 
+    uint8_t compressed[] = {7, 0, 0, 0, 0x82, 2, 0,
+                            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    uint8_t uncompressed[16];
+    const uint8_t expected[] = {1, 2, 3, 4, 1, 2, 3, 4,
+                                5, 6, 7, 8, 9, 10, 11, 12};
+    assert(gex_title_cel_decompress(compressed, sizeof compressed, uncompressed,
+                                    sizeof uncompressed) == GEX_TITLE_CEL_OK);
+    assert(!memcmp(uncompressed, expected, sizeof expected));
+    assert(gex_title_cel_decompress(compressed, sizeof compressed - 1, uncompressed,
+                                    sizeof uncompressed) == GEX_TITLE_CEL_INVALID);
+    assert(gex_title_cel_decompress(compressed, sizeof compressed, uncompressed,
+                                    sizeof uncompressed - 4) == GEX_TITLE_CEL_INVALID);
+    compressed[0] = 5;
+    assert(gex_title_cel_decompress(compressed, sizeof compressed, uncompressed,
+                                    sizeof uncompressed) == GEX_TITLE_CEL_INVALID);
+    uint8_t run_128[] = {5, 0, 0, 0, 0x80, 1, 2, 3, 4};
+    uint8_t long_run[512];
+    assert(gex_title_cel_decompress(run_128, sizeof run_128, long_run,
+                                    sizeof long_run) == GEX_TITLE_CEL_OK);
+    for (size_t i = 0; i < sizeof long_run; ++i)
+        assert(long_run[i] == 1 + i % 4);
+
     tile(image + 20, 44, 3, 2, -2, 1);
     tile(image + 28, 52, 2, 1, 3, 3);
     image[44] = 0x10; image[45] = 0x02;
@@ -359,6 +381,46 @@ int main(void) {
     assert(gex_title_cel_capture(read_guest, memory, UINT32_MAX - 10, capture_palette,
                                  &snapshot) == GEX_TITLE_CEL_INVALID);
     assert(!snapshot.pixels);
+    memset(memory + capture_image, 0, 100);
+    memory[capture_image + 16] = 4;
+    tile(memory + capture_image + 20, 36, 8, 2, 0, 0);
+    put32(memory + capture_image + 36, 5);
+    memory[capture_image + 40] = 2;
+    memory[capture_image + 41] = 0x10;
+    memory[capture_image + 45] = 0x32;
+    assert(gex_title_cel_capture(read_guest, memory, capture_image, capture_palette,
+                                 &snapshot) == GEX_TITLE_CEL_UNSUPPORTED);
+    assert(gex_title_cel_capture_map(read_guest, memory, capture_image, capture_palette,
+                                     &snapshot) == GEX_TITLE_CEL_OK);
+    assert(snapshot.cel.width == 8 && snapshot.cel.height == 2 &&
+           snapshot.pixels[0] == 0x10000 && snapshot.pixels[1] == 0x10001 &&
+           snapshot.pixels[8] == 0x10002 && snapshot.pixels[9] == 0x10003);
+    assert(gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    memory[capture_image + 45] ^= 1;
+    assert(!gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    assert(snapshot.pixels[8] == 0x10002);
+    gex_title_cel_release(&snapshot);
+    memory[capture_image + 40] = 3;
+    assert(gex_title_cel_capture_map(read_guest, memory, capture_image, capture_palette,
+                                     &snapshot) == GEX_TITLE_CEL_INVALID);
+    put16(memory + capture_image + 20, 40);
+    assert(gex_title_cel_capture_map(read_guest, memory, capture_image, capture_palette,
+                                     &snapshot) == GEX_TITLE_CEL_UNSUPPORTED);
+    memset(memory + capture_image, 0, 100);
+    memory[capture_image + 16] = 4;
+    tile(memory + capture_image + 20, 44, 8, 2, 0, 0);
+    tile(memory + capture_image + 28, 52, 8, 1, 8, 0);
+    put32(memory + capture_image + 44, 6);
+    memory[capture_image + 48] = 0x82;
+    memory[capture_image + 49] = 1;
+    memory[capture_image + 50] = 0x10;
+    memory[capture_image + 54] = 0x32;
+    assert(gex_title_cel_capture_map(read_guest, memory, capture_image, capture_palette,
+                                     &snapshot) == GEX_TITLE_CEL_OK);
+    assert(snapshot.cel.width == 16 && snapshot.cel.height == 2 &&
+           snapshot.pixels[1] == 0x10001 && snapshot.pixels[8] == 0x10002 &&
+           snapshot.pixels[9] == 0x10003 && snapshot.pixels[17] == 0x10001);
+    gex_title_cel_release(&snapshot);
     for (unsigned iteration = 0; iteration < 10000; ++iteration) {
         for (size_t i = 0; i < sizeof memory; ++i) {
             random = random * 1664525u + 1013904223u;

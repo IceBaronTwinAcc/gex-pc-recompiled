@@ -57,6 +57,30 @@ The long-form implementation details and historical measurements are in
 [development.md](development.md#modular-renderer); verify the current source
 and configuration before treating historical results as current behavior.
 
+## Experimental Dreamcast level-selection map
+
+`GEX_DREAMCAST_NATIVE_MAP` is off by default. When enabled, the Dreamcast
+backend can replace the scene-49 repeating backdrop, supported unflipped CELs,
+direct-color map chunks including flipped tiles, and supported flipped, unflipped, and scaled
+CEL packet generation. Those CEL packet paths still use the original atlas and
+palette preparation. Compressed map CEL capture is limited to sequential tile data.
+`map_plan.c` preserves the original chunk and layer order; `map_draw.c` reserves
+packet space before writing and falls back without writes for unsupported tiles
+or unsafe arena reuse. Other map paths can still use legacy generation, so this
+is not a complete legacy-free map implementation. A no-fallback diagnostic must
+check each producer independently and exercise selection, fades, and
+transitions.
+
+The map chunk path currently accepts direct-color tiles only. An inventory of
+the loaded scene-49 map found two nonempty chunks with 72 drawable tile layers,
+all direct-color; this does not establish support for other maps. Unflipped CEL
+packet preflight also checks that wrapped arena allocations do not overlap
+previously planned packets before making any writes.
+
+The destination level ID can change before the outgoing map finishes drawing.
+The guest bridge retains the displayed scene's ID while its scene and map
+pointers still match; replacing either pointer ends that association.
+
 ## Web startup freeze or incorrect presentation: step-by-step
 
 Use this procedure when a browser starts with a frozen, badly sized, or clipped

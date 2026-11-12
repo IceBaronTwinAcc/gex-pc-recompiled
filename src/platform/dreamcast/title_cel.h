@@ -35,6 +35,8 @@ int gex_title_cel_bounds(const uint8_t *image, size_t size, gex_title_cel *out);
 /* Bit 16 marks a covered pixel; the low 16 bits hold the original texel. */
 int gex_title_cel_decode(const uint8_t *image, size_t size,
                          const gex_title_cel *cel, uint32_t *pixels, size_t count);
+int gex_title_cel_decompress(const uint8_t *source, size_t source_size,
+                             uint8_t *output, size_t output_size);
 int gex_title_cel_visibility(const gex_title_cel *cel, const uint8_t *palette,
                              size_t palette_size, const uint8_t *modulation,
                              unsigned rgb, uint32_t visible[8]);
@@ -55,6 +57,9 @@ int gex_title_cel_twiddle(const gex_title_cel *cel, const uint16_t *pixels,
 int gex_title_cel_capture(gex_title_cel_read read, void *context,
                           uint32_t image, uint32_t palette,
                           gex_title_cel_snapshot *out);
+int gex_title_cel_capture_map(gex_title_cel_read read, void *context,
+                              uint32_t image, uint32_t palette,
+                              gex_title_cel_snapshot *out);
 int gex_title_cel_matches(gex_title_cel_read read, gex_title_cel_match match, void *context,
                           uint32_t image, uint32_t palette,
                           const gex_title_cel_snapshot *snapshot);

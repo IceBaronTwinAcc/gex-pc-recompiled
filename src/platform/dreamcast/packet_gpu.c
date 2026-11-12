@@ -13,6 +13,7 @@
 #include "sampling.h"
 #include "title_cel.h"
 #include "title_draw.h"
+#include "map_draw.h"
 
 /* A single presorted translucent list preserves original packet order. */
 enum { TW = 512, TH = 256, CACHE_COUNT = 24, CACHE_BYTES = 4 * 1024 * 1024,
@@ -4015,12 +4016,27 @@ static int native_title_packet(void *target, uint32_t address, const uint8_t *pa
 const gex_packet_gpu *gex_packet_gpu_get(void) {
     static const gex_gpu_title_ops title = {gex_dreamcast_title_record, native_title_packet,
                                             gex_dreamcast_title_forget,
-                                            gex_dreamcast_title_reset};
+                                            gex_dreamcast_title_reset,
+#ifdef GEX_DREAMCAST_NATIVE_MAP
+                                            gex_dreamcast_backdrop_record,
+                                            gex_dreamcast_map_cel_record
+#else
+                                            NULL, NULL
+#endif
+    };
     static const gex_gpu_native_ops native = {native_clear,   native_copy, native_blit,
                                               native_present,                                               native_bind, native_polygon,
                                               native_movie, native_atlas_write, native_packet,
                                               native_atlas_write_rect, native_polygon_scaled,
-                                              native_image, &title};
+                                              native_image, &title,
+#ifdef GEX_DREAMCAST_NATIVE_MAP
+                                              gex_dreamcast_map_chunk, gex_dreamcast_map_flipped_cel,
+                                              gex_dreamcast_map_unflipped_cel,
+                                              gex_dreamcast_map_scaled_cel
+#else
+                                              NULL, NULL, NULL, NULL
+#endif
+    };
     static const gex_packet_gpu backend = {create, destroy, upload, download,
                                            draw,   history, 1,      &native};
     return &backend;

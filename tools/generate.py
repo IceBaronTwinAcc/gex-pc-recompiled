@@ -11,7 +11,9 @@ import sys
 import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.graphics_rewrite import (
-    FUNCTIONS as GRAPHICS_FUNCTIONS, FRAME_BEGIN, FRAME_END, PACKET_BEGIN, TITLE_HOOK as GRAPHICS_TITLE_HOOK,
+    FUNCTIONS as GRAPHICS_FUNCTIONS, FRAME_BEGIN, FRAME_END, PACKET_BEGIN,
+    TITLE_HOOK as GRAPHICS_TITLE_HOOK, BACKDROP_HOOK, MAP_CHUNK_HOOK, MAP_FLIPPED_HOOK,
+    MAP_SCALED_HOOK,
     ARENA_HOOK, VIEW_HOOKS, SCREEN_HOOKS, HUD_DRAWS, PLAYER_DRAWS, rewrite_graphics,
 )
 from tools.save_rewrite import rewrite_saves, TITLE_HOOK, TITLE_INIT_HOOK, CHECKPOINT_HOOK, MANUAL_HOOK
@@ -165,7 +167,8 @@ def main():
             if f"g_cur_func = 0x{address}u;\n    {replacement}();" not in rewritten:
                 raise RuntimeError(f"missing renderer replacement at 0x{address}")
         if any(hook not in rewritten for hook in
-               (FRAME_BEGIN, FRAME_END, PACKET_BEGIN, GRAPHICS_TITLE_HOOK, ARENA_HOOK,
+               (FRAME_BEGIN, FRAME_END, PACKET_BEGIN, GRAPHICS_TITLE_HOOK, BACKDROP_HOOK,
+                MAP_CHUNK_HOOK, MAP_FLIPPED_HOOK, MAP_SCALED_HOOK, ARENA_HOOK,
                 *VIEW_HOOKS.values(), *SCREEN_HOOKS.values())):
             raise RuntimeError("missing native renderer hooks")
         for address, anchor in HUD_DRAWS.items():

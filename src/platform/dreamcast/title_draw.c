@@ -22,7 +22,7 @@ typedef struct title_asset {
     gex_title_cel_snapshot image;
     title_colors *colors;
     size_t bytes;
-    unsigned references, variants;
+    unsigned references, variants, backdrop;
     struct title_asset *owner;
     struct title_asset *next;
 } title_asset;
@@ -82,6 +82,47 @@ static int read32(const gex_gpu_guest_io *io, uint32_t address, uint32_t *value)
     if (read_bytes(io, address, b, sizeof b)) return -1;
     *value = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
     return 0;
+}
+
+static int matches_backdrop(const gex_gpu_guest_io *io, const gex_title_cel_snapshot *image) {
+    if (io->matches)
+        return io->matches(io->context, image->image_address,
+                           image->source, image->source_size) == 1;
+    uint8_t bytes[128];
+    for (size_t offset = 0; offset < image->source_size; offset += sizeof bytes) {
+        size_t count = image->source_size - offset;
+        if (count > sizeof bytes) count = sizeof bytes;
+        if (read_bytes(io, image->image_address + (uint32_t)offset, bytes, count) ||
+            memcmp(bytes, image->source + offset, count)) return 0;
+    }
+    return 1;
+}
+
+static int capture_backdrop(const gex_gpu_guest_io *io, uint32_t palette,
+                            gex_title_cel_snapshot *snapshot) {
+    enum { HEADER = 28, WIDTH = 64, HEIGHT = 32, BYTES = WIDTH * HEIGHT / 2 };
+    memset(snapshot, 0, sizeof *snapshot);
+    snapshot->source = malloc(HEADER + BYTES);
+    snapshot->pixels = malloc(WIDTH * HEIGHT * sizeof *snapshot->pixels);
+    if (!snapshot->source || !snapshot->pixels) {
+        gex_title_cel_release(snapshot);
+        return GEX_TITLE_CEL_NO_MEMORY;
+    }
+    if (read_bytes(io, 0x460258, snapshot->source, HEADER + BYTES) ||
+        read_bytes(io, palette, snapshot->palette, 32)) {
+        gex_title_cel_release(snapshot);
+        return GEX_TITLE_CEL_INVALID;
+    }
+    for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+        unsigned value = snapshot->source[HEADER + i / 2];
+        snapshot->pixels[i] = 0x10000u | ((value >> ((i & 1) * 4)) & 15);
+    }
+    snapshot->cel = (gex_title_cel){0, 0, WIDTH, HEIGHT, 0, 1};
+    snapshot->source_size = HEADER + BYTES;
+    snapshot->image_address = 0x460258;
+    snapshot->palette_address = palette;
+    snapshot->palette_size = 32;
+    return GEX_TITLE_CEL_OK;
 }
 
 static void write32(const gex_gpu_guest_io *io, uint32_t address, uint32_t value) {
@@ -167,8 +208,8 @@ void gex_dreamcast_title_reset(void) {
         }
 }
 
-int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
-                               char *error, size_t size) {
+static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int backdrop,
+                  int map, uint32_t scene, char *error, size_t size) {
     if (!io || !io->read || !io->write || !io->allocated) return 0;
     uint32_t camera_x, camera_y, frame, fade, colors[32], begin, end, cursor, tails[2];
     uint16_t screen_x, screen_y;
@@ -195,14 +236,34 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
     gex_title_part *parts = malloc(TITLE_PART_LIMIT * sizeof *parts);
     if (!parts) return fail(error, size, "cannot allocate title draw plan");
     size_t count = 0;
-    int status = gex_title_plan(io->read, io->context, object, cel,
+    int status;
+    if (backdrop) {
+        uint32_t palette;
+        uint8_t header[28];
+        if (scene != 49 ||
+            read32(io, 0x46a534, &palette) || !palette ||
+            read_bytes(io, 0x460258, header, sizeof header) ||
+            (header[16] & 0x7f) || header[20] != 28 || header[21] ||
+            header[22] != 64 || header[23] != 32 ||
+            header[24] || header[25] || header[26] || header[27]) {
+            free(parts);
+            return 0;
+        }
+        for (int x = 0; x < 320; x += 64)
+            for (int y = 0; y < 240; y += 32)
+                parts[count++] = (gex_title_part){0x460258, palette, 0, 0, x, y, 0, 0};
+        status = GEX_TITLE_PLAN_OK;
+    } else {
+        status = gex_title_plan(io->read, io->context, object, cel,
                                 camera_x, camera_y, frame, screen_x, screen_y, 320, 240,
                                 parts, TITLE_PART_LIMIT, &count);
+    }
     if (status != GEX_TITLE_PLAN_OK || count * TITLE_PAIR_SIZE > end - begin) {
         free(parts);
         return 0;
     }
     title_draw *pending = NULL, **tail = &pending;
+    title_asset *backdrop_asset = NULL;
     uint32_t position = cursor, first = 0;
     int wrapped = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -220,13 +281,15 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
             if (tails[j] >= position && tails[j] < position + TITLE_PAIR_SIZE) {
                 status = 0; goto rollback;
             }
-        title_asset *asset;
-        for (asset = assets; asset; asset = asset->next)
-            if (asset->owner == asset &&
-                asset->image.image_address == parts[i].image &&
-                gex_title_cel_matches_image(io->read, io->matches, io->context, parts[i].image,
-                                            &asset->image)) break;
-        if (asset) {
+        title_asset *asset = backdrop_asset;
+        if (!asset)
+            for (asset = assets; asset; asset = asset->next)
+                if (asset->owner == asset && asset->backdrop == (unsigned)backdrop &&
+                    asset->image.image_address == parts[i].image &&
+                    (backdrop ? matches_backdrop(io, &asset->image) :
+                     gex_title_cel_matches_image(io->read, io->matches, io->context, parts[i].image,
+                                                 &asset->image))) break;
+        if (asset && !backdrop_asset) {
             title_asset *owner = asset->owner;
             uint8_t palette[512];
             size_t palette_size = owner->image.palette_size;
@@ -242,6 +305,7 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
                 asset = malloc(sizeof *asset);
                 if (!asset) { status = -1; goto rollback; }
                 *asset = (title_asset){.image = owner->image, .bytes = sizeof *asset,
+                                       .backdrop = owner->backdrop,
                                        .owner = owner, .next = assets};
                 if (palette_size) memcpy(asset->image.palette, palette, palette_size);
                 asset->image.palette_address = parts[i].palette;
@@ -252,14 +316,18 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
         }
         if (!asset) {
             gex_title_cel_snapshot snapshot;
-            int captured = gex_title_cel_capture(io->read, io->context, parts[i].image,
-                                                 parts[i].palette, &snapshot);
+            int captured = backdrop ? capture_backdrop(io, parts[i].palette, &snapshot) :
+                map ? gex_title_cel_capture_map(io->read, io->context, parts[i].image,
+                                                parts[i].palette, &snapshot) :
+                      gex_title_cel_capture(io->read, io->context, parts[i].image,
+                                            parts[i].palette, &snapshot);
             if (captured != GEX_TITLE_CEL_OK) {
                 status = captured == GEX_TITLE_CEL_NO_MEMORY ? -1 : 0;
                 goto rollback;
             }
             for (asset = assets; asset; asset = asset->next)
-                if (same_asset(&asset->image, &snapshot)) break;
+                if (asset->backdrop == (unsigned)backdrop &&
+                    same_asset(&asset->image, &snapshot)) break;
             if (asset) {
                 gex_title_cel_release(&snapshot);
             } else {
@@ -274,12 +342,14 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
                     gex_title_cel_release(&snapshot);
                     status = -1; goto rollback;
                 }
-                *asset = (title_asset){.image = snapshot, .bytes = bytes, .next = assets};
+                *asset = (title_asset){.image = snapshot, .bytes = bytes,
+                                       .backdrop = (unsigned)backdrop, .next = assets};
                 asset->owner = asset;
                 assets = asset;
                 storage += bytes;
             }
         }
+        if (backdrop) backdrop_asset = asset;
         ++asset->references;
         if (!make_room(sizeof(title_draw))) {
             release_asset(asset);
@@ -295,8 +365,11 @@ int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint
                                         {position + TITLE_MARKER_SIZE, draw, NULL}},
                              .x = parts[i].x, .y = parts[i].y,
                              .wrap_x = parts[i].wrap_x, .wrap_y = parts[i].wrap_y,
-                             .rgb = gex_title_packet_rgb(parts[i].tint, fade, fade_rgb, colors),
-                             .semitransparent = !!(parts[i].tint & 0x8080u),
+                             .rgb = backdrop ? (uint32_t)fade_rgb[0] |
+                                               (uint32_t)fade_rgb[1] << 8 |
+                                               (uint32_t)fade_rgb[2] << 16 :
+                                    gex_title_packet_rgb(parts[i].tint, fade, fade_rgb, colors),
+                             .semitransparent = !backdrop && !!(parts[i].tint & 0x8080u),
                              .asset = asset};
         *tail = draw;
         tail = &draw->next;
@@ -326,6 +399,21 @@ rollback:
     free(parts);
     release_pending(pending);
     return status < 0 ? fail(error, size, "cannot allocate title image snapshot") : 0;
+}
+
+int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
+                               char *error, size_t size) {
+    return record(io, object, cel, 0, 0, 63, error, size);
+}
+
+int gex_dreamcast_backdrop_record(const gex_gpu_guest_io *io, uint32_t scene,
+                                  char *error, size_t size) {
+    return record(io, 0, 0, 1, 0, scene, error, size);
+}
+
+int gex_dreamcast_map_cel_record(const gex_gpu_guest_io *io, uint32_t scene,
+                                 uint32_t object, uint32_t cel, char *error, size_t size) {
+    return scene == 49 ? record(io, object, cel, 0, 1, scene, error, size) : 0;
 }
 
 static int signed16(int value) {

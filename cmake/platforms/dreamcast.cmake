@@ -4,6 +4,10 @@ endif()
 set(GEX_PLATFORM_RUNTIME hle)
 set(GEX_PLATFORM_DESKTOP_TESTS OFF)
 set(GEX_PVR_AVAILABLE ON)
+option(GEX_DREAMCAST_NATIVE_MAP "Enable experimental native map draw generation" OFF)
+if(GEX_DREAMCAST_NATIVE_MAP)
+    set(GEX_PLATFORM_PACKET_GPU_DEFINITIONS GEX_DREAMCAST_NATIVE_MAP)
+endif()
 target_compile_definitions(gex_renderer PUBLIC GEX_NATIVE_GAMEPLAY_WIDTH=320 GEX_NATIVE_GAMEPLAY_HEIGHT=240)
 target_compile_definitions(gex_renderer PRIVATE GEX_PACKET_SPAN_LIMIT=256)
 set(GEX_PLATFORM_LIBRARIES m)
@@ -60,7 +64,8 @@ target_compile_options(gex_renderer PRIVATE -O2 -g -fomit-frame-pointer -fno-lto
 set_source_files_properties(src/main.c src/platform/dreamcast/renderer.c
     src/platform/dreamcast/packet_gpu.c src/platform/dreamcast/title_cel.c
     src/platform/dreamcast/title_draw.c src/platform/dreamcast/title_layout.c
-    src/platform/dreamcast/title_plan.c src/platform/gl/packet_gpu.c src/sha256.c
+    src/platform/dreamcast/title_plan.c src/platform/dreamcast/map_plan.c
+    src/platform/dreamcast/map_draw.c src/platform/gl/packet_gpu.c src/sha256.c
     "${PCRECOMP_DIR}/runtime/win32hle/dsound.c"
     PROPERTIES COMPILE_OPTIONS -O2)
 set_source_files_properties(src/graphics_guest.c

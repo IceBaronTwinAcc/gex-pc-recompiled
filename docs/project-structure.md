@@ -30,7 +30,7 @@ There are two distinct codebases:
 | `AGENTS.md` | Repository-wide agent instructions. | Read first; protected-document rules apply. |
 | `CMakeLists.txt` | Root targets, options, platform selection, and CTest registrations. | Check target/condition wiring when adding source or tests. |
 | `src/` | Shared launcher, guest integration, menus, graphics, audio-facing logic, and interfaces. | Prefer these sources for game-specific behavior. |
-| `src/platform/` | Platform contracts, SDL desktop implementations (`desktop/`), host-specific implementations (`linux/`, `windows/`, `dreamcast/`), and graphics backends (`bgfx/`, `gl/`). | Follow the existing source layout and platform manifest; several files retain target-specific branches for macOS, Android, and WebAssembly. |
+| `src/platform/` | Platform contracts, SDL desktop implementations (`desktop/`), host-specific implementations (`linux/`, `windows/`, `dreamcast/`), and graphics backends (`bgfx/`, `gl/`). | Follow the existing source layout and platform manifest; several files retain target-specific branches for macOS and Android. |
 | `src/recomp/gen/` | Generated lift, dispatch, and declarations. | Ignored output: **do not hand-edit**. Change generation/rewrites and regenerate when needed. |
 | `cmake/` | Platform manifests, toolchains, runtime source groups, and renderer dependency wiring. | A manifest selects implementations; a toolchain selects compiler/target. |
 | `config/` | Tracked lift metadata and game-asset hashes; locally generated analysis files are ignored. | Treat hashes and lift inputs as compatibility contracts, not defaults to silently replace. |
@@ -132,7 +132,7 @@ prove image correctness or gameplay. Use appropriate external scanout evidence.
 | Windows MSVC native32 | `cmake/platforms/windows.cmake`; separate native32 runtime | `src/platform/windows/main.c`; requires MSVC x86 / `-A Win32`. Not interchangeable with MinGW HLE. |
 | Android | Desktop/HLE manifest with Android-specific branches and `src/platform/android/` entry/font helpers | `android/`, `tools/build-android.sh`, `tools/package-android.py`. |
 | Dreamcast | `cmake/platforms/dreamcast.cmake`, KallistiOS services in `src/platform/dreamcast/` | `cmake/toolchains/dreamcast.cmake`, `tools/build-dreamcast.sh`, `tools/test-dreamcast.sh`. |
-| WebAssembly (experimental) | `cmake/platforms/wasm.cmake`, Wasm font support under `src/platform/wasm/`, and Emscripten branches in desktop/Linux/HLE sources; browser shell/import in `web/` | `tools/build-wasm.sh`, `tools/serve-wasm.py`, [WebAssembly guide](webassembly.md). |
+| WebAssembly (experimental) | TODO: Document the WebAssembly platform boundaries. | `tools/build-wasm.sh`, `tools/serve-wasm.py`, [WebAssembly guide](webassembly.md). |
 
 `GEX_PLATFORM_FILE` selects the manifest. `GEX_RENDERER_BACKEND_SOURCE`,
 `GEX_MOVIE_DECODER_SOURCE`, and `GEX_ENABLE_*_RENDERER` affect selected

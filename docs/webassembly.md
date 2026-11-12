@@ -208,18 +208,13 @@ Their visible trace kept image/backing at 1100x618 both windowed and in a
 2560x1440 fullscreen rectangle, with an advancing audio clock and approximately
 15 movie writes per second after activation.
 
-`cmake/platforms/wasm.cmake` reuses the desktop SDL and Linux host sources,
-with Emscripten-specific branches in the desktop services/screen,
-Linux runtime/filesystem/virtual-memory/audio, and HLE flat-memory files.
-Browser-specific font lookup is in `src/platform/wasm/`; movie playback uses
+TODO: Document WebAssembly platform source selection and shared SDL/POSIX interfaces.
+Movie playback uses
 the shared player and FFmpeg decoder in `src/movie.c` and
 `src/platform/desktop/movie_decoder.c`. The browser shell and import glue are
 in `web/shell.html` and `web/gex-pre.js`.
 `tools/serve-wasm.py` is a local development server, not a production hosting
-configuration. The software renderer uses the existing desktop SDL presenter;
-the guest-address memory layout is implemented in
-`src/platform/hle/flat_memory.c`, and file reads use the Emscripten branch in
-`src/platform/linux/virtual_memory.c`.
+configuration. The software renderer uses the existing desktop SDL presenter.
 
 Treat streamed game-data access and font bundling as follow-up projects.
 Browser saves and settings use the existing

@@ -11,9 +11,6 @@
 #include <time.h>
 #include "platform/runtime.h"
 #include "win32hle.h"
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
 
 static pthread_mutex_t *native_mutex(gex_mutex *mutex) {
     void *implementation = atomic_load(&mutex->implementation);
@@ -42,33 +39,7 @@ void gex_mutex_unlock(gex_mutex *mutex) {
 }
 
 _Noreturn void gex_runtime_exit_thread(void) { pthread_exit(NULL); }
-_Noreturn void gex_runtime_exit_process(int code) {
-#ifdef __EMSCRIPTEN__
-    exit(code);
-#else
-    _exit(code);
-#endif
-}
 uint32_t gex_runtime_process_id(void) { return (uint32_t)getpid(); }
-
-int gex_runtime_executable_path(char *out, size_t size) {
-#ifdef __EMSCRIPTEN__
-    const char *path = "/Gex/GEX.exe";
-    if (strlen(path) >= size) return 0;
-    strcpy(out, path);
-#elif defined(__APPLE__)
-    char raw[4096], real[4096];
-    uint32_t length = sizeof raw;
-    if (!size || _NSGetExecutablePath(raw, &length) || !realpath(raw, real) || strlen(real) >= size)
-        return 0;
-    strcpy(out, real);
-#else
-    ssize_t length = size ? readlink("/proc/self/exe", out, size - 1) : -1;
-    if (length <= 0 || (size_t)length == size - 1) return 0;
-    out[length] = 0;
-#endif
-    return 1;
-}
 
 void gex_runtime_realtime(int64_t *seconds, long *nanoseconds) {
     struct timespec value;
@@ -109,22 +80,6 @@ void gex_runtime_machine_lock(void) {
 void gex_runtime_machine_unlock(void) {
     int error = pthread_mutex_unlock(&machine);
     if (error) hle_fatal("machine unlock: %s", strerror(error));
-}
-
-void gex_runtime_yield(void) {
-#ifdef __EMSCRIPTEN__
-    gex_runtime_sleep_us(50);
-#else
-    if (sched_yield()) hle_fatal("machine yield: %s", strerror(errno));
-#endif
-}
-
-unsigned gex_runtime_spin_limit(void) {
-#ifdef __EMSCRIPTEN__
-    return 200;
-#else
-    return 1000;
-#endif
 }
 
 uint64_t gex_runtime_time_us(void) {

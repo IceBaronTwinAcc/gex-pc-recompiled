@@ -23,16 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#ifdef __EMSCRIPTEN__
-#include <stdatomic.h>
-#include <emscripten.h>
-#include <emscripten/threading.h>
-#include "platform/wasm/fullscreen.h"
-#endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include "win32hle.h"
 #include "platform/desktop/app_icon.h"
+#include "platform/desktop/screen_policy.h"
 #include "platform/video.h"
 #include "preferences.h"
 
@@ -53,17 +48,6 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static int g_external_window;
-#ifdef __EMSCRIPTEN__
-static int g_web_output_width, g_web_output_height;
-static int g_web_output_captured;
-static int g_web_fullscreen_pending;
-static int capture_web_output(void) {
-    if (g_web_output_captured) return 0;
-    if (SDL_GetRendererOutputSize(g_ren, &g_web_output_width, &g_web_output_height)) return -1;
-    g_web_output_captured = 1;
-    return 0;
-}
-#endif
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
 static pthread_t g_video_thread;                         /* SDL's video calls stay on the thread that opened it */
 #ifdef GEX_NO_DIRECTDRAW
@@ -126,11 +110,7 @@ static void set_fullscreen(int on) {
         return;
     }
     g_fullscreen = on, g_menu_depth = 0;
-#ifdef __EMSCRIPTEN__
-    (void)on;                                              /* the page does it, on the key itself (a gesture) */
-#else
-    if (g_win) SDL_SetWindowFullscreen(g_win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-#endif
+    gex_screen_shortcut_fullscreen(g_win, on);
     settings_changed();
 }
 void hle_screen_fullscreen(int on) { set_fullscreen(on != 0); }
@@ -253,69 +233,16 @@ int gex_video_display(int mode, char *error, size_t size) {
         return -1;
     }
 #endif
-#ifdef __EMSCRIPTEN__
-    if (g_win && mode != GEX_DISPLAY_WINDOWED && !g_web_output_captured) {
-        g_web_fullscreen_pending = 1;
-        gex_prefs.display = mode;
-        settings_changed();
-        return 0;
-    }
-    g_web_fullscreen_pending = 0;
-#endif
-#ifdef __EMSCRIPTEN__
-    int result = g_win ? gex_wasm_set_fullscreen(mode != GEX_DISPLAY_WINDOWED) : 0;
-    if (result) {
-        snprintf(error, size, "Browser display change failed (%d)", result);
-        return -1;
-    }
-#else
-    Uint32 flags = mode == GEX_DISPLAY_BORDERLESS ? SDL_WINDOW_FULLSCREEN_DESKTOP :
-        mode == GEX_DISPLAY_EXCLUSIVE ? SDL_WINDOW_FULLSCREEN : 0;
-    if (g_win && SDL_SetWindowFullscreen(g_win, flags)) {
-        snprintf(error, size, "Display change failed: %s", SDL_GetError());
-        return -1;
-    }
-#endif
-    g_fullscreen = mode != GEX_DISPLAY_WINDOWED;
+    int result = gex_screen_display(g_win, mode, error, size);
+    if (result < 0) return -1;
+    if (!result) g_fullscreen = mode != GEX_DISPLAY_WINDOWED;
     gex_prefs.display = mode;
     settings_changed();
     return 0;
 }
 
 int gex_video_desktop(int *width, int *height) {
-#ifdef __EMSCRIPTEN__
-    /* Embedded browser viewports are not reliable display-aspect sources. */
-    *width = 1280;
-    *height = 720;
-    return 0;
-#else
-    if (!g_win) { *width = 320; *height = 240; return 0; }
-    int display = SDL_GetWindowDisplayIndex(g_win);
-    SDL_DisplayMode mode;
-    if (display < 0 || SDL_GetDesktopDisplayMode(display, &mode)) {
-        fprintf(stderr, "[video] cannot query display resolution: %s\n", SDL_GetError());
-        return -1;
-    }
-    *width = mode.w; *height = mode.h;
-    return 0;
-#endif
-}
-
-int gex_video_migrate_saved_resolution(int *width, int *height) {
-#ifdef __EMSCRIPTEN__
-    if (!width || !height || *width <= 0 || *height <= 0 ||
-        (int64_t)*width * 9 >= (int64_t)*height * 16)
-        return 0;
-    int desktop_width, desktop_height;
-    if (gex_video_desktop(&desktop_width, &desktop_height) ||
-        gex_preferences_default_size(desktop_width, desktop_height, width, height))
-        return -1;
-    return 1;
-#else
-    (void)width;
-    (void)height;
-    return 0;
-#endif
+    return gex_screen_desktop(g_win, width, height);
 }
 
 /* window points -> game pixels, clamped to the picture */
@@ -357,18 +284,7 @@ static void present(void) {
 #else
     if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
 #endif
-#ifdef __EMSCRIPTEN__
-    if (g_ren && !g_web_output_captured) {
-        if (capture_web_output())
-            hle_fatal("SDL renderer output size: %s", SDL_GetError());
-    }
-    if (g_web_fullscreen_pending) {
-        int result = gex_wasm_set_fullscreen(1);
-        if (result) hle_fatal("Browser display change failed (%d)", result);
-        g_fullscreen = 1;
-        g_web_fullscreen_pending = 0;
-    }
-#endif
+    gex_screen_before_present(g_ren, &g_fullscreen);
     uint32_t now = hle_ticks_ms();
     g_src_w = w, g_src_h = h;
     if (seq == g_shown_seq && now - g_last_present < 250) return;
@@ -488,16 +404,7 @@ static void present(void) {
     }
     if (g_menu_depth) menu_draw();
     SDL_RenderPresent(g_ren);
-#ifdef __EMSCRIPTEN__
-    static int web_presented;
-    if (!web_presented) {
-        web_presented = 1;
-        MAIN_THREAD_ASYNC_EM_ASM({
-            if (document.getElementById("status").textContent === "Game files loaded. Starting Gex...")
-                window.gexSetStatus("Gex is running.");
-        });
-    }
-#endif
+    gex_screen_after_present();
 }
 
 /* Who shows the cursor. A DirectDraw game draws its own into the picture, so
@@ -717,9 +624,7 @@ static void menu_draw(void) {
     }
 }
 
-#ifndef __EMSCRIPTEN__
-int hle_screen_menu_open(void) { return g_menu_depth > 0; }
-#endif
+int hle_screen_menu_open(void) { return g_menu_depth > 0 || gex_screen_platform_menu_open(); }
 
 /* The size of the display the window is on (the first, before it opens):
  * SDL's desktop mode, in points, so a Retina Mac's logical size. */
@@ -730,65 +635,8 @@ int hle_screen_desktop(int *w, int *h) {
     *w = m.w, *h = m.h;
     return 1;
 }
-#ifdef __EMSCRIPTEN__
-/* The browser displays the menu as HTML so the game thread can continue
- * pumping SDL while the user makes a selection.
- * The items go over as JSON; the page writes the choice (0: none yet, -1:
- * closed) into g_web_choice, and the pump calls chosen() on this thread. */
-static _Atomic int g_web_choice;
-static void (*g_web_chosen)(int id);
-static char g_web_menu_json[16384];
-static size_t json_item(char *out, size_t n, const hle_menu_item_t *it) {
-    size_t k = 0;
-    if (!it->label) return (size_t)snprintf(out, n, "null");
-    k += (size_t)snprintf(out + k, n - k, "{\"label\":\"");
-    for (const char *p = it->label; *p && k + 8 < n; p++) {
-        if (*p == '"' || *p == '\\') out[k++] = '\\';
-        out[k++] = *p;
-    }
-    k += (size_t)snprintf(out + k, n - k, "\",\"hint\":\"%s\",\"id\":%d,\"checked\":%d", it->hint ? it->hint : "", it->id, it->checked ? 1 : 0);
-    if (it->sub && it->nsub > 0) {
-        k += (size_t)snprintf(out + k, n - k, ",\"sub\":[");
-        for (int i = 0; i < it->nsub && k + 64 < n; i++) {
-            if (i) out[k++] = ',';
-            k += json_item(out + k, n - k, &it->sub[i]);
-        }
-        k += (size_t)snprintf(out + k, n - k, "]");
-    }
-    k += (size_t)snprintf(out + k, n - k, "}");
-    return k;
-}
 void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)) {
-    if (!items || n <= 0) return;
-    size_t k = 0;
-    g_web_menu_json[k++] = '[';
-    for (int i = 0; i < n && k + 64 < sizeof g_web_menu_json; i++) {
-        if (i) g_web_menu_json[k++] = ',';
-        k += json_item(g_web_menu_json + k, sizeof g_web_menu_json - k, &items[i]);
-    }
-    g_web_menu_json[k++] = ']';
-    g_web_menu_json[k] = 0;
-    atomic_store(&g_web_choice, 0);
-    g_web_chosen = chosen;
-    MAIN_THREAD_ASYNC_EM_ASM({
-        if (Module['gexPopupMenu'])
-            Module['gexPopupMenu'](UTF8ToString($0), $1);
-        else
-            Atomics.store(HEAP32, $1 >> 2, -1);
-    }, g_web_menu_json, &g_web_choice);
-}
-int hle_screen_menu_open(void) { return g_web_chosen != NULL; }
-static void web_menu_poll(void) {
-    int choice = atomic_load(&g_web_choice);
-    if (!g_web_chosen || !choice) return;
-    void (*cb)(int) = g_web_chosen;
-    atomic_store(&g_web_choice, 0);
-    g_web_chosen = NULL;
-    if (choice > 0) cb(choice);
-}
-#endif
-#ifndef __EMSCRIPTEN__
-void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)) {
+    if (gex_screen_platform_menu(items, n, chosen)) return;
     int pw, ph, ww, wh, mx, my;
     if (g_external_window) {
         fprintf(stderr, "[screen] CPU popup-menu overlays are unavailable with an external GPU presenter\n");
@@ -812,25 +660,15 @@ void hle_screen_menu(const hle_menu_item_t *items, int n, void (*chosen)(int id)
     g_menu_depth = 1, g_menu_chosen = chosen, g_menu_eat_up = 0;
     menu_dirty();
 }
-#endif
 
 int g_input_trace;                                         /* a host's --inputtrace */
 void hle_screen_pump(void) {
     if (g_win && !pthread_equal(pthread_self(), g_video_thread)) return;
-#ifdef __EMSCRIPTEN__
-    /* the browser's main thread queues this thread's input callbacks */
-    emscripten_current_thread_process_queued_calls();
-    web_menu_poll();
-#endif
+    gex_screen_poll_platform();
     SDL_Event e;
     if (g_win) update_cursor();
     while (g_win && SDL_PollEvent(&e)) {
-#ifdef __EMSCRIPTEN__
-        if (getenv("RA2_INPUT_TRACE") || g_input_trace) {
-            if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) fprintf(stderr, "[input] key %s scancode %d repeat %d\n", e.type == SDL_KEYDOWN ? "down" : "up", e.key.keysym.scancode, e.key.repeat);
-            else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) fprintf(stderr, "[input] button %d %s at %d,%d\n", e.button.button, e.type == SDL_MOUSEBUTTONDOWN ? "down" : "up", e.button.x, e.button.y);
-        }
-#endif
+        gex_screen_event_platform(g_win, g_ren, &e, g_input_trace);
         if (g_menu_depth && menu_event(&e)) continue;
         if (g_menu_eat_up && e.type == SDL_MOUSEBUTTONUP) { g_menu_eat_up = 0; continue; }
         switch (e.type) {
@@ -886,16 +724,6 @@ void hle_screen_pump(void) {
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 g_menu_depth = 0;                         /* placed for the old size */
-#ifdef __EMSCRIPTEN__
-                int output_width, output_height;
-                if (SDL_GetRendererOutputSize(g_ren, &output_width, &output_height))
-                    hle_fatal("SDL renderer output size: %s", SDL_GetError());
-                /* Fullscreen can enlarge SDL's software canvas backing store; keep the windowed pixel size. */
-                if (g_web_output_width > 0 &&
-                    (output_width != g_web_output_width || output_height != g_web_output_height)) {
-                    SDL_SetWindowSize(g_win, g_web_output_width, g_web_output_height);
-                }
-#endif
             }
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_EXPOSED) g_shown_seq = ~0u;
             break;
@@ -933,35 +761,16 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
     hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
-    Uint32 window_flags = SDL_WINDOW_RESIZABLE;
-#ifndef __EMSCRIPTEN__
-    window_flags |= SDL_WINDOW_ALLOW_HIGHDPI;
-#endif
+    Uint32 window_flags = gex_screen_window_flags(fullscreen);
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     if (gex_app_video_init() != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
-#ifndef __EMSCRIPTEN__
-    if (fullscreen) window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-#endif
     g_win = gex_app_window(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
                              window_flags);
     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
-#ifdef __EMSCRIPTEN__
-    /* In a browser the game runs on a worker thread and the canvas belongs
-     * to the page's: SDL's GL renderer would need the WebGL context made
-     * current on this thread, which its EGL path (proxied to the page's
-     * thread) does not do. The software renderer draws into the window's
-     * framebuffer, which SDL hands to the canvas from the page's thread. */
-    g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
-#else
-    g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_PRESENTVSYNC);
-    if (!g_ren) g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
-#endif
+    g_ren = gex_screen_create_renderer(g_win);
     if (!g_ren) { fprintf(stderr, "[screen] renderer: %s\n", SDL_GetError()); return -1; }
-#ifdef __EMSCRIPTEN__
-    g_web_output_captured = 0;
-    g_web_fullscreen_pending = fullscreen != 0;
-#endif
+    gex_screen_opened(fullscreen);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_ShowCursor(SDL_DISABLE);                         /* the game draws its own */
     hle_cursor_hook = warp;
@@ -978,13 +787,7 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
 void hle_screen_close(void) {
     if (g_win && !pthread_equal(pthread_self(), g_video_thread))
         hle_fatal("SDL screen shutdown on a non-owner thread");
-#ifdef __EMSCRIPTEN__
-    if (g_win) {
-        int result = gex_wasm_set_fullscreen(0);
-        if (result) fprintf(stderr, "[video] Browser display change failed (%d)\n", result);
-    }
-    g_web_fullscreen_pending = 0;
-#endif
+    gex_screen_close_platform(g_win);
     hle_gdi_window_hook = NULL;
     hle_cursor_hook = NULL;
     hle_set_pump_hook(NULL);
@@ -998,10 +801,8 @@ void hle_screen_close(void) {
     free(g_conv); g_conv = NULL; g_conv_n = 0;
     free(g_hd); g_hd = NULL; g_hd_n = 0;
     free(g_ov); g_ov = NULL; g_ov_n = 0;
-#ifndef __EMSCRIPTEN__
     if (g_menu_font) TTF_CloseFont(g_menu_font);
     g_menu_font = NULL;
-#endif
     g_shown_seq = ~0u;
     g_last_present = 0;
     g_src_w = g_src_h = 0;

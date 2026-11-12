@@ -52,19 +52,3 @@ size_t gex_vm_page_size(void) {
     if (size <= 0) hle_fatal("cannot determine host page size");
     return (size_t)size;
 }
-
-int gex_vm_map_file(void *address, size_t bytes, int file, uint64_t offset,
-                    int writable, int copy) {
-#ifdef __EMSCRIPTEN__
-    for (size_t done = 0; done < bytes;) {
-        ssize_t count = pread(file, (uint8_t *)address + done, bytes - done, (off_t)(offset + done));
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return -1;
-        done += (size_t)count;
-    }
-    return 0;
-#else
-    return mmap(address, bytes, PROT_READ | (writable ? PROT_WRITE : 0),
-                MAP_FIXED | (copy ? MAP_PRIVATE : MAP_SHARED), file, (off_t)offset) == MAP_FAILED ? -1 : 0;
-#endif
-}

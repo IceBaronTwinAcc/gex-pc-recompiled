@@ -225,6 +225,9 @@ if(GEX_PLATFORM_RUNTIME STREQUAL "hle")
 endif()
 add_library(gex_host STATIC ${GEX_HOST_SOURCES})
 target_include_directories(gex_host PUBLIC src)
+target_compile_definitions(gex_host PRIVATE
+    GEX_ENABLE_BGFX_RENDERER=$<BOOL:${GEX_ENABLE_BGFX_RENDERER}>
+    GEX_ENABLE_SOFTWARE_RENDERER=$<BOOL:${GEX_ENABLE_SOFTWARE_RENDERER}>)
 if(GEX_HOST_LIBRARIES)
     target_link_libraries(gex_host PRIVATE ${GEX_HOST_LIBRARIES})
 endif()
@@ -318,7 +321,8 @@ else()
     target_link_libraries(gex_host PUBLIC gex_hle)
     add_library(gex_renderer_backend STATIC "${GEX_RENDERER_BACKEND_SOURCE}")
     if(GEX_ENABLE_BGFX_RENDERER)
-        target_sources(gex_renderer_backend PRIVATE src/platform/bgfx/present.c)
+        target_sources(gex_renderer_backend PRIVATE src/platform/bgfx/present.c
+            "${GEX_BGFX_PRESENT_POLICY}")
         target_link_libraries(gex_renderer_backend PRIVATE gex_packet_gpu)
     endif()
     target_link_libraries(gex_renderer_backend PUBLIC gex_renderer gex_hle)
@@ -469,32 +473,11 @@ endif()
 
 target_include_directories(gex_recomp PRIVATE "${PCRECOMP_DIR}/runtime/recomp32")
 target_sources(gex_recomp PRIVATE src/guest_runtime.c src/identity.c src/sha256.c src/graphics_guest.c)
-if(GEX_PLATFORM_WEB)
-    set(GEX_WEB_LOGO "${PROJECT_SOURCE_DIR}/docs/GexRecompLogo.png")
-    set(GEX_WEB_FFMPEG_LICENSE "${GEX_WASM_FFMPEG_ROOT}/licenses/FFmpeg.txt")
-    set_target_properties(gex_recomp PROPERTIES
-        SUFFIX ".html" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/web")
-    set_property(TARGET gex_recomp APPEND PROPERTY LINK_DEPENDS
-        "${PROJECT_SOURCE_DIR}/web/shell.html" "${PROJECT_SOURCE_DIR}/web/gex-pre.js"
-        "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
-        "${PROJECT_SOURCE_DIR}/web/gex-audio.js" "${GEX_WEB_LOGO}"
-        "${GEX_WEB_FFMPEG_LICENSE}")
-    add_custom_command(TARGET gex_recomp POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${PROJECT_SOURCE_DIR}/web/gex-coi-serviceworker.js"
-            "$<TARGET_FILE_DIR:gex_recomp>/gex-coi-serviceworker.js"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${GEX_WEB_LOGO}" "$<TARGET_FILE_DIR:gex_recomp>/GexRecompLogo.png"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "$<TARGET_FILE_DIR:gex_recomp>/licenses"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${GEX_WEB_FFMPEG_LICENSE}"
-            "$<TARGET_FILE_DIR:gex_recomp>/licenses/FFmpeg.txt"
-        VERBATIM)
+if(COMMAND gex_configure_platform_launcher)
+    gex_configure_platform_launcher(gex_recomp)
 endif()
-if(EMSCRIPTEN AND GEX_ENABLE_BGFX_RENDERER)
-    # emdawnwebgpu requires Asyncify for bgfx's TimedWaitAny initialization.
-    target_link_options(gex_recomp PRIVATE -sASYNCIFY=1)
+if(GEX_ENABLE_BGFX_RENDERER AND COMMAND gex_bgfx_platform_launcher)
+    gex_bgfx_platform_launcher(gex_recomp)
 endif()
 target_link_libraries(gex_recomp PRIVATE gex_game gex_renderer gex_host)
 target_link_libraries(gex_recomp PRIVATE gex_packet_gpu)
@@ -561,7 +544,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
             RENAME org.gexrecomp.app.png)
     endforeach()
 endif()
-if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_WEB) AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
+if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_PASSWORD_SAVES) AND GEX_PLATFORM_RUNTIME STREQUAL "hle")
     target_compile_definitions(gex_game PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
     target_compile_definitions(gex_recomp PRIVATE GEX_ENABLE_PASSWORD_SAVES=1)
     add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h"
@@ -570,6 +553,7 @@ if((GEX_PLATFORM_DESKTOP_TESTS OR GEX_PLATFORM_WEB) AND GEX_PLATFORM_RUNTIME STR
             "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h"
         DEPENDS tools/save_menu_assets.py assets/save-menu.bin VERBATIM)
     add_library(gex_saves STATIC src/save_store.c src/save_menu.c src/options_menu.c
+        "${GEX_OPTIONS_PLATFORM_SOURCE}"
         "${CMAKE_CURRENT_BINARY_DIR}/save_menu_art.h")
     target_include_directories(gex_saves PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(gex_saves PUBLIC gex_host gex_renderer)

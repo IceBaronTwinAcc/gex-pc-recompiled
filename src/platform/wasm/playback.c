@@ -1,12 +1,12 @@
 #include <stdio.h>
 #include "platform/audio.h"
 #include "platform/runtime.h"
-#include "platform/wasm/playback.h"
+#include "platform/host.h"
 #include "win32hle.h"
 
 extern int gex_web_audio_playback_ready(void);
 
-int gex_wasm_prepare_playback(void) {
+int gex_host_prepare_playback(void) {
     if (!gex_audio_open()) {
         fprintf(stderr, "[audio] cannot prepare browser playback\n");
         return -1;

@@ -12,6 +12,24 @@ RUNTIME_SOURCES = re.findall(
 
 
 class PlatformBoundaryTests(unittest.TestCase):
+    def test_wasm_runtime_sources_keep_browser_code_in_wasm_backend(self):
+        forbidden = re.compile(
+            r"__EMSCRIPTEN__|<emscripten(?:/|\.h)|\b(?:emscripten_\w+|"
+            r"EM_ASM\w*|EM_JS|EM_ASYNC_JS|MAIN_THREAD_\w+)\b"
+        )
+        sources = list(ROOT.joinpath("src").glob("*.[ch]"))
+        sources += list(ROOT.joinpath("src/platform").rglob("*.[ch]"))
+        for source in sources:
+            if source.is_relative_to(ROOT / "src/platform/wasm"):
+                continue
+            with self.subTest(path=source.relative_to(ROOT)):
+                self.assertIsNone(forbidden.search(source.read_text()))
+        for source in ("CMakeLists.txt", "cmake/bgfx.cmake"):
+            with self.subTest(path=source):
+                text = ROOT.joinpath(source).read_text()
+                for token in ("EMSCRIPTEN", "GEX_PLATFORM_WEB", "GEX_WASM_", "/web/"):
+                    self.assertNotIn(token, text)
+
     def test_shared_sources_have_no_platform_dependencies(self):
         forbidden = re.compile(
             r"#\s*include\s*[<\"](?:SDL|AL/|al\.h|alc\.h|alext\.h|dsound\.h|windows\.h|bcrypt\.h|libav|libsw|"

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "platform/bgfx/backend.h"
+#include "platform/bgfx/present_policy.h"
 #include "packet_gpu.h"
 #include "win32hle.h"
 #include "platform/desktop/app_icon.h"
@@ -49,11 +50,7 @@ static int configure(const gex_render_frame *frame, char *error, size_t size) {
 static int present(const gex_render_frame *frame, char *error, size_t size) {
     int width = frame->width, height = frame->height;
     if (window) {
-#ifdef __EMSCRIPTEN__
-        width = window_width; height = window_height;
-#else
-        SDL_GetWindowSizeInPixels(window, &width, &height);
-#endif
+        gex_bgfx_window_size(window, window_width, window_height, &width, &height);
     }
     return gex_bgfx_present(frame, width, height, error, size);
 }
@@ -65,20 +62,14 @@ static int pump(char *error, size_t size) {
 }
 
 static void shutdown_renderer(void) {
-#ifndef __EMSCRIPTEN__
-    gex_packet_gpu_shutdown_bgfx();
-#endif
+    gex_bgfx_before_window_close();
     hle_gdi_window_surface(NULL, 0, 0, 0, 0);
     hle_screen_close();
     SDL_DestroyWindow(window);
     window = NULL;
     if (video) SDL_QuitSubSystem(SDL_INIT_VIDEO);
     video = 0;
-#ifdef __EMSCRIPTEN__
-    /* SDL can queue canvas resizes during shutdown; its owning worker must
-     * remain alive until the window and video subsystem have been destroyed. */
-    gex_packet_gpu_shutdown_bgfx();
-#endif
+    gex_bgfx_after_window_close();
 }
 
 const gex_renderer_backend *gex_bgfx_renderer(void) {

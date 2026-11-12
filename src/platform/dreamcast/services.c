@@ -33,6 +33,11 @@ static void show_vmu_image(maple_device_t *dev) {
 
 int gex_host_skip_movies_by_default(void) { return 0; }
 int gex_host_prepare_playback(void) { return 0; }
+int gex_host_renderer_preference(int renderer, int explicit_renderer) {
+    (void)explicit_renderer;
+    return renderer;
+}
+void (*gex_host_game_exit_callback(void))(int code) { return NULL; }
 
 int gex_host_settings_path(char *path, size_t size) {
     if (size) path[0] = 0;

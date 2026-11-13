@@ -9,6 +9,15 @@ typedef struct {
     unsigned layer, flipped, bytes;
 } map_command;
 
+typedef struct {
+    uint32_t begin[2], end[2];
+    unsigned count;
+} map_reservations;
+
+typedef struct {
+    uint32_t begin, end;
+} map_allocation;
+
 static int read_bytes(const gex_gpu_guest_io *io, uint32_t address, void *out, size_t size) {
     if (!address || size > UINT32_MAX - address) return -1;
     return io->read(io->context, address, out, size);
@@ -56,21 +65,47 @@ static void write16(const gex_gpu_guest_io *io, uint32_t address, uint16_t value
 }
 
 static int reserve(uint32_t begin, uint32_t end, uint32_t *cursor, uint32_t bytes,
-                   const uint32_t tails[4], map_command *commands, size_t count,
+                   const uint32_t tails[4], map_reservations *reservations,
                    uint32_t *address) {
     uint32_t position = *cursor;
-    if (end - position < bytes) position = begin;
+    if (end - position < bytes) {
+        position = begin;
+        /* The callback cannot identify a wrap if next reaches the old cursor. */
+        if (position + bytes >= *cursor) return -1;
+    }
     for (unsigned i = 0; i < 4; ++i)
         if (tails[i] >= position && tails[i] < position + bytes) return -1;
-    for (size_t i = 0; i < count; ++i) {
-        uint32_t other = commands[i].sprite;
-        if (position < other + commands[i].bytes && other < position + bytes) return -1;
-        other = commands[i].page_packet;
-        if (other && position < other + 24 && other < position + bytes) return -1;
+    for (unsigned i = 0; i < reservations->count; ++i)
+        if (position < reservations->end[i] && reservations->begin[i] < position + bytes)
+            return -1;
+    /* Sequential reservations can form only one run on each side of a wrap. */
+    if (reservations->count && reservations->end[reservations->count - 1] == position)
+        reservations->end[reservations->count - 1] = position + bytes;
+    else {
+        if (reservations->count == 2) return -1;
+        unsigned i = reservations->count++;
+        reservations->begin[i] = position;
+        reservations->end[i] = position + bytes;
     }
     *address = position;
     *cursor = position + bytes;
     return 0;
+}
+
+static void retire_chunk_allocation(const gex_gpu_guest_io *io,
+                                    const map_allocation *allocations, size_t count,
+                                    size_t index, size_t *batch_end, uint32_t *cursor) {
+    if (index == *batch_end) {
+        size_t end = index + 1;
+        /* A wrapped callback is recognized only while next remains below cursor. */
+        int wrapped = allocations[index].end < *cursor;
+        while (end < count && allocations[end].begin == allocations[end - 1].end &&
+               (!wrapped || allocations[end].end < *cursor))
+            ++end;
+        io->allocated(io->context, allocations[end - 1].end);
+        *batch_end = end;
+    }
+    *cursor = allocations[index].end;
 }
 
 int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
@@ -98,6 +133,10 @@ int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
 
     gex_map_tile tiles[GEX_MAP_TILE_LIMIT];
     map_command commands[GEX_MAP_TILE_LIMIT];
+    map_reservations reservations = {0};
+    map_allocation allocations[GEX_MAP_TILE_LIMIT * 2];
+    size_t allocation_count = 0;
+    uint32_t committed_cursor = cursor;
     size_t count;
     if (gex_dreamcast_map_plan(io->read, io->context, chunk, table, definitions,
                                 x, y, (int16_t)screen_x, (int16_t)screen_y,
@@ -128,8 +167,10 @@ int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
         cmd->bytes = cmd->flipped ? 80 : 40;
         cmd->page_packet = 0;
         if (end - begin < cmd->bytes ||
-            reserve(begin, end, &cursor, cmd->bytes, tails, commands, i, &cmd->sprite) ||
+            reserve(begin, end, &cursor, cmd->bytes, tails, &reservations, &cmd->sprite) ||
             read32(io, cmd->sprite, &cmd->link)) return 0;
+        allocations[allocation_count++] =
+            (map_allocation){cmd->sprite, cmd->sprite + cmd->bytes};
         if (cmd->flipped) {
             if (read_bytes(io, cmd->sprite, cmd->quad, sizeof cmd->quad)) return 0;
             int offset_x = (int16_t)word(header + 4), offset_y = (int16_t)word(header + 6);
@@ -152,19 +193,23 @@ int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
             put16(cmd->quad + 22, cmd->page);
             last_page[cmd->layer] = cmd->page;
         } else if (last_page[cmd->layer] != cmd->page) {
-            if (reserve(begin, end, &cursor, 24, tails, commands, i, &cmd->page_packet) ||
+            if (reserve(begin, end, &cursor, 24, tails, &reservations, &cmd->page_packet) ||
                 read32(io, cmd->page_packet + 8, &cmd->page_padding))
                 return 0;
             if (cmd->page_packet < cmd->sprite + 40 && cmd->sprite < cmd->page_packet + 24)
                 return 0;
+            allocations[allocation_count++] =
+                (map_allocation){cmd->page_packet, cmd->page_packet + 24};
             last_page[cmd->layer] = cmd->page;
         }
     }
+    size_t allocation_index = 0, batch_end = 0;
     for (size_t i = 0; i < count; ++i) {
         map_command *cmd = &commands[i];
         unsigned list = cmd->layer * 2;
         if (cmd->flipped) {
-            io->allocated(io->context, cmd->sprite + 80);
+            retire_chunk_allocation(io, allocations, allocation_count, allocation_index++,
+                                    &batch_end, &committed_cursor);
             write32(io, 0x4a2ae4, cmd->sprite + 80);
             io->write(io->context, cmd->sprite + 4, cmd->quad + 4, 36);
             io->write(io->context, cmd->sprite + 40, cmd->quad, 40);
@@ -191,7 +236,8 @@ int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
         put16(sprite + 12, cmd->uv);
         put16(sprite + 16, cmd->width);
         put16(sprite + 18, cmd->height);
-        io->allocated(io->context, cmd->sprite + 40);
+        retire_chunk_allocation(io, allocations, allocation_count, allocation_index++,
+                                &batch_end, &committed_cursor);
         write32(io, 0x4a2ae4, cmd->sprite + 40);
         io->write(io->context, cmd->sprite + 4, sprite + 4, 16);
         io->write(io->context, cmd->sprite + 20, sprite, sizeof sprite);
@@ -200,7 +246,8 @@ int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
         io->write(io->context, cmd->sprite + 28, sprite + 8, 4);
         if (cmd->page_packet) {
             uint32_t page_word = 0xe1000200u + (cmd->page & 0x1ffu);
-            io->allocated(io->context, cmd->page_packet + 24);
+            retire_chunk_allocation(io, allocations, allocation_count, allocation_index++,
+                                    &batch_end, &committed_cursor);
             write32(io, 0x4a2ae4, cmd->page_packet + 24);
             write32(io, cmd->page_packet + 20, cmd->page_padding);
             for (unsigned copy = 0; copy < 2; ++copy) {
@@ -367,6 +414,7 @@ int gex_dreamcast_map_unflipped_cel(const gex_gpu_guest_io *io,
         end - begin < 40 || !tails[0] || !tails[1]) return 0;
 
     map_command commands[LIMIT];
+    map_reservations reservations = {0};
     uint8_t sprites[LIMIT][20], pages[LIMIT][12];
     uint32_t atlas = draw->atlas;
     size_t count = 0;
@@ -391,10 +439,10 @@ int gex_dreamcast_map_unflipped_cel(const gex_gpu_guest_io *io,
         if (!(draw->tint & 1)) cmd->page |= 0x20;
         cmd->page_packet = 0;
         cmd->bytes = 40;
-        if (reserve(begin, end, &cursor, 40, tails, commands, count, &cmd->sprite) ||
+        if (reserve(begin, end, &cursor, 40, tails, &reservations, &cmd->sprite) ||
             read_bytes(io, cmd->sprite, sprites[count], 20)) return 0;
         if (last_page != cmd->page) {
-            if (reserve(begin, end, &cursor, 24, tails, commands, count, &cmd->page_packet) ||
+            if (reserve(begin, end, &cursor, 24, tails, &reservations, &cmd->page_packet) ||
                 (cmd->page_packet < cmd->sprite + 40 &&
                  cmd->sprite < cmd->page_packet + 24) ||
                 read_bytes(io, cmd->page_packet, pages[count], 12)) return 0;

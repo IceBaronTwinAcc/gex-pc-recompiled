@@ -11,6 +11,8 @@ enum { MEMORY_SIZE = 0x4b0000, OBJECT = 0x10000, CEL = 0x11000,
 
 static uint8_t memory[MEMORY_SIZE];
 static unsigned submissions, matches;
+static unsigned allocation_count;
+static uint32_t allocation_begin[4], allocation_end[4];
 static uint16_t rendered[4];
 static float rendered_x, rendered_y;
 static uint64_t rendered_id;
@@ -58,6 +60,11 @@ static void allocated(void *context, uint32_t next) {
     (void)context;
     uint32_t begin = get32(0x4a2ae4);
     if (next < begin) begin = get32(0x4a2ae0);
+    if (allocation_count < 4) {
+        allocation_begin[allocation_count] = begin;
+        allocation_end[allocation_count] = next;
+    }
+    ++allocation_count;
     gex_dreamcast_title_forget(begin, next);
 }
 
@@ -105,6 +112,7 @@ static int submit_backdrop(void *target, const gex_gpu_vertex q[4],
 
 static void setup(void) {
     memset(memory, 0, sizeof memory);
+    allocation_count = 0;
     put32(CEL + 0x18, LIST);
     put32(LIST, PART);
     put32(PART + 8, IMAGE);
@@ -221,6 +229,74 @@ int main(void) {
            get32(TAIL1) == 0);
     gex_dreamcast_title_reset();
     setup();
+    put32(0x4a2adc, ARENA + 80);
+    for (unsigned i = 0; i < 3; ++i)
+        assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(0x4a2ae4, ARENA + 64);
+    put32(0x4a2b18, TAIL0);
+    put32(0x4a2b14, TAIL1);
+    put32(LIST + 4, PART + 32);
+    put32(LIST + 8, PART + 64);
+    memcpy(memory + PART + 32, memory + PART, 20);
+    memcpy(memory + PART + 64, memory + PART, 20);
+    put16(PALETTE + 2, 0x7c00);
+    allocation_count = 0;
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    assert(allocation_count == 2 &&
+           allocation_begin[0] == ARENA + 64 && allocation_end[0] == ARENA + 80 &&
+           allocation_begin[1] == ARENA && allocation_end[1] == ARENA + 32);
+    assert(get32(TAIL0) == ARENA + 64 && get32(ARENA + 64) == ARENA &&
+           get32(ARENA) == ARENA + 16 && get32(0x4a2ae4) == ARENA + 32);
+    assert(gex_dreamcast_title_packet(NULL, ARENA + 32, memory + ARENA + 32, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0xfc00);
+    assert(gex_dreamcast_title_packet(NULL, ARENA, memory + ARENA, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0x801f);
+    gex_dreamcast_title_reset();
+    setup();
+    put32(0x4a2adc, ARENA + 80);
+    for (unsigned i = 0; i < 5; ++i)
+        assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(0x4a2ae4, ARENA + 72);
+    put32(0x4a2b18, TAIL0);
+    put32(0x4a2b14, TAIL1);
+    for (unsigned i = 1; i < 5; ++i) put32(LIST + i * 4, PART);
+    put16(PALETTE + 2, 0x7c00);
+    allocation_count = 0;
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    assert(allocation_count == 2 &&
+           allocation_begin[0] == ARENA && allocation_end[0] == ARENA + 64 &&
+           allocation_begin[1] == ARENA + 64 && allocation_end[1] == ARENA + 80);
+    for (unsigned i = 0; i < 5; ++i) {
+        assert(gex_dreamcast_title_packet(NULL, ARENA + i * 16,
+                                          memory + ARENA + i * 16, &state,
+                                          submit, error, sizeof error) == 1);
+        assert(rendered[0] == 0x801f);
+    }
+    gex_dreamcast_title_reset();
+    setup();
+    put32(0x4a2adc, ARENA + 72);
+    for (unsigned i = 0; i < 4; ++i)
+        assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(0x4a2ae4, ARENA + 64);
+    put32(0x4a2b18, TAIL0);
+    put32(0x4a2b14, TAIL1);
+    for (unsigned i = 1; i < 4; ++i) put32(LIST + i * 4, PART);
+    put16(PALETTE + 2, 0x7c00);
+    allocation_count = 0;
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    assert(allocation_count == 2 &&
+           allocation_begin[0] == ARENA && allocation_end[0] == ARENA + 48 &&
+           allocation_begin[1] == ARENA + 48 && allocation_end[1] == ARENA + 64);
+    for (unsigned i = 0; i < 4; ++i) {
+        assert(gex_dreamcast_title_packet(NULL, ARENA + i * 16,
+                                          memory + ARENA + i * 16, &state,
+                                          submit, error, sizeof error) == 1);
+        assert(rendered[0] == 0x801f);
+    }
+    gex_dreamcast_title_reset();
+    setup();
     assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
     unsigned previous_matches = matches;
     put16(PALETTE + 2, 0x7c00);
@@ -252,6 +328,35 @@ int main(void) {
     assert(gex_dreamcast_title_packet(NULL, ARENA + 32, memory + ARENA + 32, &state,
                                       submit, error, sizeof error) == 1);
     assert(rendered[0] == 0x83e0);
+    gex_dreamcast_title_reset();
+    setup();
+    enum { COLLISION_IMAGE = 0x50000 };
+    uint32_t collision = COLLISION_IMAGE + 0x100;
+    unsigned bucket = (COLLISION_IMAGE * UINT32_C(2654435761)) >> 24;
+    while ((collision * UINT32_C(2654435761) >> 24) != bucket)
+        collision += 0x100;
+    assert(collision + 52 < MEMORY_SIZE);
+    memcpy(memory + COLLISION_IMAGE, memory + IMAGE, 52);
+    memcpy(memory + collision, memory + IMAGE, 52);
+    memory[collision + 44] = 0x22;
+    put32(PART + 8, COLLISION_IMAGE);
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(PART + 8, collision);
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(PART + 8, COLLISION_IMAGE);
+    put16(PALETTE + 2, 0x7c00);
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_packet(NULL, ARENA, memory + ARENA, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0xfc00);
+    assert(gex_dreamcast_title_packet(NULL, ARENA + 16, memory + ARENA + 16, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0x83e0);
+    gex_dreamcast_title_forget(ARENA, ARENA + 32);
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_packet(NULL, ARENA + 48, memory + ARENA + 48, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0x801f);
     gex_dreamcast_title_reset();
     setup();
     memory[IMAGE + 16] = 2;
@@ -315,6 +420,8 @@ int main(void) {
     memory[0x4a2af9] = 0x20;
     memory[0x4a2afa] = 0x30;
     assert(gex_dreamcast_backdrop_record(&io, 49, error, sizeof error) == 1);
+    assert(allocation_count == 1 && allocation_begin[0] == ARENA &&
+           allocation_end[0] == ARENA + 40 * 16);
     assert(get32(0x4a2ae4) == ARENA + 40 * 16);
     uint32_t first = get32(TAIL0), second = get32(TAIL1);
     memset(memory + BACKDROP + 28, 0x22, 64 * 32 / 2);
@@ -349,6 +456,20 @@ int main(void) {
     assert(get32(0x4a2ae4) == ARENA);
     assert(gex_dreamcast_map_cel_record(&io, 49, OBJECT, CEL, error, sizeof error) == 1);
     assert(get32(0x4a2ae4) == ARENA + 16);
+    gex_dreamcast_title_reset();
+    for (unsigned count = 16; count <= 17; ++count) {
+        setup();
+        for (unsigned i = 0; i < count; ++i) put32(LIST + i * 4, PART);
+        assert(gex_dreamcast_map_cel_record(&io, 49, OBJECT, CEL, error, sizeof error) == 1);
+        assert(get32(0x4a2ae4) == ARENA + count * 16);
+        assert(get32(TAIL0) == ARENA && get32(ARENA + (count - 2) * 16) ==
+               ARENA + (count - 1) * 16);
+        gex_dreamcast_title_reset();
+    }
+    setup();
+    for (unsigned i = 0; i < 513; ++i) put32(LIST + i * 4, PART);
+    assert(!gex_dreamcast_map_cel_record(&io, 49, OBJECT, CEL, error, sizeof error));
+    assert(get32(0x4a2ae4) == ARENA && !get32(TAIL0) && !get32(TAIL1));
     gex_dreamcast_title_reset();
     return 0;
 }

@@ -174,7 +174,9 @@ if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
     target_include_directories(gex_map_plan_test PRIVATE src)
     add_test(NAME dreamcast-map-plan COMMAND gex_map_plan_test)
     add_executable(gex_map_draw_test tests/dreamcast_map_draw.c
-        src/platform/dreamcast/map_plan.c src/platform/dreamcast/map_draw.c)
+        src/platform/dreamcast/map_plan.c src/platform/dreamcast/map_draw.c
+        src/platform/dreamcast/title_cel.c src/platform/dreamcast/title_layout.c
+        src/platform/dreamcast/title_plan.c src/platform/dreamcast/title_draw.c)
     target_include_directories(gex_map_draw_test PRIVATE src)
     add_test(NAME dreamcast-map-draw COMMAND gex_map_draw_test)
 endif()

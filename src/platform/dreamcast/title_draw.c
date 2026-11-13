@@ -7,7 +7,7 @@
 
 enum { TITLE_PART_LIMIT = 512, TITLE_STORAGE_LIMIT = 2 * 1024 * 1024,
        TITLE_MARKER_SIZE = 8, TITLE_PAIR_SIZE = 16, TITLE_OPCODE = 0x7f,
-       TITLE_BUCKETS = 4096 };
+       TITLE_BUCKETS = 4096, TITLE_ASSET_BUCKETS = 256, MAP_LOCAL_PARTS = 16 };
 
 typedef struct {
     uint8_t modulation[1024];
@@ -25,6 +25,7 @@ typedef struct title_asset {
     unsigned references, variants, backdrop;
     struct title_asset *owner;
     struct title_asset *next;
+    struct title_asset *indexed_next;
 } title_asset;
 
 typedef struct title_draw title_draw;
@@ -43,9 +44,22 @@ struct title_draw {
 };
 
 static title_asset *assets;
+static title_asset *asset_index[TITLE_ASSET_BUCKETS];
 static title_marker *markers[TITLE_BUCKETS];
 static size_t storage;
 static uint64_t next_image_id;
+
+static unsigned asset_bucket(uint32_t image) {
+    return (image * UINT32_C(2654435761)) >> 24;
+}
+
+static void insert_asset(title_asset *asset) {
+    unsigned bucket = asset_bucket(asset->image.image_address);
+    asset->next = assets;
+    assets = asset;
+    asset->indexed_next = asset_index[bucket];
+    asset_index[bucket] = asset;
+}
 
 static int make_room(size_t bytes) {
     for (title_asset *asset = assets;
@@ -146,6 +160,9 @@ static void discard_asset(title_asset *asset) {
     title_asset **link = &assets;
     while (*link != asset) link = &(*link)->next;
     *link = asset->next;
+    link = &asset_index[asset_bucket(asset->image.image_address)];
+    while (*link != asset) link = &(*link)->indexed_next;
+    *link = asset->indexed_next;
     storage -= asset->bytes;
     free(asset->colors);
     if (!variant) gex_title_cel_release(&asset->image);
@@ -233,7 +250,8 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
         end <= begin || cursor < begin || cursor > end ||
         !tails[0] || !tails[1]) return 0;
 
-    gex_title_part *parts = malloc(TITLE_PART_LIMIT * sizeof *parts);
+    gex_title_part local_parts[MAP_LOCAL_PARTS];
+    gex_title_part *parts = map ? local_parts : malloc(TITLE_PART_LIMIT * sizeof *parts);
     if (!parts) return fail(error, size, "cannot allocate title draw plan");
     size_t count = 0;
     int status;
@@ -256,10 +274,17 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
     } else {
         status = gex_title_plan(io->read, io->context, object, cel,
                                 camera_x, camera_y, frame, screen_x, screen_y, 320, 240,
-                                parts, TITLE_PART_LIMIT, &count);
+                                parts, map ? MAP_LOCAL_PARTS : TITLE_PART_LIMIT, &count);
+        if (map && status == GEX_TITLE_PLAN_CAPACITY) {
+            parts = malloc(TITLE_PART_LIMIT * sizeof *parts);
+            if (!parts) return fail(error, size, "cannot allocate title draw plan");
+            status = gex_title_plan(io->read, io->context, object, cel,
+                                    camera_x, camera_y, frame, screen_x, screen_y, 320, 240,
+                                    parts, TITLE_PART_LIMIT, &count);
+        }
     }
     if (status != GEX_TITLE_PLAN_OK || count * TITLE_PAIR_SIZE > end - begin) {
-        free(parts);
+        if (parts != local_parts) free(parts);
         return 0;
     }
     title_draw *pending = NULL, **tail = &pending;
@@ -283,7 +308,8 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
             }
         title_asset *asset = backdrop_asset;
         if (!asset)
-            for (asset = assets; asset; asset = asset->next)
+            for (asset = asset_index[asset_bucket(parts[i].image)]; asset;
+                 asset = asset->indexed_next)
                 if (asset->owner == asset && asset->backdrop == (unsigned)backdrop &&
                     asset->image.image_address == parts[i].image &&
                     (backdrop ? matches_backdrop(io, &asset->image) :
@@ -297,7 +323,8 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                 read_bytes(io, parts[i].palette, palette, palette_size))) {
                 status = 0; goto rollback;
             }
-            for (asset = assets; asset; asset = asset->next)
+            for (asset = asset_index[asset_bucket(owner->image.image_address)]; asset;
+                 asset = asset->indexed_next)
                 if (asset->owner == owner &&
                     !memcmp(asset->image.palette, palette, palette_size)) break;
             if (!asset) {
@@ -306,11 +333,11 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                 if (!asset) { status = -1; goto rollback; }
                 *asset = (title_asset){.image = owner->image, .bytes = sizeof *asset,
                                        .backdrop = owner->backdrop,
-                                       .owner = owner, .next = assets};
+                                       .owner = owner};
                 if (palette_size) memcpy(asset->image.palette, palette, palette_size);
                 asset->image.palette_address = parts[i].palette;
                 ++owner->variants;
-                assets = asset;
+                insert_asset(asset);
                 storage += sizeof *asset;
             }
         }
@@ -343,9 +370,9 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                     status = -1; goto rollback;
                 }
                 *asset = (title_asset){.image = snapshot, .bytes = bytes,
-                                       .backdrop = (unsigned)backdrop, .next = assets};
+                                       .backdrop = (unsigned)backdrop};
                 asset->owner = asset;
-                assets = asset;
+                insert_asset(asset);
                 storage += bytes;
             }
         }
@@ -375,28 +402,39 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
         tail = &draw->next;
         position += TITLE_PAIR_SIZE;
     }
-    free(parts);
+    if (parts != local_parts) free(parts);
     while (pending) {
-        title_draw *draw = pending;
-        pending = pending->next;
-        uint32_t next = draw->marker[0].address + TITLE_PAIR_SIZE;
-        io->allocated(io->context, next);
-        write32(io, 0x4a2ae4, next);
-        for (unsigned i = 0; i < 2; ++i) {
-            title_marker *marker = &draw->marker[i];
-            write32(io, marker->address, 0x00ffffffu);
-            write32(io, marker->address + 4, (draw->rgb & 0xffffffu) | TITLE_OPCODE << 24);
-            write32(io, tails[i], marker->address);
-            tails[i] = marker->address;
-            write32(io, i ? 0x4a2b14 : 0x4a2b18, tails[i]);
-            unsigned bucket = (marker->address >> 2) * 2654435761u >> 20;
-            marker->next = markers[bucket];
-            markers[bucket] = marker;
-        }
+        title_draw *end = pending;
+        /* The allocation callback detects a wrap only when next < cursor. */
+        int wrapped = end->marker[0].address + TITLE_PAIR_SIZE < cursor;
+        while (end->next && end->next->marker[0].address ==
+                            end->marker[0].address + TITLE_PAIR_SIZE &&
+               (!wrapped || end->next->marker[0].address + TITLE_PAIR_SIZE < cursor))
+            end = end->next;
+        title_draw *after = end->next;
+        io->allocated(io->context, end->marker[0].address + TITLE_PAIR_SIZE);
+        do {
+            title_draw *draw = pending;
+            pending = pending->next;
+            uint32_t next = draw->marker[0].address + TITLE_PAIR_SIZE;
+            write32(io, 0x4a2ae4, next);
+            cursor = next;
+            for (unsigned i = 0; i < 2; ++i) {
+                title_marker *marker = &draw->marker[i];
+                write32(io, marker->address, 0x00ffffffu);
+                write32(io, marker->address + 4, (draw->rgb & 0xffffffu) | TITLE_OPCODE << 24);
+                write32(io, tails[i], marker->address);
+                tails[i] = marker->address;
+                write32(io, i ? 0x4a2b14 : 0x4a2b18, tails[i]);
+                unsigned bucket = (marker->address >> 2) * 2654435761u >> 20;
+                marker->next = markers[bucket];
+                markers[bucket] = marker;
+            }
+        } while (pending != after);
     }
     return 1;
 rollback:
-    free(parts);
+    if (parts != local_parts) free(parts);
     release_pending(pending);
     return status < 0 ? fail(error, size, "cannot allocate title image snapshot") : 0;
 }

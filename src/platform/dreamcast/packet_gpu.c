@@ -122,6 +122,11 @@ typedef struct transient_texture {
     unsigned direct_width, direct_height, direct_passes;
     uint32_t direct_hash;
     struct transient_texture *next;
+    struct transient_texture *title_next;
+    struct transient_texture *snapshot_next;
+    unsigned snapshot_bucket;
+    pvr_poly_hdr_t image_header[2];
+    unsigned image_header_valid[2];
 } transient_texture;
 typedef struct transient_pin {
     transient_texture *texture;
@@ -187,6 +192,8 @@ static uint64_t atlas_write_epoch;
 static size_t retained_snapshot_bytes;
 static size_t retained_title_bytes;
 static transient_texture *transients;
+static transient_texture *title_textures[256];
+static transient_texture *snapshot_textures[256];
 static transient_pin *active_transient_pin;
 static unsigned previous_scheduler_hz;
 static target *last_presented;
@@ -199,9 +206,31 @@ static int transient_pinned(const transient_texture *t) {
     return 0;
 }
 
+static unsigned title_texture_bucket(uint64_t id) {
+    uint32_t key = (uint32_t)id ^ (uint32_t)(id >> 32);
+    return (key * UINT32_C(2654435761)) >> 24;
+}
+
+static unsigned snapshot_texture_bucket(unsigned page, unsigned clut, unsigned alpha,
+                                        unsigned left, unsigned top, unsigned dimension) {
+    uint32_t key = page * 33u ^ clut * 65599u ^ alpha * 97u ^
+                   left * 257u ^ top * 4099u ^ dimension * 17u;
+    return (key * UINT32_C(2654435761)) >> 24;
+}
+
 static void free_transient(transient_texture **link) {
     transient_texture *t = *link;
     *link = t->next;
+    if (t->title_id) {
+        transient_texture **entry = &title_textures[title_texture_bucket(t->title_id)];
+        while (*entry != t) entry = &(*entry)->title_next;
+        *entry = t->title_next;
+    }
+    if (t->snapshot_bucket) {
+        transient_texture **entry = &snapshot_textures[t->snapshot_bucket - 1];
+        while (*entry != t) entry = &(*entry)->snapshot_next;
+        *entry = t->snapshot_next;
+    }
     retained_snapshot_bytes -= t->retained_bytes;
     if (t->title_id) retained_title_bytes -= t->retained_bytes;
     cache_bytes -= t->retained_bytes;
@@ -837,6 +866,17 @@ static void context(pvr_poly_cxt_t *c, pvr_ptr_t image, int format, int w, int h
     c->blend.src = PVR_BLEND_SRCALPHA;
     c->blend.dst = PVR_BLEND_INVSRCALPHA;
     if (image) c->txr.env = PVR_TXRENV_MODULATEALPHA;
+}
+
+static void transient_header(transient_texture *texture, unsigned pass,
+                             unsigned width, unsigned height, pvr_poly_hdr_t *header) {
+    if (!texture->image_header_valid[pass]) {
+        pvr_poly_cxt_t c;
+        context(&c, texture->image[pass], PVR_TXRFMT_ARGB1555, width, height);
+        pvr_poly_compile(&texture->image_header[pass], &c);
+        texture->image_header_valid[pass] = 1;
+    }
+    *header = texture->image_header[pass];
 }
 
 static void vertices(pvr_vertex_t v[4], float x, float y, float w, float h,
@@ -1558,30 +1598,48 @@ static unsigned sampled_color(const gex_gpu_material *m, unsigned u, unsigned v)
     return word(m->atlas + ((m->clut * 32 + index * 2) & 0xffffe));
 }
 
+static void snapshot_bounds(unsigned u0, unsigned u1, unsigned v0, unsigned v1,
+                            unsigned *left, unsigned *top, unsigned *dimension) {
+    *dimension = 8;
+    *left = u0;
+    *top = v0;
+    while (*dimension < u1 - u0 || *dimension < v1 - v0) *dimension *= 2;
+    if (*left + *dimension > 256) *left = 256 - *dimension;
+    if (*top + *dimension > 256) *top = 256 - *dimension;
+}
+
+static transient_texture *find_snapshot(const gex_gpu_material *m,
+                                        unsigned left, unsigned top, unsigned dimension,
+                                        const uint32_t zero_mask[8]) {
+    if (m->atlas != tracked_atlas || !active_transient_pin) return NULL;
+    unsigned bucket = snapshot_texture_bucket(m->page, m->clut, m->opcode & 2,
+                                              left, top, dimension);
+    for (transient_texture *t = snapshot_textures[bucket]; t; t = t->snapshot_next)
+        if (t->atlas == m->atlas && t->epoch == atlas_write_epoch &&
+            t->page == m->page && t->clut == m->clut &&
+            t->alpha == (m->opcode & 2) && t->origin_u == left &&
+            t->origin_v == top && t->dimension == dimension &&
+            !memcmp(t->zero_mask, zero_mask, sizeof t->zero_mask)) {
+            t->used = ++cache_clock;
+            active_transient_pin->texture = t;
+            return t;
+        }
+    return NULL;
+}
+
 static transient_texture *snapshot_texture(const gex_gpu_material *m,
                                            unsigned u0, unsigned u1,
                                            unsigned v0, unsigned v1,
                                            const uint32_t zero_mask[8],
                                            char *error, size_t size) {
-    unsigned dimension = 8, left = u0, top = v0;
-    while (dimension < u1 - u0 || dimension < v1 - v0) dimension *= 2;
-    if (left + dimension > 256) left = 256 - dimension;
-    if (top + dimension > 256) top = 256 - dimension;
+    unsigned dimension, left, top;
+    snapshot_bounds(u0, u1, v0, v1, &left, &top, &dimension);
     if (!active_transient_pin) {
         fail(error, size, "PVR converted texture has no submission scope");
         return NULL;
     }
-    if (m->atlas == tracked_atlas)
-        for (transient_texture *t = transients; t; t = t->next)
-            if (t->atlas == m->atlas && t->epoch == atlas_write_epoch &&
-                t->page == m->page && t->clut == m->clut &&
-                t->alpha == (m->opcode & 2) && t->origin_u == left &&
-                t->origin_v == top && t->dimension == dimension &&
-                !memcmp(t->zero_mask, zero_mask, sizeof t->zero_mask)) {
-                t->used = ++cache_clock;
-                active_transient_pin->texture = t;
-                return t;
-            }
+    transient_texture *existing = find_snapshot(m, left, top, dimension, zero_mask);
+    if (existing) return existing;
     transient_texture *t = calloc(1, sizeof *t);
     if (!t) {
         fail(error, size, "cannot allocate PVR converted texture record");
@@ -1667,6 +1725,11 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
         retained_snapshot_bytes += storage;
         cache_bytes += storage;
     }
+    unsigned bucket = snapshot_texture_bucket(t->page, t->clut, t->alpha,
+                                              t->origin_u, t->origin_v, t->dimension);
+    t->snapshot_next = snapshot_textures[bucket];
+    t->snapshot_bucket = bucket + 1;
+    snapshot_textures[bucket] = t;
     WORK(snapshots, 1);
     return t;
 }
@@ -2316,6 +2379,15 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     uint32_t zero_mask[8] = {0};
     int masked = 0;
     unsigned format = m->page >> 7 & 3;
+    if (format == 2 && !(m->opcode & 2)) {
+        unsigned left, top, dimension;
+        snapshot_bounds(u0, u1, v0, v1, &left, &top, &dimension);
+        t->converted = find_snapshot(m, left, top, dimension, zero_mask);
+        if (t->converted) {
+            *bank = 0;
+            return 0;
+        }
+    }
     if (format < 2) {
         /* Software discards indexed colors after modulation, but PVR applies
          * tint after palette lookup. Preserve those discarded indices in alpha. */
@@ -2952,10 +3024,13 @@ static uint32_t polygon_header(const gex_gpu_material *m, draw_texture tx, int b
     if (tx.region) fmt = tx.region->group == SHARED_GROUPS ? PVR_TXRFMT_ARGB1555 :
                         PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank);
     unsigned image = pass + (tx.page && tx.page->raw && (m->opcode & 2) ? 1 : 0);
-    if (textured && !tx.converted && tx.region &&
+    if (textured && tx.converted) {
+        transient_header(tx.converted, pass, tx.converted->dimension,
+                         tx.converted->dimension, header);
+    } else if (textured && tx.region &&
         tx.region->header_format == fmt) {
         *header = tx.region->header;
-    } else if (textured && !tx.converted && tx.page &&
+    } else if (textured && tx.page &&
                tx.page->header_valid[image] && tx.page->header_format[image] == fmt) {
         *header = tx.page->header[image];
     } else {
@@ -3874,7 +3949,8 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
     size_t count = (size_t)image->width * image->height;
     uint32_t hash = title_id ? 0 : direct_image_hash(image, passes);
     transient_texture *texture = NULL;
-    for (transient_texture *t = transients; t; t = t->next)
+    for (transient_texture *t = title_id ? title_textures[title_texture_bucket(title_id)] : transients;
+         t; t = title_id ? t->title_next : t->next)
         if ((title_id ? t->title_id == title_id :
              t->direct_pixels && !t->title_id && t->direct_hash == hash &&
              t->direct_count == count &&
@@ -3887,6 +3963,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
             texture = t;
             break;
         }
+    int cached_title = texture && title_id;
     transient_pin pin = {texture, active_transient_pin};
     active_transient_pin = &pin;
     int result = -1;
@@ -3962,6 +4039,11 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                 retained_snapshot_bytes += storage;
                 if (title_id) retained_title_bytes += storage;
                 cache_bytes += storage;
+                if (title_id) {
+                    unsigned bucket = title_texture_bucket(title_id);
+                    texture->title_next = title_textures[bucket];
+                    title_textures[bucket] = texture;
+                }
             }
         }
     }
@@ -3973,11 +4055,9 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
     float u0 = (q[0].u + ub + (x0 - q[0].x) * du) / width;
     float v0 = (q[0].v + vb + (y0 - q[0].y) * dv) / height;
     for (unsigned pass = 0; pass < passes; ++pass) {
-        pvr_poly_cxt_t c;
         pvr_poly_hdr_t header;
         pvr_vertex_t vertices_out[4];
-        context(&c, texture->image[pass], PVR_TXRFMT_ARGB1555, width, height);
-        pvr_poly_compile(&header, &c);
+        transient_header(texture, pass, width, height, &header);
         vertices(vertices_out, x0, y0, x1 - x0, y1 - y0, u0, v0,
                  (x1 - x0) * du / width, (y1 - y0) * dv / height,
                  vertex_tint ? tint(rgb, pass ? 128 : 255) :
@@ -3988,7 +4068,8 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
 done:
     free(staging);
     active_transient_pin = pin.previous;
-    release_transients();
+    /* A retained hit creates no transient; frame retirement handles cleanup. */
+    if (!cached_title || result) release_transients();
     return result;
 }
 

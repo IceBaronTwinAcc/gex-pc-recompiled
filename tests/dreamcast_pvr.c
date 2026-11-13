@@ -140,6 +140,29 @@ static void title_image_regression(const gex_packet_gpu *gpu) {
     EXPECT(gpu->native->title->packet(t, ARENA + 8, title_guest_memory + ARENA + 8,
                                       &state, error, sizeof error) == 1);
     EXPECT(pvr_mem_available() == cached);
+    for (unsigned i = 1; i <= 270; ++i) {
+        unsigned color = 0x4000 | i;
+        title_guest_memory[PALETTE + 2] = (uint8_t)color;
+        title_guest_memory[PALETTE + 3] = (uint8_t)(color >> 8);
+        title_guest_put32(0x4a2ae4, ARENA + 16);
+        title_guest_put32(0x4a2b18, ARENA);
+        title_guest_put32(0x4a2b14, ARENA + 8);
+        EXPECT(gpu->native->title->record(&io, OBJECT, CEL, error, sizeof error) == 1);
+        EXPECT(gpu->native->title->packet(t, ARENA + 16, title_guest_memory + ARENA + 16,
+                                          &state, error, sizeof error) == 1);
+        size_t used = pvr_mem_available();
+        EXPECT(gpu->native->title->packet(t, ARENA + 16, title_guest_memory + ARENA + 16,
+                                          &state, error, sizeof error) == 1);
+        EXPECT(pvr_mem_available() == used);
+        gpu->native->title->forget(ARENA + 16, ARENA + 32);
+    }
+    cached = pvr_mem_available();
+    EXPECT(gpu->native->title->packet(t, ARENA, title_guest_memory + ARENA,
+                                      &state, error, sizeof error) == 1);
+    EXPECT(pvr_mem_available() == cached);
+    title_guest_put32(0x4a2ae4, ARENA + 16);
+    title_guest_put32(0x4a2b18, ARENA);
+    title_guest_put32(0x4a2b14, ARENA + 8);
     title_guest_memory[PALETTE + 2] = 0;
     title_guest_memory[PALETTE + 3] = 0x7c;
     title_guest_put32(OBJECT + 0x78, 20u << 16);
@@ -2200,6 +2223,67 @@ static void retained_texture_snapshot_regression(const gex_packet_gpu *gpu) {
     gpu->destroy(t);
 }
 
+static void retained_direct_snapshot_regression(const gex_packet_gpu *gpu) {
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR direct snapshot target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    gpu->native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    for (unsigned i = 0; i < 14; ++i) put(i * 128, i + 1);
+    atlas[0x80000] = 1;
+    put(0xc0002, 1);
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    gex_gpu_material material = {16 | 1 << 7, 0x6000, 0x64, 0x808080, atlas, table};
+    gex_gpu_vertex indexed[] = {{0, 20, 0, 0}, {1, 20, 1, 0},
+                                {0, 21, 0, 1}, {1, 21, 1, 1}};
+    EXPECT(!gpu->native->polygon(t, indexed, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    material.clut = 0;
+    size_t before = 0, after = 0;
+    for (unsigned i = 0; i < 14; ++i) {
+        material.page = (2 << 7) | i;
+        float x = 10 + i;
+        gex_gpu_vertex cell[] = {{x, 20, 0, 0}, {x + 1, 20, 1, 0},
+                                 {x, 21, 0, 1}, {x + 1, 21, 1, 1}};
+        if (i == 13) before = pvr_mem_available();
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                     &material, error, sizeof error));
+        if (i == 13) after = pvr_mem_available();
+    }
+    EXPECT(before > after && before - after < 4096);
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    gex_gpu_vertex cell[] = {{10, 20, 0, 0}, {11, 20, 1, 0},
+                             {10, 21, 0, 1}, {11, 21, 1, 1}};
+    before = pvr_mem_available();
+    EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(pvr_mem_available() == before);
+    gpu->native->atlas_write(atlas, 0x90000, 2);
+    put(0x90000, 7);
+    for (unsigned i = 0; i < 4; ++i) cell[i].x += 1;
+    material.rgb = 0x404040;
+    EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(pvr_mem_available() == before);
+    gpu->native->atlas_write(atlas, 13 * 128, 2);
+    put(13 * 128, 0x3e0);
+    for (unsigned i = 0; i < 4; ++i) cell[i].x += 1;
+    material.rgb = 0x808080;
+    EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                 &material, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[20 * 320 + 10] == 14);
+    EXPECT(pixels[20 * 320 + 11] == 7);
+    EXPECT(pixels[20 * 320 + 12] == 0x3e0);
+    gpu->destroy(t);
+}
+
 static void retained_texture_snapshot_budget_regression(const gex_packet_gpu *gpu) {
     char error[256] = {0};
     void *t = gpu->create(320, 240, error, sizeof error);
@@ -4003,6 +4087,7 @@ int main(void) {
         inactive_texture_replay_regression(gpu);
         inactive_movie_replay_regression(gpu);
         retained_texture_snapshot_regression(gpu);
+        retained_direct_snapshot_regression(gpu);
         retained_texture_snapshot_budget_regression(gpu);
         bound_command_capacity_regression(gpu);
         movie_upload_regression(gpu);
@@ -4067,6 +4152,7 @@ int main(void) {
     deferred_alpha_texture_pressure_regression(gpu);
     deferred_palette_regression(gpu);
     retained_texture_snapshot_regression(gpu);
+    retained_direct_snapshot_regression(gpu);
     retained_texture_snapshot_budget_regression(gpu);
     deferred_pal8_regression(gpu);
     deferred_eviction_regression(gpu);

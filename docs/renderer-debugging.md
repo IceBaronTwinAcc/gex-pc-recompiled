@@ -57,6 +57,52 @@ The long-form implementation details and historical measurements are in
 [development.md](development.md#modular-renderer); verify the current source
 and configuration before treating historical results as current behavior.
 
+## Dreamcast title snapshot lifetime
+
+The title renderer indexes live snapshots by guest image address, but still
+checks the source bytes and palette before reuse. The PVR backend indexes
+retained title textures by immutable image ID. Retained-cache hits do not need
+a transient cleanup sweep; command retirement and allocation paths still
+perform cleanup. Keep the existing arena retirement and VRAM cache limits when
+changing either index.
+
+Title packet retirement batches contiguous runs before installing new markers.
+Runs split at arena wrap and before a wrapped range reaches the old cursor, so
+the allocation callback can recognize the wrap. Pending draws hold their
+snapshots throughout, and markers outside overwritten ranges remain live.
+
+Compact atlas snapshots are indexed by page, palette, transparency and
+region, and removed from the index when their texture is freed. Lookup still
+checks the atlas, write epoch and zero mask; overlapping atlas writes invalidate
+the old snapshot without changing queued commands. Opaque direct-color draws
+reuse a matching snapshot before attempting to allocate a full page. Immutable
+transient textures retain their PVR headers separately for each alpha pass;
+per-draw tint remains in the vertices.
+
+For cadence profiling, buffer frame and vblank measurements before printing
+them: serial output every 30 frames can itself cause a missed vblank. Flycast
+timings do not establish physical Dreamcast performance.
+
+For a warmed idle scene-49 run with the experimental map enabled, a 180-frame
+Flycast control averaged 37.1 ms wall and 21.3 ms game-thread CPU per frame.
+It had 142 two-vblank intervals and 38 of three or more vblanks. A separate
+lightly instrumented run measured about 11.0 ms CPU in guest packet-list
+processing, 4.5 ms recording CELs, 2.4 ms generating chunks, 0.2 ms generating
+flipped CELs, and 0.9 ms in presentation; roughly 2.6 ms remained unclassified.
+The generator callbacks did not overlap packet-list processing in a subsequent
+probe. Callback retirement time is included in the generator measurements.
+
+The packet list processed about 150 packets per frame: 78 sprite packets,
+40 deferred CEL markers, 10 textured quads, 21 page-state packets, and one
+other packet. Sampling one in eight packets attributed roughly 5 ms CPU to
+sprite dispatch and 3 ms to deferred CEL dispatch; these are included in the
+packet-list total, not additional costs. The separately measured presentation
+wall time included approximately 8 ms in the KOS render-completion wait and
+7 ms waiting for the display flip. These waits include scheduling and emulator
+effects and are not measurements of GPU execution alone. Animation counter
+and camera position were matched across comparisons, but complete game state
+was not; instrumentation and differing workloads make the figures approximate.
+
 ## Experimental Dreamcast level-selection map
 
 `GEX_DREAMCAST_NATIVE_MAP` is off by default. When enabled, the Dreamcast
@@ -70,6 +116,25 @@ or unsafe arena reuse. Other map paths can still use legacy generation, so this
 is not a complete legacy-free map implementation. A no-fallback diagnostic must
 check each producer independently and exercise selection, fades, and
 transitions.
+
+In one headless scene-49 autoplay run, blocking those legacy loops still
+allowed a down-selection and transition to scene 3. A separate run exercised
+up, left, right and down inputs without reaching the blocked loops. These runs
+did not exercise the standalone backdrop or unflipped fallback producers, and
+do not establish full route coverage. A scanout comparison at the same
+animation counter and camera position found small color differences between
+native and legacy output; those fields alone do not prove identical game state.
+An isolated Flycast PVR comparison also found RGB565 differences between
+direct ARGB1555 CEL textures and indexed palette textures for neutral green
+values 16 and 17. This can contribute to scanout differences independently of
+animation state; do not treat a matching animation counter as pixel proof.
+
+Chunk preflight tracks the at-most-two contiguous arena runs rather than
+scanning every earlier packet. After preflight succeeds, contiguous chunk
+packet retirements are batched, splitting at wrap and before a wrapped range
+reaches the previous cursor. Preflight rejects a wrapping allocation whose end
+would prevent the retirement callback from recognizing the wrap. Map CEL plans
+use a small local buffer and retry with the full-sized allocation when necessary.
 
 The map chunk path currently accepts direct-color tiles only. An inventory of
 the loaded scene-49 map found two nonempty chunks with 72 drawable tile layers,

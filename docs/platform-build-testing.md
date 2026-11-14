@@ -58,10 +58,11 @@ or non-bgfx build, configure with `-DGEX_ENABLE_BGFX_RENDERER=OFF`; do not
 silently disable a requested renderer to make a test pass. Use a fresh,
 non-existing build path when diagnosing a stale cache.
 
-The testing skill gives bounded, isolated, headless gameplay and full-movie
-commands. `first-graveyard=PASS` confirms the measured scene/movement checks,
-not collision fidelity or a full playthrough. Movie checks require both
-completion markers; normal exit is a separate check.
+The [Linux testing skill](../.github/skills/testing-linux/SKILL.md) gives
+bounded, isolated, headless gameplay and full-movie commands.
+`first-graveyard=PASS` confirms the measured scene/movement checks, not
+collision fidelity or a full playthrough. Movie checks require both completion
+markers; normal exit is a separate check.
 
 ## Windows: MinGW x64 and isolated Wine
 

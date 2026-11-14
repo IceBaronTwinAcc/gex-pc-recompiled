@@ -40,7 +40,7 @@ There are two distinct codebases:
 | `assets/` | Checked-in project artwork, icons, and save-menu asset pack. | Distinguish project assets from the user's retail installation. |
 | `patches/` | Checked-in patches for the separate pcrecomp checkout. | `tools/prepare_runtime.py` checks and applies these to that checkout. |
 | `docs/` | Detailed development guide, Flycast test runbook, and this map. | Read the relevant section rather than the entire long development guide. |
-| `.github/skills/` | Project-local Copilot skills: `testing` and `pcrecomp`. | Invoke the applicable skill before work; skills are instructions, not the toolchain itself. |
+| `.github/skills/` | Project-local Copilot skills: `testing`, `testing-linux`, `testing-windows`, `testing-macos`, `testing-dreamcast`, `testing-android`, and `pcrecomp`. | Invoke the applicable skill before work; skills are instructions, not the toolchain itself. |
 
 The following are normally local/ignored and might not exist in another
 checkout: `Gex/` (user's authorized original game), `pcrecomp/` (toolchain

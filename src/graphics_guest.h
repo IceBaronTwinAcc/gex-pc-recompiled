@@ -31,6 +31,9 @@ int gex_graphics_view_height(void);
 int gex_graphics_screen_point(int *x, int *y);
 int gex_graphics_draw_tiles(void);
 int gex_graphics_map_chunk_try(uint32_t chunk, uint32_t definitions, int32_t x, int32_t y);
+int gex_graphics_map_cel_direct_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                    uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                    uint16_t wrap_x, uint16_t wrap_y, uint16_t palette);
 int gex_graphics_map_flipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
                                      uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
                                      uint16_t wrap_x, uint16_t wrap_y, uint16_t palette,
@@ -49,7 +52,7 @@ void gex_graphics_camera_barrier(uint32_t object);
 void gex_graphics_draw_player_sprite(void);
 void gex_graphics_backdrop_begin(void);
 void gex_graphics_backdrop_end(void);
-int gex_graphics_backdrop_try(void);
+int gex_graphics_backdrop_try(uint32_t location, uint16_t palette);
 void gex_graphics_transition_begin(void);
 void gex_graphics_transition_end(void);
 void gex_graphics_pause_begin(void);
@@ -57,6 +60,8 @@ void gex_graphics_pause_end(void);
 /* Horizontal anchor: 0 = left, 1 = right, 2 = first third, 3 = second third. */
 int gex_graphics_hud_begin(uint32_t object, int anchor, int scaled);
 void gex_graphics_hud_end(uint32_t object);
+/* Reject direct world draws that could replace HUD-classified guest packets. */
+int gex_graphics_hud_blocks_direct(uint32_t packet_bound);
 void gex_graphics_shutdown(void);
 void gex_graphics_format(void);
 void gex_graphics_create(void);
@@ -64,6 +69,13 @@ void gex_graphics_destroy(void);
 void gex_graphics_resolution(void);
 void gex_graphics_begin_frame(void);
 void gex_graphics_end_frame(void);
+void gex_graphics_list_begin(uint32_t root);
+void gex_graphics_title_lists_reset(uint32_t first, uint32_t second);
+void gex_graphics_tile_lists_reset(void);
+void gex_graphics_tile_lists_merge(unsigned layer);
+int gex_graphics_palette_try(uint32_t anchor, uint32_t rectangle, uint32_t source, unsigned width);
+void gex_graphics_palette_flush(uint32_t anchor);
+void gex_graphics_palette_reset(void);
 int gex_graphics_draw_packet(uint32_t packet);
 int gex_graphics_title_try(uint32_t object, uint32_t cel);
 void gex_graphics_flush(void);

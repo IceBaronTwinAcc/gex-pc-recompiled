@@ -7,7 +7,8 @@
 
 enum { TITLE_PART_LIMIT = 512, TITLE_STORAGE_LIMIT = 2 * 1024 * 1024,
        TITLE_MARKER_SIZE = 8, TITLE_PAIR_SIZE = 16, TITLE_OPCODE = 0x7f,
-       TITLE_BUCKETS = 4096, TITLE_ASSET_BUCKETS = 256, MAP_LOCAL_PARTS = 16 };
+       TITLE_BUCKETS = 4096, TITLE_DIRECT_BUCKETS = 256,
+       TITLE_ASSET_BUCKETS = 256, MAP_LOCAL_PARTS = 16 };
 
 typedef struct {
     uint8_t modulation[1024];
@@ -29,25 +30,45 @@ typedef struct title_asset {
 } title_asset;
 
 typedef struct title_draw title_draw;
+typedef struct palette_transfer {
+    uint32_t anchor;
+    gex_gpu_palette_upload upload;
+    struct palette_transfer *next;
+} palette_transfer;
+
 typedef struct title_marker {
-    uint32_t address;
+    uint32_t address, root;
     title_draw *draw;
     struct title_marker *next;
+    struct title_marker **link, *root_next, **root_link;
 } title_marker;
 
 struct title_draw {
     title_marker marker[2];
-    int x, y, wrap_x, wrap_y;
-    unsigned rgb, semitransparent;
-    title_asset *asset;
+    union {
+        struct {
+            int x, y, wrap_x, wrap_y;
+            unsigned rgb, semitransparent, world, backdrop;
+            title_asset *asset;
+        };
+        gex_dreamcast_tile_draw tile;
+    };
+    unsigned is_tile;
     title_draw *next;
 };
 
 static title_asset *assets;
 static title_asset *asset_index[TITLE_ASSET_BUCKETS];
 static title_marker *markers[TITLE_BUCKETS];
+static title_marker *direct_markers[TITLE_DIRECT_BUCKETS];
+static title_marker **direct_tails[TITLE_DIRECT_BUCKETS];
+static title_marker *root_markers[TITLE_DIRECT_BUCKETS];
+static title_marker **root_tails[TITLE_DIRECT_BUCKETS];
+static size_t direct_count;
 static size_t storage;
 static uint64_t next_image_id;
+static palette_transfer *palette_transfers;
+static palette_transfer **palette_tail = &palette_transfers;
 
 static unsigned asset_bucket(uint32_t image) {
     return (image * UINT32_C(2654435761)) >> 24;
@@ -177,7 +198,7 @@ static void release_asset(title_asset *asset) {
 }
 
 static void release_draw(title_draw *draw) {
-    release_asset(draw->asset);
+    if (!draw->is_tile) release_asset(draw->asset);
     storage -= sizeof *draw;
     free(draw);
 }
@@ -190,8 +211,225 @@ static void release_pending(title_draw *pending) {
     }
 }
 
+static unsigned direct_bucket(uint32_t address) {
+    return (address >> 2) * UINT32_C(2654435761) >> 24;
+}
+
+static void append_direct(title_marker *marker) {
+    unsigned bucket = direct_bucket(marker->address);
+    unsigned root_bucket = direct_bucket(marker->root);
+    if (!direct_tails[bucket]) direct_tails[bucket] = &direct_markers[bucket];
+    if (!root_tails[root_bucket]) root_tails[root_bucket] = &root_markers[root_bucket];
+    marker->next = NULL;
+    marker->link = direct_tails[bucket];
+    *direct_tails[bucket] = marker;
+    direct_tails[bucket] = &marker->next;
+    marker->root_next = NULL;
+    marker->root_link = root_tails[root_bucket];
+    *root_tails[root_bucket] = marker;
+    root_tails[root_bucket] = &marker->root_next;
+}
+
+static void unlink_direct(title_marker *marker) {
+    unsigned bucket = direct_bucket(marker->address);
+    unsigned root_bucket = direct_bucket(marker->root);
+    *marker->link = marker->next;
+    if (marker->next) marker->next->link = marker->link;
+    else direct_tails[bucket] = marker->link;
+    *marker->root_link = marker->root_next;
+    if (marker->root_next) marker->root_next->root_link = marker->root_link;
+    else root_tails[root_bucket] = marker->root_link;
+}
+
+int gex_dreamcast_palette_record(uint32_t anchor, const gex_gpu_palette_upload *upload) {
+    if (!anchor || (anchor & 3) || !upload || !upload->source ||
+        (upload->width != 16 && upload->width != 256) ||
+        !make_room(sizeof(palette_transfer))) return 0;
+    palette_transfer *transfer = malloc(sizeof *transfer);
+    if (!transfer) return -1;
+    *transfer = (palette_transfer){anchor, *upload, NULL};
+    *palette_tail = transfer;
+    palette_tail = &transfer->next;
+    storage += sizeof *transfer;
+    return 1;
+}
+
+int gex_dreamcast_palette_take(uint32_t anchor, gex_gpu_palette_upload *upload) {
+    if (!upload) return 0;
+    palette_transfer **link = &palette_transfers;
+    while (*link && (*link)->anchor != anchor) link = &(*link)->next;
+    if (!*link) return 0;
+    palette_transfer *transfer = *link;
+    *upload = transfer->upload;
+    *link = transfer->next;
+    if (!*link) palette_tail = link;
+    storage -= sizeof *transfer;
+    free(transfer);
+    return 1;
+}
+
+void gex_dreamcast_palette_reset(void) {
+    while (palette_transfers) {
+        palette_transfer *transfer = palette_transfers;
+        palette_transfers = transfer->next;
+        storage -= sizeof *transfer;
+        free(transfer);
+    }
+    palette_tail = &palette_transfers;
+}
+
+static void forget_palettes(uint32_t begin, uint32_t end) {
+    palette_transfer **link = &palette_transfers;
+    while (*link) {
+        palette_transfer *transfer = *link;
+        if (transfer->anchor >= end || (uint64_t)transfer->anchor + 4 <= begin) {
+            link = &transfer->next;
+            continue;
+        }
+        *link = transfer->next;
+        if (!*link) palette_tail = link;
+        storage -= sizeof *transfer;
+        free(transfer);
+    }
+}
+
+static int record_tiles(const gex_gpu_guest_io *io, const gex_dreamcast_tile_draw *tiles,
+                        size_t count, const uint32_t *roots, const uint32_t *tails,
+                        unsigned lists) {
+    if ((!tiles && count) || !tails) return 0;
+    for (unsigned i = 0; i < lists; ++i)
+        if (!tails[i] || (tails[i] & 3)) return 0;
+    for (unsigned i = 0; i < lists; ++i)
+        for (unsigned j = i + 1; j < lists; ++j)
+            if (tails[i] == tails[j]) return 0;
+    title_draw *pending = NULL, **next = &pending;
+    for (size_t i = 0; i < count; ++i) {
+        if (tiles[i].layer >= lists / 2 || (tiles[i].palette_address && (!io || !io->prepare_palette)) ||
+            !make_room(sizeof(title_draw))) {
+            release_pending(pending);
+            return 0;
+        }
+        title_draw *draw = malloc(sizeof *draw);
+        if (!draw) {
+            release_pending(pending);
+            return -1;
+        }
+        storage += sizeof *draw;
+        unsigned list = tiles[i].layer * 2;
+        *draw = (title_draw){.marker = {{.address = tails[list], .root = roots[list], .draw = draw},
+                                        {.address = tails[list + 1], .root = roots[list + 1], .draw = draw}},
+                             .tile = tiles[i], .is_tile = 1};
+        *next = draw;
+        next = &draw->next;
+    }
+    while (pending) {
+        title_draw *draw = pending;
+        pending = draw->next;
+        /* Palette uploads can retire anchors used by earlier direct tiles. */
+        if (draw->tile.palette_address)
+            draw->tile.clut = io->prepare_palette(io->context, draw->tile.palette_address);
+        append_direct(&draw->marker[0]);
+        append_direct(&draw->marker[1]);
+        direct_count += 2;
+    }
+    return 1;
+}
+
+int gex_dreamcast_title_record_tiles(const gex_gpu_guest_io *io,
+                                     const gex_dreamcast_tile_draw *tiles, size_t count,
+                                     const uint32_t tails[4]) {
+    static const uint32_t roots[4] = {0x46bc64, 0x46bc60, 0x46bc58, 0x46bc5c};
+    return record_tiles(io, tiles, count, roots, tails, 4);
+}
+
+int gex_dreamcast_title_record_cel_tiles(const gex_dreamcast_tile_draw *tiles, size_t count,
+                                         const uint32_t roots[2], const uint32_t tails[2]) {
+    if (!roots || !roots[0] || !roots[1] || roots[0] == roots[1]) return 0;
+    return record_tiles(NULL, tiles, count, roots, tails, 2);
+}
+
+void gex_dreamcast_title_merge_lists(const uint32_t source[2], const uint32_t roots[2],
+                                      const uint32_t tails[2]) {
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        title_marker *moved = NULL, **last = &moved;
+        title_marker *marker = root_markers[direct_bucket(source[copy])];
+        while (marker) {
+            title_marker *next = marker->root_next;
+            if (marker->root == source[copy]) {
+                unlink_direct(marker);
+                if (marker->address == source[copy]) marker->address = tails[copy];
+                marker->root = roots[copy];
+                marker->next = NULL;
+                *last = marker;
+                last = &marker->next;
+            }
+            marker = next;
+        }
+        while (moved) {
+            marker = moved;
+            moved = marker->next;
+            append_direct(marker);
+        }
+    }
+}
+
+static void release_marker(title_marker *marker) {
+    title_draw *draw = marker->draw;
+    marker->address = 0;
+    if (!draw->marker[0].address && !draw->marker[1].address)
+        release_draw(draw);
+}
+
+static void forget_direct(uint32_t begin, uint32_t end) {
+    if (!direct_count) return;
+    uint32_t start = begin >= 3 ? begin - 3 : 0;
+    start &= ~3u;
+    for (uint64_t at = start; at < end; at += 4) {
+        unsigned bucket = direct_bucket((uint32_t)at);
+        title_marker **link = &direct_markers[bucket];
+        while (*link) {
+            title_marker *marker = *link;
+            if (marker->address != at || marker->address >= end ||
+                (uint64_t)marker->address + 4 <= begin) {
+                link = &marker->next;
+                continue;
+            }
+            unlink_direct(marker);
+            --direct_count;
+            release_marker(marker);
+        }
+    }
+}
+
+void gex_dreamcast_title_reset_lists(uint32_t first, uint32_t second) {
+    if (!direct_count) return;
+    const uint32_t roots[2] = {first, second};
+    for (unsigned i = 0; i < 2; ++i) {
+        title_marker *marker = root_markers[direct_bucket(roots[i])];
+        while (marker) {
+            title_marker *next = marker->root_next;
+            if (marker->root == roots[i]) {
+                unlink_direct(marker);
+                --direct_count;
+                release_marker(marker);
+            }
+            marker = next;
+        }
+    }
+}
+
+int gex_dreamcast_title_has_direct(uint32_t root, uint32_t anchor) {
+    if (!direct_count) return 0;
+    for (title_marker *marker = direct_markers[direct_bucket(anchor)]; marker;
+         marker = marker->next)
+        if (marker->root == root && marker->address == anchor) return 1;
+    return 0;
+}
+
 void gex_dreamcast_title_forget(uint32_t begin, uint32_t end) {
     if (begin >= end) return;
+    forget_direct(begin, end);
+    forget_palettes(begin, end);
     uint32_t start = begin >= TITLE_MARKER_SIZE - 1 ? begin - (TITLE_MARKER_SIZE - 1) : 0;
     start &= ~3u;
     for (uint64_t at = start; at < end; at += 4) {
@@ -205,28 +443,32 @@ void gex_dreamcast_title_forget(uint32_t begin, uint32_t end) {
                 continue;
             }
             *link = marker->next;
-            title_draw *draw = marker->draw;
-            marker->address = 0;
-            if (!draw->marker[0].address && !draw->marker[1].address)
-                release_draw(draw);
+            release_marker(marker);
         }
     }
 }
 
 void gex_dreamcast_title_reset(void) {
+    gex_dreamcast_palette_reset();
+    for (unsigned i = 0; i < TITLE_DIRECT_BUCKETS; ++i)
+        while (direct_markers[i]) {
+            title_marker *marker = direct_markers[i];
+            unlink_direct(marker);
+            --direct_count;
+            release_marker(marker);
+        }
+    memset(direct_tails, 0, sizeof direct_tails);
+    memset(root_tails, 0, sizeof root_tails);
     for (unsigned i = 0; i < TITLE_BUCKETS; ++i)
         while (markers[i]) {
             title_marker *marker = markers[i];
             markers[i] = marker->next;
-            title_draw *draw = marker->draw;
-            marker->address = 0;
-            if (!draw->marker[0].address && !draw->marker[1].address)
-                release_draw(draw);
+            release_marker(marker);
         }
 }
 
 static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int backdrop,
-                  int map, uint32_t scene, char *error, size_t size) {
+                  int map, uint32_t scene, const uint32_t *roots, char *error, size_t size) {
     if (!io || !io->read || !io->write || !io->allocated) return 0;
     uint32_t camera_x, camera_y, frame, fade, colors[32], begin, end, cursor, tails[2];
     uint16_t screen_x, screen_y;
@@ -248,7 +490,8 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                     (uint32_t)color_bytes[i * 4 + 3] << 24;
     if (!begin || (begin & 3) || (cursor & 3) ||
         end <= begin || cursor < begin || cursor > end ||
-        !tails[0] || !tails[1]) return 0;
+        !tails[0] || !tails[1] ||
+        (roots && (tails[0] == tails[1] || ((tails[0] | tails[1]) & 3)))) return 0;
 
     gex_title_part local_parts[MAP_LOCAL_PARTS];
     gex_title_part *parts = map ? local_parts : malloc(TITLE_PART_LIMIT * sizeof *parts);
@@ -283,7 +526,7 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                                     parts, TITLE_PART_LIMIT, &count);
         }
     }
-    if (status != GEX_TITLE_PLAN_OK || count * TITLE_PAIR_SIZE > end - begin) {
+    if (status != GEX_TITLE_PLAN_OK || (!roots && count * TITLE_PAIR_SIZE > end - begin)) {
         if (parts != local_parts) free(parts);
         return 0;
     }
@@ -293,16 +536,16 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
     int wrapped = 0;
     for (size_t i = 0; i < count; ++i) {
         if (parts[i].flags & 0xc0000000u) { status = 0; goto rollback; }
-        if (end - position < TITLE_PAIR_SIZE) {
+        if (!roots && end - position < TITLE_PAIR_SIZE) {
             position = begin;
             wrapped = 1;
             if (position + TITLE_PAIR_SIZE == cursor) { status = 0; goto rollback; }
         }
-        if (i && wrapped && position + TITLE_PAIR_SIZE > first) {
+        if (!roots && i && wrapped && position + TITLE_PAIR_SIZE > first) {
             status = 0; goto rollback;
         }
         if (!i) { first = position; wrapped = 0; }
-        for (unsigned j = 0; j < 2; ++j)
+        for (unsigned j = 0; !roots && j < 2; ++j)
             if (tails[j] >= position && tails[j] < position + TITLE_PAIR_SIZE) {
                 status = 0; goto rollback;
             }
@@ -388,8 +631,10 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
             status = -1; goto rollback;
         }
         storage += sizeof *draw;
-        *draw = (title_draw){.marker = {{position, draw, NULL},
-                                        {position + TITLE_MARKER_SIZE, draw, NULL}},
+        *draw = (title_draw){.marker = {{.address = roots ? tails[0] : position,
+                                         .root = roots ? roots[0] : 0, .draw = draw},
+                                        {.address = roots ? tails[1] : position + TITLE_MARKER_SIZE,
+                                         .root = roots ? roots[1] : 0, .draw = draw}},
                              .x = parts[i].x, .y = parts[i].y,
                              .wrap_x = parts[i].wrap_x, .wrap_y = parts[i].wrap_y,
                              .rgb = backdrop ? (uint32_t)fade_rgb[0] |
@@ -397,12 +642,25 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                                                (uint32_t)fade_rgb[2] << 16 :
                                     gex_title_packet_rgb(parts[i].tint, fade, fade_rgb, colors),
                              .semitransparent = !backdrop && !!(parts[i].tint & 0x8080u),
+                             .world = roots && scene == 3,
+                             .backdrop = roots && backdrop,
                              .asset = asset};
         *tail = draw;
         tail = &draw->next;
-        position += TITLE_PAIR_SIZE;
+        if (!roots) position += TITLE_PAIR_SIZE;
     }
     if (parts != local_parts) free(parts);
+    if (roots) {
+        while (pending) {
+            title_draw *draw = pending;
+            pending = pending->next;
+            for (unsigned i = 0; i < 2; ++i) {
+                append_direct(&draw->marker[i]);
+                ++direct_count;
+            }
+        }
+        return 1;
+    }
     while (pending) {
         title_draw *end = pending;
         /* The allocation callback detects a wrap only when next < cursor. */
@@ -441,17 +699,38 @@ rollback:
 
 int gex_dreamcast_title_record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
                                char *error, size_t size) {
-    return record(io, object, cel, 0, 0, 63, error, size);
+    return record(io, object, cel, 0, 0, 63, NULL, error, size);
+}
+
+int gex_dreamcast_title_record_direct(const gex_gpu_guest_io *io, uint32_t object,
+                                      uint32_t cel, const uint32_t roots[2],
+                                      char *error, size_t size) {
+    if (!roots || !roots[0] || !roots[1] || roots[0] == roots[1]) return 0;
+    return record(io, object, cel, 0, 0, 63, roots, error, size);
 }
 
 int gex_dreamcast_backdrop_record(const gex_gpu_guest_io *io, uint32_t scene,
                                   char *error, size_t size) {
-    return record(io, 0, 0, 1, 0, scene, error, size);
+    return record(io, 0, 0, 1, 0, scene, NULL, error, size);
+}
+
+int gex_dreamcast_backdrop_record_direct(const gex_gpu_guest_io *io, uint32_t scene,
+                                         const uint32_t roots[2], char *error, size_t size) {
+    if (scene != 49 || !roots || !roots[0] || !roots[1] || roots[0] == roots[1]) return 0;
+    return record(io, 0, 0, 1, 0, scene, roots, error, size);
 }
 
 int gex_dreamcast_map_cel_record(const gex_gpu_guest_io *io, uint32_t scene,
                                  uint32_t object, uint32_t cel, char *error, size_t size) {
-    return scene == 49 ? record(io, object, cel, 0, 1, scene, error, size) : 0;
+    return scene == 49 ? record(io, object, cel, 0, 1, scene, NULL, error, size) : 0;
+}
+
+int gex_dreamcast_scene_cel_record_direct(const gex_gpu_guest_io *io, uint32_t scene,
+                                          uint32_t object, uint32_t cel,
+                                          const uint32_t roots[2], char *error, size_t size) {
+    if ((scene != 49 && scene != 3) || !roots || !roots[0] || !roots[1] ||
+        roots[0] == roots[1]) return 0;
+    return record(io, object, cel, 0, 1, scene, roots, error, size);
 }
 
 static int signed16(int value) {
@@ -459,18 +738,10 @@ static int signed16(int value) {
     return v & 0x8000u ? (int)v - 65536 : (int)v;
 }
 
-int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *packet,
-                               const gex_raster_state *state, gex_title_image_submit submit,
-                               char *error, size_t size) {
-    unsigned bucket = (address >> 2) * 2654435761u >> 20;
-    title_marker *marker;
-    for (marker = markers[bucket]; marker; marker = marker->next)
-        if (marker->address == address) break;
-    if (!marker) return 0;
-    title_draw *draw = marker->draw;
-    unsigned copy = marker == &draw->marker[1];
-    if (!packet || !state || !submit || packet[7] != TITLE_OPCODE)
-        return fail(error, size, "invalid deferred title packet");
+static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned rgb,
+                       const gex_raster_state *state, gex_title_image_submit submit,
+                       char *error, size_t size) {
+    if (!state || !submit) return fail(error, size, "invalid deferred title draw");
     const gex_title_cel_snapshot *snapshot = &draw->asset->image;
     int x = signed16(draw->x + snapshot->cel.left - (copy ? draw->wrap_x : 0));
     int y = signed16(draw->y + snapshot->cel.top - (copy ? draw->wrap_y : 0));
@@ -479,7 +750,16 @@ int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *pa
     int top = state->top - state->origin_y;
     int bottom = state->bottom - state->origin_y;
     if (top < 8) top = 8;
-    if (bottom > 232) bottom = 232;
+    if (draw->world && !state->layout) {
+        if (bottom == 232 || bottom == 240) bottom = 248;
+        if (bottom > 248) bottom = 248;
+        if (state->world_clip) {
+            if (left < state->world_left) left = state->world_left;
+            if (right > state->world_right) right = state->world_right;
+            if (top < state->world_top) top = state->world_top;
+            if (bottom > state->world_bottom) bottom = state->world_bottom;
+        }
+    } else if (bottom > 232) bottom = 232;
     int fitted_y = state->layout == 1 ? 8 : 0;
     int repeats = state->layout == 2 ? 2 : 1;
     int visible = 0;
@@ -498,7 +778,6 @@ int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *pa
     }
     if (!visible) return 1;
     size_t count = (size_t)snapshot->cel.width * snapshot->cel.height;
-    unsigned rgb = packet[4] | (unsigned)packet[5] << 8 | (unsigned)packet[6] << 16;
     size_t color_bytes = sizeof(title_colors) + count * 2 * sizeof(uint16_t);
     title_colors *colors = draw->asset->colors;
     int temporary = 0;
@@ -571,4 +850,113 @@ int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *pa
     }
     if (temporary) free(colors);
     return result;
+}
+
+int gex_dreamcast_title_packet(void *target, uint32_t address, const uint8_t *packet,
+                               const gex_raster_state *state, gex_title_image_submit submit,
+                               char *error, size_t size) {
+    unsigned bucket = (address >> 2) * 2654435761u >> 20;
+    title_marker *marker;
+    for (marker = markers[bucket]; marker; marker = marker->next)
+        if (marker->address == address) break;
+    if (!marker) return 0;
+    if (!packet || packet[7] != TITLE_OPCODE)
+        return fail(error, size, "invalid deferred title packet");
+    unsigned rgb = packet[4] | (unsigned)packet[5] << 8 | (unsigned)packet[6] << 16;
+    return submit_draw(target, marker->draw, marker == &marker->draw->marker[1],
+                       rgb, state, submit, error, size);
+}
+
+static int submit_tile(void *target, const gex_dreamcast_tile_draw *tile, unsigned copy,
+                       const gex_raster_state *state, gex_title_polygon_submit submit,
+                       gex_gpu_direct_state *result, char *error, size_t size) {
+    if (!state || !submit || !result) return fail(error, size, "invalid direct tile draw");
+    unsigned page = result->page_valid ? result->page & 0x19f : state->page;
+    if (tile->is_quad || tile->page_change) {
+        result->page = tile->page;
+        result->page_valid = 1;
+        page = tile->is_quad ? tile->page : tile->page & 0x19f;
+    }
+    if (tile->page_change) {
+        result->page_command = tile->page;
+        result->page_command_valid = 1;
+    }
+    int left = state->left > 0 ? state->left : 0;
+    int right = state->right < 320 ? state->right : 320;
+    int top = state->top - state->origin_y;
+    int bottom = state->bottom - state->origin_y;
+    if (top < 8) top = 8;
+    if (!state->layout) {
+        if (bottom == 232 || bottom == 240) bottom = 248;
+        if (bottom > 248) bottom = 248;
+        if (state->world_clip) {
+            if (left < state->world_left) left = state->world_left;
+            if (right > state->world_right) right = state->world_right;
+            if (top < state->world_top) top = state->world_top;
+            if (bottom > state->world_bottom) bottom = state->world_bottom;
+        }
+    } else if (bottom > 232) bottom = 232;
+    int offset = state->layout == 1 ? 8 : 0;
+    int clip_top = top - 8 + offset, clip_bottom = bottom - 8 + offset;
+    if (clip_top < 0) clip_top = 0;
+    if (clip_bottom > 240) clip_bottom = 240;
+    if (left >= right || clip_top >= clip_bottom) return 1;
+    gex_gpu_vertex q[4];
+    int x0 = signed16(tile->x[0] + (copy ? tile->wrap_x : 0));
+    int y0 = signed16(tile->y[0] + (copy ? tile->wrap_y : 0));
+    for (unsigned i = 0; i < 4; ++i) {
+        int x = tile->is_quad ? signed16(tile->x[i] + (copy ? tile->wrap_x : 0)) :
+                x0 + ((i & 1) ? tile->width : 0);
+        int y = tile->is_quad ? signed16(tile->y[i] + (copy ? tile->wrap_y : 0)) :
+                y0 + ((i & 2) ? tile->height : 0);
+        unsigned u = tile->is_quad ? tile->u[i] : tile->u[0] + ((i & 1) ? tile->width : 0);
+        unsigned v = tile->is_quad ? tile->v[i] : tile->v[0] + ((i & 2) ? tile->height : 0);
+        if (tile->is_quad && (i == 1 || i == 3) && !u) u = 256;
+        if (tile->is_quad && (i == 2 || i == 3) && !v) v = 256;
+        q[i] = (gex_gpu_vertex){(float)x, (float)(y - state->origin_y - 8 + offset),
+                                (float)u, (float)v};
+    }
+    gex_gpu_material material = {page, tile->clut,
+                                 (tile->is_quad ? 0x2cu : 0x64u) | (tile->rgb >> 24 & 2u),
+                                 tile->rgb & 0xffffffu, state->atlas, state->modulation};
+    return submit(target, q, left, clip_top, right, clip_bottom, &material, error, size) ? -1 : 1;
+}
+
+int gex_dreamcast_title_draw_direct_tiles(void *target, uint32_t root, uint32_t anchor,
+                                           const gex_raster_state *state,
+                                           gex_title_image_submit image,
+                                           gex_title_polygon_submit polygon,
+                                           gex_gpu_direct_state *result,
+                                           char *error, size_t size) {
+    int found = 0;
+    for (title_marker *marker = direct_markers[direct_bucket(anchor)]; marker;
+         marker = marker->next) {
+        if (marker->root != root || marker->address != anchor) continue;
+        title_draw *draw = marker->draw;
+        if (draw->is_tile) {
+            if (submit_tile(target, &draw->tile, marker == &draw->marker[1], state,
+                            polygon, result, error, size) < 0) return -1;
+            found = 1;
+            continue;
+        }
+        gex_raster_state backdrop_state;
+        const gex_raster_state *draw_state = state;
+        if (draw->backdrop && state && state->layout == 1 && state->repeat_backdrop) {
+            backdrop_state = *state;
+            backdrop_state.layout = 2;
+            draw_state = &backdrop_state;
+        }
+        if (submit_draw(target, draw, marker == &draw->marker[1], draw->rgb,
+                        draw_state, image, error, size) < 0) return -1;
+        found = 1;
+    }
+    return found;
+}
+
+int gex_dreamcast_title_draw_direct(void *target, uint32_t root, uint32_t anchor,
+                                     const gex_raster_state *state, gex_title_image_submit submit,
+                                     char *error, size_t size) {
+    gex_gpu_direct_state result = {0};
+    return gex_dreamcast_title_draw_direct_tiles(target, root, anchor, state, submit, NULL,
+                                                  &result, error, size);
 }

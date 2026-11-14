@@ -135,6 +135,18 @@ int gex_raster_title_packet(gex_raster *r, uint32_t address, const uint8_t *pack
     return result;
 }
 
+int gex_raster_title_direct(gex_raster *r, uint32_t root, uint32_t anchor,
+                            const gex_raster_state *state, gex_gpu_direct_state *result) {
+    if (!gex_raster_gpu_owned(r) || !r->gpu->native->title ||
+        !r->gpu->native->title->draw_direct) return 0;
+    char error[512] = {0};
+    int consumed = r->gpu->native->title->draw_direct(r->device, root, anchor, state,
+                                                      result, error, sizeof error);
+    if (consumed < 0) gpu_fail(error);
+    if (consumed) r->guest_newer = r->gpu_newer = 1;
+    return consumed;
+}
+
 void gex_raster_bind(gex_raster *r, const uint8_t *atlas, unsigned plane) {
     if (gex_raster_gpu_owned(r)) r->gpu->native->bind(r->device, atlas, plane);
 }

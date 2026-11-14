@@ -22,7 +22,7 @@ enum { TW = 512, TH = 256, CACHE_COUNT = 24, CACHE_BYTES = 4 * 1024 * 1024,
        REMAP_COUNT = 256, REMAP_BYTES = 512 * 1024, SNAPSHOT_BYTES = 512 * 1024,
        TITLE_SNAPSHOT_BYTES = 2 * 1024 * 1024,
        SHARED_GROUPS = 2,
-       WARM_REGIONS = 4, WARM_BYTES = 128 * 128 };
+       WARM_REGIONS = 4, WARM_BYTES = 128 * 128, PAGE_RETRY_SKIPS = 64 };
 enum { BACKGROUND_IDLE, BACKGROUND_RECORD, BACKGROUND_REUSE, BACKGROUND_VERIFY,
        BACKGROUND_REDRAW };
 typedef struct {
@@ -191,6 +191,11 @@ static uint64_t atlas_revision;
 static uint64_t atlas_write_epoch;
 static size_t retained_snapshot_bytes;
 static size_t retained_title_bytes;
+static unsigned vram_free_generation;
+static struct {
+    size_t bytes, available;
+    unsigned skipped, generation, vblank;
+} failed_page_allocation;
 static transient_texture *transients;
 static transient_texture *title_textures[256];
 static transient_texture *snapshot_textures[256];
@@ -200,6 +205,16 @@ static target *last_presented;
 static unsigned last_present_vblank;
 static int presentation_paced;
 static int fail(char *error, size_t size, const char *message);
+static void *zeroed_aligned(size_t alignment, size_t size) {
+    void *memory = memalign(alignment, size);
+    if (memory) memset(memory, 0, size);
+    return memory;
+}
+static void free_vram(pvr_ptr_t memory) {
+    pvr_mem_free(memory);
+    ++vram_free_generation;
+}
+
 static int transient_pinned(const transient_texture *t) {
     for (transient_pin *pin = active_transient_pin; pin; pin = pin->previous)
         if (pin->texture == t) return 1;
@@ -235,25 +250,27 @@ static void free_transient(transient_texture **link) {
     if (t->title_id) retained_title_bytes -= t->retained_bytes;
     cache_bytes -= t->retained_bytes;
     for (unsigned i = 0; i < 2; ++i)
-        if (t->image[i]) pvr_mem_free(t->image[i]);
+        if (t->image[i]) free_vram(t->image[i]);
     free(t->direct_pixels);
     free(t);
 }
 
-static transient_texture **oldest_idle_snapshot_kind(int title) {
+static transient_texture **oldest_idle_snapshot_kind(int title, size_t minimum) {
     transient_texture **oldest = NULL;
     for (transient_texture **link = &transients; *link; link = &(*link)->next) {
         transient_texture *t = *link;
         if (!t->retained_bytes || t->current || t->saved_refs || transient_pinned(t))
             continue;
         if (title >= 0 && !!t->title_id != title) continue;
+        if (minimum && (t->image[1] ? t->retained_bytes / 2 : t->retained_bytes) < minimum)
+            continue;
         if (!oldest || t->used < (*oldest)->used) oldest = link;
     }
     return oldest;
 }
 
 static transient_texture **oldest_idle_snapshot(void) {
-    return oldest_idle_snapshot_kind(-1);
+    return oldest_idle_snapshot_kind(-1, 0);
 }
 
 static void release_transients(void) {
@@ -1075,9 +1092,9 @@ static int select_target(target *t, char *error, size_t size) {
 }
 
 static void release_texture(texture *t) {
-    if (t->source) pvr_mem_free(t->source);
+    if (t->source) free_vram(t->source);
     for (unsigned j = 0; j < 3; ++j)
-        if (t->image[j]) pvr_mem_free(t->image[j]);
+        if (t->image[j]) free_vram(t->image[j]);
     cache_bytes -= t->storage;
     memset(t, 0, sizeof *t);
 }
@@ -1093,7 +1110,7 @@ static void release_remap(remap_texture *t) {
     size_t storage = t->dimension * t->dimension * (t->group == SHARED_GROUPS ? 2 : 1);
     remap_bytes -= storage;
     cache_bytes -= storage;
-    if (t->image) pvr_mem_free(t->image);
+    if (t->image) free_vram(t->image);
     memset(t, 0, sizeof *t);
 }
 
@@ -1166,7 +1183,7 @@ static void *create(int width, int height, char *error, size_t size) {
             return NULL;
         }
     }
-    target *t = calloc(1, sizeof *t);
+    target *t = zeroed_aligned(_Alignof(target), sizeof *t);
     if (t) {
         for (unsigned i = 0; i < 2; ++i) {
             t->image[i] = pvr_mem_malloc(TW * TH * 2);
@@ -1176,7 +1193,7 @@ static void *create(int width, int height, char *error, size_t size) {
     if (!t || !t->image[0] || !t->image[1]) {
         if (t) {
             for (unsigned i = 0; i < 2; ++i)
-                if (t->image[i]) pvr_mem_free(t->image[i]);
+                if (t->image[i]) free_vram(t->image[i]);
             free(t);
         }
         if (!users) {
@@ -1189,7 +1206,7 @@ static void *create(int width, int height, char *error, size_t size) {
     if (!users) {
         previous_scheduler_hz = thd_get_hz();
         if (thd_set_hz(1000)) {
-            for (unsigned i = 0; i < 2; ++i) pvr_mem_free(t->image[i]);
+            for (unsigned i = 0; i < 2; ++i) free_vram(t->image[i]);
             free(t);
             free(commands); commands = NULL; command_capacity = 0;
             pvr_shutdown();
@@ -1224,10 +1241,10 @@ static void destroy(void *data) {
         release_transients();
     }
     for (unsigned i = 0; i < 2; ++i)
-        if (t->image[i]) pvr_mem_free(t->image[i]);
+        if (t->image[i]) free_vram(t->image[i]);
     free(t->background);
     for (unsigned i = 0; i < 2; ++i) if (pictures[i] == t) pictures[i] = NULL;
-    if (t->history) pvr_mem_free(t->history);
+    if (t->history) free_vram(t->history);
     if (last_presented == t) last_presented = NULL;
     target **link = &targets;
     while (*link != t) link = &(*link)->next;
@@ -1247,6 +1264,8 @@ static void destroy(void *data) {
             abort();
         }
         command_size = palette_used = 0;
+        memset(&failed_page_allocation, 0, sizeof failed_page_allocation);
+        vram_free_generation = 0;
         saved_count = 0;
         memset(palette_banks, 0, sizeof palette_banks);
         command_replaces = command_clear_only = 0;
@@ -1448,7 +1467,7 @@ static int evict_texture(texture *protected, size_t bytes, int allow_snapshot,
                          char *error, size_t size) {
     texture *victim = NULL;
     remap_texture *remapped = NULL;
-    transient_texture **snapshot = allow_snapshot ? oldest_idle_snapshot() : NULL;
+    transient_texture **snapshot = allow_snapshot ? oldest_idle_snapshot_kind(-1, bytes) : NULL;
     if (snapshot) {
         if (pvr_wait_render_done())
             return hardware_fail(error, size, "PVR texture reclamation completion failed");
@@ -1458,6 +1477,12 @@ static int evict_texture(texture *protected, size_t bytes, int allow_snapshot,
     for (unsigned fenced = 0; fenced < 2; ++fenced) {
         /* Prefer an allocation large enough to open the requested hole. */
         for (unsigned pass = 0; pass < 2; ++pass) {
+            if (pass && bytes && allow_snapshot && (snapshot = oldest_idle_snapshot())) {
+                if (pvr_wait_render_done())
+                    return hardware_fail(error, size, "PVR texture reclamation completion failed");
+                free_transient(snapshot);
+                return 0;
+            }
             size_t minimum = pass ? 0 : bytes;
             for (unsigned i = 0; i < CACHE_COUNT; ++i)
                 if (&cache[i] != protected && cache[i].storage && !cache[i].read_end &&
@@ -1543,26 +1568,67 @@ static pvr_ptr_t allocate_texture(texture *protected, size_t bytes,
     }
 }
 
+static int reclaimable_without_drain(texture *protected, size_t bytes, int preserve_small) {
+    for (unsigned i = 0; i < CACHE_COUNT; ++i)
+        if (&cache[i] != protected && cache[i].storage && !cache[i].read_end &&
+            (!preserve_small || cache[i].bytes >= bytes || cache[i].source_bytes >= bytes))
+            return 1;
+    for (unsigned i = 0; i < REMAP_COUNT; ++i)
+        if (remaps[i].image && !remaps[i].queued &&
+            (!preserve_small ||
+             remaps[i].dimension * remaps[i].dimension *
+                 (remaps[i].group == SHARED_GROUPS ? 2u : 1u) >= bytes))
+            return 1;
+    return oldest_idle_snapshot_kind(-1, preserve_small ? bytes : 0) != NULL;
+}
+
 static pvr_ptr_t allocate_texture_without_drain(texture *protected, size_t bytes,
+                                                int preserve_small,
                                                 char *error, size_t size) {
+    /* A failed speculative page build falls back to a compact snapshot.
+     * Retry on renderer frees, newly idle large allocations, increased free
+     * VRAM, or periodically in case an external allocation changed the heap. */
+    if (preserve_small && failed_page_allocation.bytes &&
+        bytes >= failed_page_allocation.bytes &&
+        failed_page_allocation.generation == vram_free_generation &&
+        failed_page_allocation.skipped < PAGE_RETRY_SKIPS &&
+        !reclaimable_without_drain(protected, bytes, 1)) {
+        unsigned vblank = (unsigned)pvr_get_vbl_count();
+        if (vblank != failed_page_allocation.vblank) {
+            size_t available = pvr_mem_available();
+            failed_page_allocation.vblank = vblank;
+            if (available > failed_page_allocation.available) goto retry;
+            failed_page_allocation.available = available;
+        }
+        ++failed_page_allocation.skipped;
+        return NULL;
+    }
+retry:
     for (;;) {
         pvr_ptr_t memory = pvr_mem_malloc(bytes);
-        if (memory) return memory;
-        int reclaimable = 0;
-        for (unsigned i = 0; i < CACHE_COUNT; ++i)
-            if (&cache[i] != protected && cache[i].storage && !cache[i].read_end)
-                reclaimable = 1;
-        for (unsigned i = 0; i < REMAP_COUNT; ++i)
-            if (remaps[i].image && !remaps[i].queued)
-                reclaimable = 1;
-        if (oldest_idle_snapshot()) reclaimable = 1;
-        if (!reclaimable) return NULL;
+        if (memory) {
+            if (preserve_small && bytes >= failed_page_allocation.bytes)
+                memset(&failed_page_allocation, 0, sizeof failed_page_allocation);
+            return memory;
+        }
+        /* Speculative page builds can fall back to a compact snapshot; do not
+         * discard smaller allocations that may not form a contiguous hole. */
+        if (!reclaimable_without_drain(protected, bytes, preserve_small)) {
+            if (preserve_small) {
+                failed_page_allocation.bytes = bytes;
+                failed_page_allocation.available = pvr_mem_available();
+                failed_page_allocation.skipped = 0;
+                failed_page_allocation.generation = vram_free_generation;
+                failed_page_allocation.vblank = (unsigned)pvr_get_vbl_count();
+            }
+            return NULL;
+        }
         if (evict_texture(protected, bytes, 1, error, size)) return NULL;
     }
 }
 
 static transient_texture *snapshot_picture_image(const target *source, char *error, size_t size) {
-    transient_texture *snapshot = calloc(1, sizeof *snapshot);
+    transient_texture *snapshot = zeroed_aligned(_Alignof(transient_texture), sizeof *snapshot);
     if (!snapshot) {
         fail(error, size, "cannot allocate PVR converted texture record");
         return NULL;
@@ -1640,7 +1706,7 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
     }
     transient_texture *existing = find_snapshot(m, left, top, dimension, zero_mask);
     if (existing) return existing;
-    transient_texture *t = calloc(1, sizeof *t);
+    transient_texture *t = zeroed_aligned(_Alignof(transient_texture), sizeof *t);
     if (!t) {
         fail(error, size, "cannot allocate PVR converted texture record");
         return NULL;
@@ -1658,7 +1724,7 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
         active_transient_pin->texture = NULL;
         transients = t->next;
         for (unsigned i = 0; i < 2; ++i)
-            if (t->image[i]) pvr_mem_free(t->image[i]);
+            if (t->image[i]) free_vram(t->image[i]);
         free(t);
         return NULL;
     }
@@ -1706,7 +1772,7 @@ static transient_texture *snapshot_texture(const gex_gpu_material *m,
         while (storage > SNAPSHOT_BYTES - (retained_snapshot_bytes - retained_title_bytes) ||
                storage > CACHE_BYTES - cache_bytes) {
             int kind = storage > SNAPSHOT_BYTES - (retained_snapshot_bytes - retained_title_bytes) ? 0 : -1;
-            transient_texture **victim = oldest_idle_snapshot_kind(kind);
+            transient_texture **victim = oldest_idle_snapshot_kind(kind, 0);
             if (!victim) break;
             if (!fenced && pvr_wait_render_done()) {
                 active_transient_pin->texture = NULL;
@@ -1861,21 +1927,28 @@ rebuild:
         t->storage = storage;
         cache_bytes += storage;
         t->source = avoid_drain ?
-            allocate_texture_without_drain(t, source_bytes, error, size) :
+            allocate_texture_without_drain(t, source_bytes, 1, error, size) :
             allocate_texture(t, source_bytes, "page-source", m->page,
                              m->rgb, m->opcode, error, size);
         if (t->source)
             t->image[0] = avoid_drain ?
-                allocate_texture_without_drain(t, bytes, error, size) :
+                allocate_texture_without_drain(t, bytes, 1, error, size) :
                 allocate_texture(t, bytes, "page-image", m->page,
                                  m->rgb, m->opcode, error, size);
         if (t->image[0] && masked)
             t->image[1] = avoid_drain ?
-                allocate_texture_without_drain(t, bytes, error, size) :
+                allocate_texture_without_drain(t, bytes, 1, error, size) :
                 allocate_texture(t, bytes, "page-alpha", m->page,
                                  m->rgb, m->opcode, error, size);
         if (!t->source || !t->image[0] || (masked && !t->image[1])) {
+            unsigned generation = vram_free_generation;
             release_texture(t);
+            if (avoid_drain && generation != vram_free_generation &&
+                failed_page_allocation.bytes && (!error || !size || !*error)) {
+                failed_page_allocation.available = pvr_mem_available();
+                failed_page_allocation.generation = vram_free_generation;
+                failed_page_allocation.vblank = (unsigned)pvr_get_vbl_count();
+            }
             return NULL;
         }
     }
@@ -1910,17 +1983,25 @@ static texture *texture_region_impl(const gex_gpu_material *m, int raw, int u0, 
     if (avoid_drain && !cache_can_reserve(t, t->bytes * 2, 0)) return NULL;
     if (reserve_texture(t, t->bytes * 2, error, size)) return NULL;
     pvr_ptr_t unmasked = avoid_drain ?
-        allocate_texture_without_drain(t, t->bytes, error, size) :
+        allocate_texture_without_drain(t, t->bytes, 1, error, size) :
         allocate_texture(t, t->bytes, "page-alpha", m->page,
                          m->rgb, m->opcode, error, size);
     pvr_ptr_t masked = unmasked ?
-        (avoid_drain ? allocate_texture_without_drain(t, t->bytes, error, size) :
+        (avoid_drain ? allocate_texture_without_drain(t, t->bytes, 1, error, size) :
          allocate_texture(t, t->bytes, "page-alpha", m->page, m->rgb, m->opcode,
                           error, size)) : NULL;
     if (!unmasked || !masked) {
-        if (unmasked) pvr_mem_free(unmasked);
-        if (masked) pvr_mem_free(masked);
-        if (avoid_drain && (!error || !size || !*error)) return NULL;
+        unsigned generation = vram_free_generation;
+        if (unmasked) free_vram(unmasked);
+        if (masked) free_vram(masked);
+        if (avoid_drain && (!error || !size || !*error)) {
+            if (failed_page_allocation.bytes && generation != vram_free_generation) {
+                failed_page_allocation.available = pvr_mem_available();
+                failed_page_allocation.generation = vram_free_generation;
+                failed_page_allocation.vblank = (unsigned)pvr_get_vbl_count();
+            }
+            return NULL;
+        }
         fprintf(stderr, "[packet-gpu] alpha allocation failed: page=%lx opcode=%lx "
                 "cache=%lu free=%lu request=%lu\n",
                 (unsigned long)m->page, (unsigned long)m->opcode,
@@ -2775,7 +2856,7 @@ static int native_blit(void *data, int x, int y, int width, int height,
     unsigned tw = 8, th = 8;
     while (tw < (unsigned)width) tw *= 2;
     while (th < (unsigned)height) th *= 2;
-    transient_texture *texture = calloc(1, sizeof *texture);
+    transient_texture *texture = zeroed_aligned(_Alignof(transient_texture), sizeof *texture);
     if (!texture) return fail(error, size, "cannot allocate PVR asset texture record");
     texture->next = transients;
     transients = texture;
@@ -2934,7 +3015,7 @@ static int native_movie(void *data, const uint8_t *pixels, int width, int height
     t->background_count = t->background_at = 0;
     t->pending_key.valid = 0;
     if (native_clear(t, error, size)) return -1;
-    transient_texture *frame = calloc(1, sizeof *frame);
+    transient_texture *frame = zeroed_aligned(_Alignof(transient_texture), sizeof *frame);
     if (!frame) return fail(error, size, "cannot allocate PVR asset texture record");
     frame->next = transients;
     transients = frame;
@@ -3970,7 +4051,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
     uint32_t *staging = NULL;
     if (!texture) {
         staging = malloc(bytes);
-        texture = calloc(1, sizeof *texture);
+        texture = zeroed_aligned(_Alignof(transient_texture), sizeof *texture);
         if (!staging || !texture) {
             free(texture);
             fail(error, size, "cannot allocate PVR direct image staging");
@@ -3988,7 +4069,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                 goto done;
             }
             char allocation_error[256] = {0};
-            texture->image[pass] = allocate_texture_without_drain(NULL, bytes,
+            texture->image[pass] = allocate_texture_without_drain(NULL, bytes, 0,
                                                                    allocation_error, sizeof allocation_error);
             if (!texture->image[pass]) {
                 fail(error, size, allocation_error[0] ? allocation_error :
@@ -4006,7 +4087,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
             while (storage > limit - used ||
                    storage > CACHE_BYTES - cache_bytes) {
                 int kind = storage > limit - used ? !!title_id : -1;
-                transient_texture **victim = oldest_idle_snapshot_kind(kind);
+                transient_texture **victim = oldest_idle_snapshot_kind(kind, 0);
                 if (!victim) break;
                 if (!fenced && pvr_wait_render_done()) {
                     hardware_fail(error, size, "PVR direct image reclamation completion failed");
@@ -4094,6 +4175,16 @@ static int native_title_packet(void *target, uint32_t address, const uint8_t *pa
                                       error, size);
 }
 
+#if defined(GEX_DREAMCAST_PACKETLESS_TITLE) || defined(GEX_DREAMCAST_PACKETLESS_GAME)
+static int native_title_direct(void *target, uint32_t root, uint32_t anchor,
+                               const gex_raster_state *state, gex_gpu_direct_state *result,
+                               char *error, size_t size) {
+    return gex_dreamcast_title_draw_direct_tiles(target, root, anchor, state,
+                                                 native_title_image, native_polygon, result,
+                                                 error, size);
+}
+#endif
+
 const gex_packet_gpu *gex_packet_gpu_get(void) {
     static const gex_gpu_title_ops title = {gex_dreamcast_title_record, native_title_packet,
                                             gex_dreamcast_title_forget,
@@ -4103,6 +4194,27 @@ const gex_packet_gpu *gex_packet_gpu_get(void) {
                                             gex_dreamcast_map_cel_record
 #else
                                             NULL, NULL
+#endif
+#ifdef GEX_DREAMCAST_PACKETLESS_TITLE
+                                            , gex_dreamcast_title_record_direct
+#else
+                                            , NULL
+#endif
+#if defined(GEX_DREAMCAST_PACKETLESS_TITLE) || defined(GEX_DREAMCAST_PACKETLESS_GAME)
+                                            ,
+                                            gex_dreamcast_title_has_direct, native_title_direct,
+                                            gex_dreamcast_title_reset_lists
+#else
+                                            , NULL, NULL, NULL
+#endif
+#ifdef GEX_DREAMCAST_PACKETLESS_GAME
+                                            , gex_dreamcast_scene_cel_record_direct,
+                                            gex_dreamcast_backdrop_record_direct,
+                                            gex_dreamcast_title_merge_lists,
+                                            gex_dreamcast_palette_record, gex_dreamcast_palette_take,
+                                            gex_dreamcast_palette_reset
+#else
+                                            , NULL, NULL, NULL, NULL, NULL, NULL
 #endif
     };
     static const gex_gpu_native_ops native = {native_clear,   native_copy, native_blit,
@@ -4116,6 +4228,18 @@ const gex_packet_gpu *gex_packet_gpu_get(void) {
                                               gex_dreamcast_map_scaled_cel
 #else
                                               NULL, NULL, NULL, NULL
+#endif
+#ifdef GEX_DREAMCAST_PACKETLESS_GAME
+                                              , gex_dreamcast_map_chunk_direct,
+                                              gex_dreamcast_map_cel_direct,
+                                              gex_dreamcast_map_scaled_cel_direct,
+                                              GEX_DREAMCAST_MAP_CHUNK_PACKET_BOUND,
+                                              GEX_DREAMCAST_MAP_CEL_PACKET_BOUND,
+                                              GEX_DREAMCAST_MAP_SCALED_CEL_PACKET_BOUND,
+                                              gex_dreamcast_backdrop_tiles_direct,
+                                              GEX_DREAMCAST_BACKDROP_PACKET_BOUND
+#else
+                                              , NULL, NULL, NULL, 0, 0, 0, NULL, 0
 #endif
     };
     static const gex_packet_gpu backend = {create, destroy, upload, download,

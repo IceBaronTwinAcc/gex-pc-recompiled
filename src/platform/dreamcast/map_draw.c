@@ -1,5 +1,6 @@
 #include "map_draw.h"
 #include "map_plan.h"
+#include "title_draw.h"
 #include <string.h>
 
 typedef struct {
@@ -106,6 +107,104 @@ static void retire_chunk_allocation(const gex_gpu_guest_io *io,
         *batch_end = end;
     }
     *cursor = allocations[index].end;
+}
+
+int gex_dreamcast_backdrop_tiles_direct(const gex_gpu_guest_io *io, uint32_t location,
+                                        uint16_t palette, const uint32_t roots[2]) {
+    uint32_t tails[2];
+    uint8_t uv[3], fade[3];
+    if (!io || !io->read || !location || location > UINT32_MAX - 15 || !roots ||
+        read_bytes(io, location + 12, uv, sizeof uv) ||
+        read_bytes(io, 0x4a2af8, fade, sizeof fade) ||
+        read32(io, 0x4a2b18, &tails[0]) || read32(io, 0x4a2b14, &tails[1]))
+        return 0;
+    gex_dreamcast_tile_draw tiles[40] = {0};
+    for (unsigned i = 0; i < 40; ++i) {
+        gex_dreamcast_tile_draw *tile = &tiles[i];
+        tile->x[0] = (uint16_t)((i / 8) * 64);
+        tile->y[0] = (uint16_t)((i % 8) * 32);
+        tile->u[0] = (uint8_t)(uv[0] << 2);
+        tile->v[0] = uv[2];
+        tile->width = 64;
+        tile->height = 32;
+        tile->clut = palette;
+        tile->rgb = UINT32_C(0x64000000) | (uint32_t)fade[0] << 16 |
+                    (uint32_t)fade[1] << 8 | fade[2];
+    }
+    return gex_dreamcast_title_record_cel_tiles(tiles, 40, roots, tails);
+}
+
+int gex_dreamcast_map_chunk_direct(const gex_gpu_guest_io *io, uint32_t chunk,
+                                   uint32_t definitions, int32_t x, int32_t y,
+                                   int width, int height) {
+    if (!io || !io->read || width != 320 || (height != 240 && height != 256) ||
+        x < -0x40000000 || x > 0x40000000 ||
+        y < -0x40000000 || y > 0x40000000) return 0;
+    uint32_t table, pages, tails[4];
+    uint16_t screen_x, screen_y, last_page[2] = {0xffff, 0xffff};
+    uint8_t fade[3];
+    if (read32(io, 0x4a2ae8, &table) || read32(io, 0x460e08, &pages) ||
+        read16(io, 0x4a2a96, &screen_x) || read16(io, 0x4a2a94, &screen_y) ||
+        read_bytes(io, 0x4a2af8, fade, 3) ||
+        read32(io, 0x46bc74, &tails[0]) || read32(io, 0x46bc70, &tails[1]) ||
+        read32(io, 0x46bc6c, &tails[2]) || read32(io, 0x46bc68, &tails[3]) ||
+        !pages || (int16_t)screen_x < -256 || (int16_t)screen_x > 256 ||
+        (int16_t)screen_y < -256 || (int16_t)screen_y > 256) return 0;
+    gex_map_tile tiles[GEX_MAP_TILE_LIMIT];
+    gex_dreamcast_tile_draw draws[GEX_MAP_TILE_LIMIT];
+    size_t count;
+    if (gex_dreamcast_map_plan(io->read, io->context, chunk, table, definitions,
+                                x, y, (int16_t)screen_x, (int16_t)screen_y,
+                                width, height, tiles, &count)) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        const gex_map_tile *tile = &tiles[i];
+        uint8_t header[10], image_flags, palette_header[4];
+        uint16_t page_index, page, uv;
+        uint32_t tint, palette = 0;
+        if (read_bytes(io, tile->image + 20, header, sizeof header) ||
+            read_bytes(io, tile->image + 16, &image_flags, 1) ||
+            (image_flags & 3) == 3 || read16(io, tile->image + 18, &page_index) ||
+            read32(io, tile->descriptor + 8, &tint)) return 0;
+        if ((image_flags & 3) != 2) {
+            if (!io->prepare_palette || read32(io, tile->descriptor + 4, &palette) ||
+                palette < 4 || read_bytes(io, palette - 4, palette_header, sizeof palette_header))
+                return 0;
+            int16_t slot = (int16_t)word(palette_header + 2);
+            if (slot < -1 || slot >= (palette_header[0] ? 64 : 384)) return 0;
+        }
+        int64_t address = (int64_t)pages + (int16_t)page_index * 8;
+        if (address <= 0 || address > UINT32_MAX - 3 ||
+            read16(io, (uint32_t)address, &page) ||
+            read16(io, (uint32_t)address + 2, &uv)) return 0;
+        gex_dreamcast_tile_draw *draw = &draws[i];
+        memset(draw, 0, sizeof *draw);
+        draw->layer = !!(tile->spec & 0x2000);
+        draw->is_quad = !!(tile->spec & 0xc000);
+        draw->page_change = !draw->is_quad && last_page[draw->layer] != page;
+        draw->page = draw->is_quad ? page : page & 0x1ff;
+        draw->palette_address = palette;
+        last_page[draw->layer] = page;
+        draw->rgb = (uint32_t)fade[2] | (uint32_t)fade[1] << 8 |
+                    (uint32_t)fade[0] << 16 | (tint & 0x8080u ? 0x66000000u : 0x64000000u);
+        draw->width = header[2];
+        draw->height = header[3];
+        draw->wrap_x = screen_x;
+        draw->wrap_y = screen_y;
+        int offset_x = (int16_t)word(header + 4), offset_y = (int16_t)word(header + 6);
+        int flip_x = !!(tile->spec & 0x4000), flip_y = !!(tile->spec & 0x8000);
+        int x0 = (tile->x >> 16) + (flip_x ? 32 - offset_x : offset_x);
+        int y0 = (tile->y >> 16) + (flip_y ? 32 - offset_y : offset_y);
+        int x1 = x0 + (flip_x ? -(int)draw->width : draw->width);
+        int y1 = y0 + (flip_y ? -(int)draw->height : draw->height);
+        uint8_t u = (uint8_t)uv, v = (uint8_t)(uv >> 8);
+        for (unsigned vertex = 0; vertex < 4; ++vertex) {
+            draw->x[vertex] = (uint16_t)((vertex & 1) ? x1 : x0);
+            draw->y[vertex] = (uint16_t)((vertex & 2) ? y1 : y0);
+            draw->u[vertex] = (uint8_t)(u + ((vertex & 1) ? draw->width - 1 : 0));
+            draw->v[vertex] = (uint8_t)(v + ((vertex & 2) ? draw->height - 1 : 0));
+        }
+    }
+    return gex_dreamcast_title_record_tiles(io, draws, count, tails);
 }
 
 int gex_dreamcast_map_chunk(const gex_gpu_guest_io *io, uint32_t chunk,
@@ -274,6 +373,112 @@ typedef struct {
     uint8_t packet[40];
 } flipped_command;
 
+static void flipped_quad(const gex_gpu_cel_draw *draw, unsigned format,
+                         const uint8_t record[8], const uint8_t location[4],
+                         gex_dreamcast_tile_draw *quad) {
+    memset(quad, 0, sizeof *quad);
+    uint16_t page = word(location);
+    if (!(draw->tint & 1)) page |= 0x20;
+    unsigned u = location[2], v = location[3];
+    unsigned uv_width = record[2], uv_height = record[3];
+    int offset_x = (int16_t)word(record + 4), offset_y = (int16_t)word(record + 6);
+    int flip_x = !!(draw->flags & 0x80000000u);
+    int flip_y = !!(draw->flags & 0x40000000u);
+    uint16_t x0 = (uint16_t)(draw->x + (flip_x ? -offset_x : offset_x));
+    uint16_t y0 = (uint16_t)(draw->y + (flip_y ? -offset_y : offset_y));
+    uint16_t x1 = (uint16_t)(x0 + (flip_x ? -(int)record[2] : record[2]));
+    uint16_t y1 = (uint16_t)(y0 + (flip_y ? -(int)record[3] : record[3]));
+    if (flip_x) {
+        if (u) --u;
+        else if (format == 1) { --page; u = 127; }
+        else --uv_width;
+    } else if (u + uv_width == 256) {
+        --uv_width;
+    }
+    if (flip_y) {
+        if (v) --v;
+        else --uv_height;
+    } else if (v + uv_height == 256) {
+        --uv_height;
+    }
+    quad->page = page;
+    quad->clut = draw->palette;
+    quad->wrap_x = (uint16_t)-draw->wrap_x;
+    quad->wrap_y = (uint16_t)-draw->wrap_y;
+    quad->is_quad = 1;
+    quad->rgb = (draw->rgb & 0xffffffu) |
+                (draw->tint & 0x8080u ? 0x2e000000u : 0x2c000000u);
+    for (unsigned vertex = 0; vertex < 4; ++vertex) {
+        quad->x[vertex] = (vertex & 1) ? x1 : x0;
+        quad->y[vertex] = (vertex & 2) ? y1 : y0;
+        quad->u[vertex] = (uint8_t)(u + ((vertex & 1) ? uv_width : 0));
+        quad->v[vertex] = (uint8_t)(v + ((vertex & 2) ? uv_height : 0));
+    }
+}
+
+int gex_dreamcast_map_cel_direct(const gex_gpu_guest_io *io,
+                                 const gex_gpu_cel_draw *draw, const uint32_t roots[2]) {
+    enum { LIMIT = 128 };
+    if (!io || !io->read || !io->write || !draw || !roots ||
+        !draw->image || !draw->atlas ||
+        draw->image > UINT32_MAX - 20 - (LIMIT + 1) * 8) return 0;
+    uint32_t tails[2];
+    uint16_t last_page;
+    uint8_t image_flags;
+    if (read32(io, 0x4a2b18, &tails[0]) || read32(io, 0x4a2b14, &tails[1]) ||
+        read16(io, 0x4a2b20, &last_page) ||
+        read_bytes(io, draw->image + 16, &image_flags, 1) || (image_flags & 3) == 3)
+        return 0;
+    int flipped = !!(draw->flags & 0xc0000000u);
+    gex_dreamcast_tile_draw quads[LIMIT];
+    uint32_t atlas = draw->atlas;
+    size_t count = 0;
+    for (; count <= LIMIT; ++count) {
+        uint8_t record[8], location[4];
+        if (read_bytes(io, draw->image + 20 + (uint32_t)count * 8, record, sizeof record))
+            return 0;
+        if (!(record[0] | record[1])) break;
+        if (count == LIMIT || !record[2] || !record[3] || !atlas) return 0;
+        uint32_t next;
+        if (image_flags & 0x40) {
+            if (atlas > UINT32_MAX - 8 || read_bytes(io, atlas, location, sizeof location))
+                return 0;
+            next = atlas + 8;
+        } else {
+            if (atlas > UINT32_MAX - 20 || read_bytes(io, atlas + 16, location, sizeof location) ||
+                read32(io, atlas + 4, &next))
+                return 0;
+        }
+        if (flipped) {
+            flipped_quad(draw, image_flags & 3, record, location, &quads[count]);
+            last_page = quads[count].page;
+        } else {
+            uint16_t page = word(location);
+            if (!(draw->tint & 1)) page |= 0x20;
+            gex_dreamcast_tile_draw *tile = &quads[count];
+            memset(tile, 0, sizeof *tile);
+            tile->x[0] = (uint16_t)(draw->x + (int16_t)word(record + 4));
+            tile->y[0] = (uint16_t)(draw->y + (int16_t)word(record + 6));
+            tile->u[0] = location[2]; tile->v[0] = location[3];
+            tile->width = record[2]; tile->height = record[3];
+            tile->wrap_x = (uint16_t)-draw->wrap_x;
+            tile->wrap_y = (uint16_t)-draw->wrap_y;
+            tile->page_change = page != last_page;
+            tile->page = page & 0x1ff;
+            tile->clut = draw->palette;
+            tile->rgb = (draw->rgb & 0xffffffu) |
+                        (draw->tint & 0x8080u ? 0x66000000u : 0x64000000u);
+            last_page = page;
+        }
+        atlas = next;
+    }
+    if (!count) return 0;
+    int result = gex_dreamcast_title_record_cel_tiles(quads, count, roots, tails);
+    if (result <= 0) return result;
+    write16(io, 0x4a2b20, last_page);
+    return 1;
+}
+
 int gex_dreamcast_map_flipped_cel(const gex_gpu_guest_io *io,
                                   const gex_gpu_cel_draw *draw, uint32_t *previous_tail) {
     enum { LIMIT = 128, PAIR_SIZE = 80 };
@@ -313,31 +518,8 @@ int gex_dreamcast_map_flipped_cel(const gex_gpu_guest_io *io,
                 read32(io, atlas + 4, &next))
                 return 0;
         }
-        uint16_t page = location[0] | (uint16_t)location[1] << 8;
-        if (!(draw->tint & 1)) page |= 0x20;
-        unsigned u = location[2], v = location[3];
-        unsigned uv_width = record[2], uv_height = record[3];
-        int offset_x = (int16_t)(record[4] | (uint16_t)record[5] << 8);
-        int offset_y = (int16_t)(record[6] | (uint16_t)record[7] << 8);
-        int flip_x = !!(draw->flags & 0x80000000u);
-        int flip_y = !!(draw->flags & 0x40000000u);
-        uint16_t x0 = (uint16_t)(draw->x + (flip_x ? -offset_x : offset_x));
-        uint16_t y0 = (uint16_t)(draw->y + (flip_y ? -offset_y : offset_y));
-        uint16_t x1 = (uint16_t)(x0 + (flip_x ? -(int)record[2] : record[2]));
-        uint16_t y1 = (uint16_t)(y0 + (flip_y ? -(int)record[3] : record[3]));
-        if (flip_x) {
-            if (u) --u;
-            else if (format == 1) { --page; u = 127; }
-            else --uv_width;
-        } else if (u + uv_width == 256) {
-            --uv_width;
-        }
-        if (flip_y) {
-            if (v) --v;
-            else --uv_height;
-        } else if (v + uv_height == 256) {
-            --uv_height;
-        }
+        gex_dreamcast_tile_draw quad;
+        flipped_quad(draw, format, record, location, &quad);
         if (end - cursor < PAIR_SIZE) cursor = begin;
         for (unsigned i = 0; i < 2; ++i)
             if (tails[i] >= cursor && tails[i] < cursor + PAIR_SIZE) return 0;
@@ -347,19 +529,16 @@ int gex_dreamcast_map_flipped_cel(const gex_gpu_guest_io *io,
         flipped_command *cmd = &commands[count];
         cmd->address = cursor;
         if (read_bytes(io, cursor, cmd->packet, sizeof cmd->packet)) return 0;
-        put32(cmd->packet + 4, (draw->rgb & 0xffffffu) |
-              (draw->tint & 0x8080u ? 0x2e000000u : 0x2c000000u));
-        put16(cmd->packet + 8, x0); put16(cmd->packet + 10, y0);
-        cmd->packet[12] = (uint8_t)u; cmd->packet[13] = (uint8_t)v;
-        put16(cmd->packet + 14, draw->palette);
-        put16(cmd->packet + 16, x1); put16(cmd->packet + 18, y0);
-        cmd->packet[20] = (uint8_t)(u + uv_width); cmd->packet[21] = (uint8_t)v;
-        put16(cmd->packet + 22, page);
-        put16(cmd->packet + 24, x0); put16(cmd->packet + 26, y1);
-        cmd->packet[28] = (uint8_t)u; cmd->packet[29] = (uint8_t)(v + uv_height);
-        put16(cmd->packet + 32, x1); put16(cmd->packet + 34, y1);
-        cmd->packet[36] = (uint8_t)(u + uv_width);
-        cmd->packet[37] = (uint8_t)(v + uv_height);
+        put32(cmd->packet + 4, quad.rgb);
+        for (unsigned vertex = 0; vertex < 4; ++vertex) {
+            unsigned at = 8 + vertex * 8;
+            put16(cmd->packet + at, quad.x[vertex]);
+            put16(cmd->packet + at + 2, quad.y[vertex]);
+            cmd->packet[at + 4] = quad.u[vertex];
+            cmd->packet[at + 5] = quad.v[vertex];
+        }
+        put16(cmd->packet + 14, quad.clut);
+        put16(cmd->packet + 22, quad.page);
         cursor += PAIR_SIZE;
         atlas = next;
         if (!atlas && count + 1 < LIMIT) {
@@ -506,6 +685,74 @@ static int scaled_coordinate(int offset, int32_t span, int32_t divisor,
     return 0;
 }
 
+static int scaled_quad(const gex_gpu_scaled_cel_draw *draw, const uint8_t record[8],
+                       const uint8_t location[4], gex_dreamcast_tile_draw *quad) {
+    uint16_t x0, x1, y0, y1;
+    int ox = (int16_t)word(record + 4), oy = (int16_t)word(record + 6);
+    if (scaled_coordinate(ox, draw->span_x, draw->divisor_x, draw->x, &x0) ||
+        scaled_coordinate(ox + record[2], draw->span_x, draw->divisor_x, draw->x, &x1) ||
+        scaled_coordinate(oy, draw->span_y, draw->divisor_y, draw->y, &y0) ||
+        scaled_coordinate(oy + record[3], draw->span_y, draw->divisor_y, draw->y, &y1))
+        return -1;
+    memset(quad, 0, sizeof *quad);
+    quad->page = word(location);
+    if (!(draw->tint & 1)) quad->page |= 0x20;
+    quad->clut = draw->palette;
+    quad->wrap_x = (uint16_t)-draw->wrap_x;
+    quad->wrap_y = (uint16_t)-draw->wrap_y;
+    quad->is_quad = 1;
+    quad->rgb = draw->rgb;
+    for (unsigned vertex = 0; vertex < 4; ++vertex) {
+        quad->x[vertex] = (vertex & 1) ? x1 : x0;
+        quad->y[vertex] = (vertex & 2) ? y1 : y0;
+        quad->u[vertex] = (uint8_t)(location[2] + ((vertex & 1) ? record[2] - 1 : 0));
+        quad->v[vertex] = (uint8_t)(location[3] + ((vertex & 2) ? record[3] - 1 : 0));
+    }
+    return 0;
+}
+
+int gex_dreamcast_map_scaled_cel_direct(const gex_gpu_guest_io *io,
+                                        const gex_gpu_scaled_cel_draw *draw,
+                                        const uint32_t roots[2], uint32_t *last_atlas) {
+    enum { LIMIT = 128 };
+    if (!io || !io->read || !io->write || !draw || !roots || !last_atlas ||
+        ((draw->rgb >> 24) & ~2u) != 0x2c || !draw->image ||
+        draw->image > UINT32_MAX - 16 || !draw->tiles || !draw->atlas ||
+        draw->tiles > UINT32_MAX - (LIMIT + 1) * 8) return 0;
+    uint32_t tails[2];
+    uint8_t flags;
+    if (read32(io, 0x4a2b18, &tails[0]) || read32(io, 0x4a2b14, &tails[1]) ||
+        read_bytes(io, draw->image + 16, &flags, 1) || (flags & 3) == 3) return 0;
+    gex_dreamcast_tile_draw quads[LIMIT];
+    uint32_t atlas = draw->atlas, final_atlas = 0;
+    size_t count = 0;
+    for (; count <= LIMIT; ++count) {
+        uint8_t record[8], location[4];
+        if (read_bytes(io, draw->tiles + (uint32_t)count * 8, record, sizeof record)) return 0;
+        if (!(record[0] | record[1])) break;
+        if (count == LIMIT || !record[2] || !record[3] || !atlas) return 0;
+        uint32_t next;
+        if (flags & 0x40) {
+            if (atlas > UINT32_MAX - 8 || read_bytes(io, atlas, location, sizeof location))
+                return 0;
+            next = final_atlas = atlas + 8;
+        } else {
+            if (atlas > UINT32_MAX - 20 || read_bytes(io, atlas + 16, location, sizeof location) ||
+                read32(io, atlas + 4, &next))
+                return 0;
+            final_atlas = atlas;
+        }
+        if (scaled_quad(draw, record, location, &quads[count])) return 0;
+        atlas = next;
+    }
+    if (!count) return 0;
+    int result = gex_dreamcast_title_record_cel_tiles(quads, count, roots, tails);
+    if (result <= 0) return result;
+    write16(io, 0x4a2b20, quads[count - 1].page);
+    *last_atlas = final_atlas;
+    return 1;
+}
+
 int gex_dreamcast_map_scaled_cel(const gex_gpu_guest_io *io,
                                  const gex_gpu_scaled_cel_draw *draw, uint32_t *last_atlas) {
     enum { LIMIT = 128, PAIR_SIZE = 80 };
@@ -543,13 +790,8 @@ int gex_dreamcast_map_scaled_cel(const gex_gpu_guest_io *io,
                 return 0;
             final_atlas = atlas;
         }
-        uint16_t x0, x1, y0, y1;
-        int ox = (int16_t)word(record + 4), oy = (int16_t)word(record + 6);
-        if (scaled_coordinate(ox, draw->span_x, draw->divisor_x, draw->x, &x0) ||
-            scaled_coordinate(ox + record[2], draw->span_x, draw->divisor_x, draw->x, &x1) ||
-            scaled_coordinate(oy, draw->span_y, draw->divisor_y, draw->y, &y0) ||
-            scaled_coordinate(oy + record[3], draw->span_y, draw->divisor_y, draw->y, &y1))
-            return 0;
+        gex_dreamcast_tile_draw quad;
+        if (scaled_quad(draw, record, location, &quad)) return 0;
         if (end - cursor < PAIR_SIZE) cursor = begin;
         for (unsigned i = 0; i < 2; ++i)
             if (tails[i] >= cursor && tails[i] < cursor + PAIR_SIZE) return 0;
@@ -559,21 +801,16 @@ int gex_dreamcast_map_scaled_cel(const gex_gpu_guest_io *io,
         flipped_command *cmd = &commands[count];
         cmd->address = cursor;
         if (read_bytes(io, cursor, cmd->packet, sizeof cmd->packet)) return 0;
-        put32(cmd->packet + 4, draw->rgb);
-        put16(cmd->packet + 8, x0); put16(cmd->packet + 10, y0);
-        cmd->packet[12] = location[2]; cmd->packet[13] = location[3];
-        put16(cmd->packet + 14, draw->palette);
-        put16(cmd->packet + 16, x1); put16(cmd->packet + 18, y0);
-        cmd->packet[20] = (uint8_t)(location[2] + record[2] - 1);
-        cmd->packet[21] = location[3];
-        uint16_t page = word(location);
-        if (!(draw->tint & 1)) page |= 0x20;
-        put16(cmd->packet + 22, page);
-        put16(cmd->packet + 24, x0); put16(cmd->packet + 26, y1);
-        cmd->packet[28] = location[2];
-        cmd->packet[29] = (uint8_t)(location[3] + record[3] - 1);
-        put16(cmd->packet + 32, x1); put16(cmd->packet + 34, y1);
-        cmd->packet[36] = cmd->packet[20]; cmd->packet[37] = cmd->packet[29];
+        put32(cmd->packet + 4, quad.rgb);
+        for (unsigned vertex = 0; vertex < 4; ++vertex) {
+            unsigned at = 8 + vertex * 8;
+            put16(cmd->packet + at, quad.x[vertex]);
+            put16(cmd->packet + at + 2, quad.y[vertex]);
+            cmd->packet[at + 4] = quad.u[vertex];
+            cmd->packet[at + 5] = quad.v[vertex];
+        }
+        put16(cmd->packet + 14, quad.clut);
+        put16(cmd->packet + 22, quad.page);
         cursor += PAIR_SIZE;
         atlas = next;
     }

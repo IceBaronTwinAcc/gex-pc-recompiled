@@ -15,6 +15,7 @@ typedef struct gex_raster_state {
     int layout; /* 0 = world pixels, 1 = centered UI, 2 = tiled 320x224 backdrop. */
     int pixel_scale, offset_x; /* Replicate rasterized HUD pixels; zero means 1x. */
     int world_clip, world_left, world_top, world_right, world_bottom;
+    int repeat_backdrop;
 } gex_raster_state;
 
 gex_raster *gex_raster_create(int width, int height);
@@ -46,5 +47,7 @@ void gex_raster_packet(gex_raster *raster, const uint8_t *packet,
                        const gex_raster_state *state);
 int gex_raster_title_packet(gex_raster *raster, uint32_t address, const uint8_t *packet,
                             const gex_raster_state *state);
+int gex_raster_title_direct(gex_raster *raster, uint32_t root, uint32_t anchor,
+                            const gex_raster_state *state, gex_gpu_direct_state *result);
 
 #endif

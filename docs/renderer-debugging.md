@@ -103,6 +103,231 @@ effects and are not measurements of GPU execution alone. Animation counter
 and camera position were matched across comparisons, but complete game state
 was not; instrumentation and differing workloads make the figures approximate.
 
+## Experimental Dreamcast packetless title draws
+
+`GEX_DREAMCAST_PACKETLESS_TITLE` is off by default. When enabled for the PVR
+backend, supported scene-63 CEL draws are attached to the current guest list
+tails instead of allocating deferred marker packets. The renderer submits them
+after their anchor, in insertion order. Each of the two guest lists retains its
+own copy until that list is reset or its anchor is overwritten. The shared
+guest bridge uses optional renderer callbacks; the queue and PVR submission
+remain in `src/platform/dreamcast/`.
+
+This is not a fully packetless title pipeline. Backdrop draws, menu-clipped or
+HUD-range draws, unsupported CELs, and other guest packet producers retain the
+existing path. Do not remove those fallbacks. A direct-backdrop experiment
+increased the measured frame time substantially and is not enabled. The direct
+path records tint at generation time, whereas legacy markers can be edited
+afterward. No marker tint changes were observed in the sampled idle-title and
+start-transition control runs, but other title routes remain unverified.
+
+In one warmed, 300-frame, headless Flycast idle-title comparison, game-thread CPU
+averaged 14.32 ms/frame with markers and 12.36 ms/frame with direct draws.
+Both averaged 33.51 ms wall/frame with 300 two-vblank intervals. The direct
+run dispatched 23,621 direct draws and 5,084 marker draws; the remaining markers
+came from the backdrop. These are instrumented emulator measurements, not
+physical Dreamcast results. Two sampled idle scanouts matched pixel-for-pixel;
+another differed in the animated background, and matching full game state was
+not established. An autoplay start transition reached the map and gameplay in
+both configurations. A separate input probe entered the password screen; three
+sampled scanouts during that route matched. Exit and other routes remain
+unverified.
+
+On a physical Dreamcast using an optical-drive emulator, the combined
+packetless hardware image reportedly stopped during movie skipping and at the
+level-map transition. A title-only image allowed movie skipping but remained
+on "Loading...", and the legacy-only control also stopped at the transition.
+The combined image remained on the loading screen for two minutes. An earlier
+pre-packetless build worked on the same setup. These observations do not
+identify the cause. Headless Flycast autoplay reached the map and gameplay with
+both title-only and legacy-only configurations.
+On a later legacy-only diagnostic build, the user reported reaching the map
+before a panic screen showed category `00000001`, saved PC `8C336F3C`, and
+TEA `00000088`. The PC resolves to the snapshot-index removal loop in that
+build's `free_transient`.
+
+`00000001 8C336FB8 17DD26FC 8C38F0CC 0000040 8CC152B8`
+
+TODO: [Human-written explanation of the alignment evidence and remaining
+physical-hardware verification.]
+
+## Experimental packetless map and gameplay draws
+
+`GEX_DREAMCAST_PACKETLESS_GAME` is off by default and independent of the title
+and native-map options. It uses the same optional renderer callbacks and
+per-list sidecar queue for the repeating backdrops, supported CELs and
+direct-color or indexed tile chunks in scene 49 and the first gameplay level
+(scene 3).
+The Dreamcast backend captures compressed CELs where supported; gameplay draws
+also use the current world clip. Supported flipped, unflipped and scaled CELs
+use their prepared atlas locations and CLUT to record direct draws, preserving
+guest UV boundaries, both list copies and final page state. Unflipped sprites
+inherit the actual raster page after their anchor, while explicit page commands
+and quads update it. Scaled draws also preserve the guest's final atlas pointer
+and fall back for unsupported geometry. Active HUD, menu-clipped, transition,
+unsupported assets, and other scene draws fall back. After completed HUD draws,
+direct world draws are allowed only if their bounded legacy allocation cannot
+overlap the recorded HUD ranges or wrap the packet arena. The gameplay backdrop
+uses the guest's prepared atlas and palette and retains its 40 tiled draws.
+
+Tile draws retain the two copies and layer order of the four temporary guest
+lists. At each layer merge, direct draws anchored to an empty temporary-list
+root move to the main-list tail, while draws anchored to legacy packet nodes
+keep those nodes. List resets and overwritten anchors retire the corresponding
+copies. Unsupported chunks fall back as a whole; an empty visible chunk is
+accepted without allocating draws. Indexed tiles call the guest palette-cache
+routine in tile order, preserving its LRU updates and deferred palette uploads;
+the returned CLUT is stored with each direct draw. Supported palette cache
+misses are attached to the current upload-list tail without allocating guest
+packets. The guest bridge drains them at the root and after each legacy upload,
+reading source pixels at drain time and using the existing atlas invalidation
+callbacks. List initialization, draining, and overwritten anchors retire pending
+uploads. Invalid rectangles, GPU-owned picture overlaps, unavailable callbacks,
+and insufficient sidecar capacity retain the guest upload path. Preflight and
+sidecar allocation finish before the first palette operation so a rejected
+chunk does not partially change guest state.
+
+This is not a fully packetless map or gameplay pipeline: unsupported chunks
+and other draw producers still allocate guest packets. In an instrumented headless Flycast
+autoplay run, the direct callback accepted at least 4,925 of 5,376 scene-49
+requests and 1,833 of 2,048 scene-3 requests; these are callback counts, not
+total draw counts. A later route accepted all of its first 96 direct backdrop
+requests with native-map both enabled and disabled. A repeated-jump route
+reached scene 3, submitted more than 6,000 indexed tile polygons, and exited
+normally. An earlier probe counted only accepted chunks and missed visible
+indexed chunks that fell back; it did not establish that gameplay tiles were
+empty. The new submission count is instrumented, not a count of unique tiles.
+In paired headless repeated-jump runs using the same packetless renderer, a
+palette-upload probe recorded 204 direct uploads and one legacy upload in the
+candidate; the comparison kept all uploads on the legacy path. The first 131
+scene-3 upload rectangles, widths, and source hashes matched. Later gameplay
+and camera states diverged; screenshots from those runs therefore do not prove
+pixel equivalence. Both runs reached scene 3 and exited normally. Another idle
+gameplay scanout recorded the same scene frame, player, and camera positions
+in both upload modes. The bottom 100 rows of the 640x480 captures matched
+exactly, but animation counters differed and 4,919 pixels elsewhere differed.
+That limited terrain comparison is not proof of full-frame equivalence.
+
+A separate 90-frame repeated-jump sample after player initialization compared
+only the palette-upload paths. Legacy uploads averaged 36.49 ms game-thread
+CPU and 51.93 ms wall per frame; direct uploads averaged 35.92 ms CPU and
+51.03 ms wall. Player and camera positions matched at both sample endpoints,
+but animation and aggregate state fingerprints differed. These figures do not
+establish a speedup or physical-hardware performance. After the player returned
+to the map, both runs emitted repeated `pvr_mem` out-of-memory diagnostics
+(40 legacy, 50 direct), although both exited normally. The allocator retries
+after reclaiming textures; the cause and visual impact of this pressure remain
+unverified. Reclamation now prefers an idle allocation large enough for a
+failed request before evicting smaller snapshots. In two later repeated-jump
+routes that returned to the map, no allocation failure was observed; their
+workloads were not matched to the earlier failures, so they do not prove the
+fragmentation issue resolved. A packet-rendering control averaged 24.20 ms CPU and 38.16 ms
+wall over 90 frames, but followed a different player and camera trajectory and
+did not return to the map during the run, so it cannot isolate that pressure
+or establish a packetless performance regression.
+
+Three additional runs of the same instrumented return-to-map route reached
+scene 3, returned to scene 49, and exited without allocator errors. Their
+observations were identical, so they do not establish coverage of the earlier
+fragmented workload or prove the issue fixed.
+
+The existing KOS fragmented-feedback fixture passed in headless Flycast, but
+checks rejection of unsupported framebuffer sampling under fragmentation; it
+does not reproduce the page-allocation eviction chains. The strict PVR
+resource-lifetime fixture also passed with both framebuffer emulation and RTT
+readback enabled. Without framebuffer emulation, its scanout checks failed in
+Flycast, so those results do not establish a hardware regression.
+
+The fragmented-page fixture interleaves 64 small cached images with live
+separators and leaves free holes smaller than a 131,072-byte page. Previously,
+one page request evicted all 64 images and made 65 failed allocation attempts.
+Speculative page and alpha allocations now preserve smaller cached allocations
+and use the compact snapshot fallback when no individually large enough idle
+allocation exists. In the fixture this reduces that request to one failed
+attempt; a separate case verifies that an idle large page is still reclaimed.
+Repeated speculative requests now back off after a failed allocation, while
+smaller requests remain eligible. In the fixture, 21 distinct fragmented page
+requests now cause one large allocation attempt instead of 21. The renderer
+retries after a VRAM release, when a large allocation becomes idle, when
+sampled free VRAM increases, or after 64 skipped requests. The fixture checks
+those paths, continued rendering, and page-cache recovery. Free VRAM is sampled
+at most once per vertical blank while backing off; the periodic retry also
+covers unobserved external heap changes. This does not eliminate fragmentation
+or establish physical-hardware performance.
+
+In a later isolated experiment that allowed direct chunks after completed HUD
+draws, the map return produced two failed 131,072-byte allocations. They
+recovered after 9 and 42 evictions respectively; a repeat did not reproduce
+the failures. The size-aware policy therefore does not eliminate the observed
+retry problem. The implementation now uses the bounded HUD-range check above
+rather than unconditionally allowing these draws.
+
+In one further instrumented route, direct flipped CELs were submitted at least
+100 times each in scenes 49 and 3, and the run returned to the map and exited
+normally. Paired scene-3 captures with direct and legacy flipped CELs had the
+same sampled player and camera positions but different animation counters:
+2,217 of 307,200 pixels differed, while the bottom 100 rows matched. This is
+not full-state or full-frame equivalence. The focused host fixture compares
+both copies of flipped quads across formats, flips, UV page edges, and
+multi-part ordering against the legacy packet geometry.
+
+Another instrumented route observed direct unflipped CELs at least 100 times in
+scene 3 and direct scaled CELs at least once each in scenes 49 and 3. It
+returned to the map and exited normally. Focused host fixtures compare direct
+unflipped and scaled geometry against legacy packets, including both list
+copies, page edges, multiple atlas records and fallback cases. Paired gameplay
+timings with and without direct scaled draws followed different player, camera
+and animation states, so they cannot establish a performance change. Earlier
+unflipped scanouts also had different game states and do not establish visual
+equivalence.
+
+One 180-frame gameplay inventory counted 18,070 legacy sprite packets and
+3,369 page commands. Of 500 chunk requests, 239 used the direct callback and
+261 were gated by previously recorded HUD ranges; none of those 261 occurred
+inside an active HUD draw. A separate experimental build removed that guard
+only for chunks and accepted all 497 requests in its corresponding sample,
+but still processed 14,879 sprite packets. The runs had different game states.
+A later 180-frame route with bounded HUD checks, inherited-page CELs and direct
+gameplay backdrops counted 1,342 legacy sprite packets and 277 page commands.
+These inventories are not matched comparisons.
+
+Direct sidecar markers are indexed by both anchor and list root. List resets
+and merges inspect only the relevant root bucket; anchor retirement still
+removes the associated copies. The root index preserves insertion order when
+draws move from temporary to main lists. A sampled 90-frame gameplay profile
+reported approximately 7.7 ms/frame in direct draw submission, 4.3 ms in CEL
+callbacks, 2.6 ms in chunk callbacks, 1.8 ms in list resets and 0.2 ms in list
+merges. These inclusive estimates overlap and are not additive. The route did
+not exercise the direct gameplay backdrop, and its game state differed from
+earlier profiles; it does not establish a matched speedup.
+
+A separate warmed, 180-frame headless Flycast map comparison with native-map
+enabled averaged 20.76 ms game-thread CPU and 36.48 ms wall per frame for the
+control, versus 18.00 ms CPU and 33.88 ms wall for packetless game. The control
+had 148 two-vblank intervals and the candidate 176. The sampled animation and
+camera fingerprints differed, so these numbers are approximate and do not
+establish a matched workload or physical Dreamcast performance. One early
+gameplay scanout matched pixel-for-pixel. A repeated-jump
+capture with indexed submissions showed different camera and player states,
+so it cannot establish indexed-tile pixel equivalence. Other gameplay levels,
+routes, and producers remain unverified.
+
+In a later test-only idle gameplay probe, the pending PVR command list was
+replayed without retiring its textures to capture the same guest state. The
+packetless and legacy 640x480 Flycast scanouts matched in all 307,200 pixels;
+the logged camera, player position, global animation counter, and three player
+animation fields also matched. The probe altered game timing and did not verify
+the entire guest state, other frames, or physical hardware. An earlier probe
+that repeatedly copied the framebuffer produced black images and is not valid
+visual evidence.
+
+On a 180-frame warmed repeated-jump gameplay sample, the control averaged
+22.31 ms game-thread CPU and 34.07 ms wall per frame; the candidate averaged
+26.22 ms CPU and 38.07 ms wall. Their state fingerprints differed, so this is
+not a matched-workload comparison and does not establish a regression or a
+speedup. A shorter route returned to the map before a comparable sample could
+be collected. These measurements are from Flycast, not Dreamcast hardware.
+
 ## Experimental Dreamcast level-selection map
 
 `GEX_DREAMCAST_NATIVE_MAP` is off by default. When enabled, the Dreamcast

@@ -5,7 +5,9 @@ import unittest
 from tools.graphics_rewrite import (
     FUNCTIONS, FRAME_BEGIN, FRAME_ENTRY, FRAME_END, FRAME_RETURN,
     PACKET_BEGIN, PACKET_ENTRY, TITLE_ANCHOR, TITLE_HOOK, BACKDROP_ANCHOR, BACKDROP_HOOK,
-    MAP_CHUNK_CALL, MAP_CHUNK_HOOK, MAP_FLIPPED_ANCHOR, MAP_FLIPPED_HOOK,
+    BACKDROP_HOOK_OLD,
+    MAP_CHUNK_CALL, MAP_CHUNK_HOOK, MAP_CHUNK_HOOK_OLD, MAP_FLIPPED_ANCHOR,
+    MAP_FLIPPED_HOOK, MAP_FLIPPED_HOOK_OLD,
     MAP_SCALED_ANCHOR, MAP_SCALED_HOOK,
     ARENA_RETURN, ARENA_HOOK, VIEW_HOOKS,
     VIEW_BOUNDS, TILE_EDGES, SCREEN_HOOKS, HUD_DRAWS, PLAYER_DRAWS, rewrite_graphics,
@@ -23,11 +25,31 @@ class GraphicsRewriteTests(unittest.TestCase):
         self.assertEqual(rewrite_graphics(source.replace("004445A8", "004445A9")),
                          source.replace("004445A8", "004445A9"))
 
+    def test_title_list_reset_hooks_are_idempotent(self):
+        for address in ("0043DB1B", "0043DC5C", "0043E569"):
+            anchor = next(key for key in SCREEN_HOOKS if f"0x{address}:" in key)
+            hook = SCREEN_HOOKS[anchor]
+            expected = hook + "\n" + anchor
+            self.assertEqual(rewrite_graphics(anchor), expected)
+            self.assertEqual(rewrite_graphics(expected), expected)
+            self.assertEqual(rewrite_graphics(anchor.replace(address, "0043DC5D")),
+                             anchor.replace(address, "0043DC5D"))
+
+    def test_palette_hooks_preserve_upload_list_order_and_are_idempotent(self):
+        for address in ("0043DB2E", "0043DB7D", "0043DB97", "0043DB9D", "0043EDD2"):
+            anchor = next(key for key in SCREEN_HOOKS if f"0x{address}:" in key)
+            expected = SCREEN_HOOKS[anchor] + "\n" + anchor
+            self.assertEqual(rewrite_graphics(anchor), expected)
+            self.assertEqual(rewrite_graphics(expected), expected)
+            unchanged = anchor.replace(address, "00430000")
+            self.assertEqual(rewrite_graphics(unchanged), unchanged)
+
     def test_backdrop_hook_follows_page_setup_and_is_idempotent(self):
         source = BACKDROP_ANCHOR + "\n"
         result = rewrite_graphics(source)
         self.assertEqual(result, BACKDROP_HOOK + "\n")
         self.assertEqual(rewrite_graphics(result), result)
+        self.assertEqual(rewrite_graphics(BACKDROP_HOOK_OLD + "\n"), result)
         unchanged = source.replace("0043F14F", "0043F150")
         self.assertEqual(rewrite_graphics(unchanged), unchanged)
 
@@ -36,12 +58,14 @@ class GraphicsRewriteTests(unittest.TestCase):
         result = rewrite_graphics(source)
         self.assertEqual(result, MAP_CHUNK_HOOK + "\n")
         self.assertEqual(rewrite_graphics(result), result)
+        self.assertEqual(rewrite_graphics(MAP_CHUNK_HOOK_OLD), MAP_CHUNK_HOOK)
 
     def test_map_flipped_hook_is_idempotent(self):
         source = MAP_FLIPPED_ANCHOR + "\n"
         result = rewrite_graphics(source)
         self.assertEqual(result, MAP_FLIPPED_HOOK + "\n")
         self.assertEqual(rewrite_graphics(result), result)
+        self.assertEqual(rewrite_graphics(MAP_FLIPPED_HOOK_OLD), MAP_FLIPPED_HOOK)
         unchanged = source.replace("0043DCEE", "0043DCEF")
         self.assertEqual(rewrite_graphics(unchanged), unchanged)
 

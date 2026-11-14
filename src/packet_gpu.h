@@ -36,6 +36,8 @@ typedef struct {
     void (*write)(void *context, uint32_t address, const void *data, size_t size);
     void (*allocated)(void *context, uint32_t next);
     int (*matches)(void *context, uint32_t address, const void *data, size_t size);
+    /* Apply the guest palette-cache operation and return its CLUT coordinate. */
+    uint16_t (*prepare_palette)(void *context, uint32_t address);
 } gex_gpu_guest_io;
 
 typedef struct {
@@ -46,6 +48,16 @@ typedef struct {
 typedef struct {
     uint32_t eax, ecx, edx;
 } gex_gpu_cel_result;
+
+typedef struct {
+    uint32_t page, page_command;
+    int page_valid, page_command_valid;
+} gex_gpu_direct_state;
+
+typedef struct {
+    uint32_t rectangle, source;
+    unsigned width;
+} gex_gpu_palette_upload;
 
 typedef struct {
     uint32_t image, tiles, atlas, tint, rgb;
@@ -67,6 +79,25 @@ typedef struct {
     /* Optional deferred generation for other authored scenes. */
     int (*record_scene)(const gex_gpu_guest_io *io, uint32_t scene,
                         uint32_t object, uint32_t cel, char *error, size_t size);
+    /* Optional draws attached after a guest-list node without allocating a packet. */
+    int (*record_direct)(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel,
+                         const uint32_t roots[2], char *error, size_t size);
+    int (*has_direct)(uint32_t root, uint32_t anchor);
+    int (*draw_direct)(void *target, uint32_t root, uint32_t anchor,
+                       const struct gex_raster_state *state, gex_gpu_direct_state *result,
+                       char *error, size_t size);
+    void (*reset_lists)(uint32_t first, uint32_t second);
+    int (*record_scene_direct)(const gex_gpu_guest_io *io, uint32_t scene,
+                               uint32_t object, uint32_t cel, const uint32_t roots[2],
+                               char *error, size_t size);
+    int (*backdrop_direct)(const gex_gpu_guest_io *io, uint32_t scene,
+                           const uint32_t roots[2], char *error, size_t size);
+    void (*merge_lists)(const uint32_t source[2], const uint32_t roots[2],
+                        const uint32_t tails[2]);
+    /* Deferred uploads are ordered after the specified guest-list anchor. */
+    int (*record_palette)(uint32_t anchor, const gex_gpu_palette_upload *upload);
+    int (*take_palette)(uint32_t anchor, gex_gpu_palette_upload *upload);
+    void (*reset_palettes)(void);
 } gex_gpu_title_ops;
 
 /* GPU-owned pictures never need CPU materialization. Asset blits upload CPU
@@ -113,6 +144,23 @@ typedef struct {
                              gex_gpu_cel_result *result);
     int (*map_scaled_cel)(const gex_gpu_guest_io *io, const gex_gpu_scaled_cel_draw *draw,
                           uint32_t *last_atlas);
+    /* Return 1 when recorded, 0 to fall back, or -1 on allocation failure. */
+    int (*map_chunk_direct)(const gex_gpu_guest_io *io, uint32_t chunk, uint32_t definitions,
+                            int32_t x, int32_t y, int width, int height);
+    int (*map_cel_direct)(const gex_gpu_guest_io *io, const gex_gpu_cel_draw *draw,
+                          const uint32_t roots[2]);
+    int (*map_scaled_cel_direct)(const gex_gpu_guest_io *io,
+                                 const gex_gpu_scaled_cel_draw *draw, const uint32_t roots[2],
+                                 uint32_t *last_atlas);
+    /* Upper bound on the guest arena bytes replaced by one direct chunk,
+     * including palette uploads. Zero means the bound is unavailable. */
+    uint32_t map_chunk_packet_bound;
+    /* CEL bounds apply after the guest has prepared the palette and atlas. */
+    uint32_t map_cel_packet_bound, map_scaled_cel_packet_bound;
+    /* A prepared repeating world backdrop, attached after its page command. */
+    int (*backdrop_tiles_direct)(const gex_gpu_guest_io *io, uint32_t location,
+                                 uint16_t palette, const uint32_t roots[2]);
+    uint32_t backdrop_packet_bound;
 } gex_gpu_native_ops;
 
 typedef struct {

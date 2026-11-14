@@ -15,7 +15,8 @@ FUNCTIONS = {
 # Cooperative/exclusive display ownership is not part of the new renderer.
 MOVIE_OWNERSHIP = ((0x40478D, 0x40479E), (0x4047D8, 0x4047E9))
 FRAME_ENTRY = "    RECOMP_ENTER(0x00445140u);"
-FRAME_BEGIN = f"{FRAME_ENTRY}\n    gex_graphics_begin_frame();"
+FRAME_BEGIN_OLD = f"{FRAME_ENTRY}\n    gex_graphics_begin_frame();"
+FRAME_BEGIN = f"{FRAME_BEGIN_OLD}\n    gex_graphics_list_begin(MEM32(esp + 4));"
 PACKET_ENTRY = "    RECOMP_ENTER(0x00444DC0u);"
 PACKET_OLD = f"{PACKET_ENTRY}\n    gex_graphics_draw_packet(MEM32(esp + 4));"
 PACKET_BEGIN = (f"{PACKET_ENTRY}\n"
@@ -25,16 +26,20 @@ TITLE_ANCHOR = "    if (TEST_Z(_flag_a, _flag_b)) goto L_004447EF; /* 0x004445A8
 TITLE_HOOK = (f"{TITLE_ANCHOR}\n"
               "    if (gex_graphics_title_try(MEM32(esp + 0x3C), ecx)) goto L_004447EF;")
 BACKDROP_ANCHOR = "    MEM32(0x4A2B14) = ecx; /* 0x0043F14F: mov dword ptr [0x4a2b14], ecx */"
+BACKDROP_HOOK_OLD = (f"{BACKDROP_ANCHOR}\n"
+                     "    if (gex_graphics_backdrop_try()) { edx = 0x100; goto L_0043F221; }")
 BACKDROP_HOOK = (f"{BACKDROP_ANCHOR}\n"
-                 "    if (gex_graphics_backdrop_try()) { edx = 0x100; goto L_0043F221; }")
+                 "    if (gex_graphics_backdrop_try(ebp, MEM16(esp + 0x12))) "
+                 "{ edx = 0x100; goto L_0043F221; }")
 MAP_CHUNK_CALL = "    RECOMP_CALL(sub_0043FCE0); /* 0x0043FCA7: call 0x43fce0 */"
-MAP_CHUNK_HOOK = (
+MAP_CHUNK_HOOK_OLD = (
     "    if (!gex_graphics_map_chunk_try(MEM32(esp), MEM32(esp + 4),\n"
     "                                    (int32_t)MEM32(esp + 8), (int32_t)MEM32(esp + 12)))\n"
     f"    {MAP_CHUNK_CALL}")
+MAP_CHUNK_HOOK = "    RECOMP_REGS_OUT();\n" + MAP_CHUNK_HOOK_OLD
 MAP_FLIPPED_ANCHOR = ("    esp = esp + 4; /* 0x0043DCEE: add esp, 4 */\n"
                       "    _flag_k = FK_ADD;")
-MAP_FLIPPED_HOOK = (
+MAP_FLIPPED_HOOK_OLD = (
     f"{MAP_FLIPPED_ANCHOR}\n"
     "    uint32_t map_previous_tail;\n"
     "    if (gex_graphics_map_flipped_cel_try(ebx - 0x14, MEM8(esp + 0x2C) ?\n"
@@ -52,6 +57,17 @@ MAP_FLIPPED_HOOK = (
     "            MEM16(esp + 0x3C), MEM16(esp + 0x40), MEM16(esp + 0x50),\n"
     "            MEM16(esp + 0x54), MEM16(esp + 0x16), &map_result)) {\n"
     "        eax = map_result.eax; ecx = map_result.ecx; edx = map_result.edx;\n"
+    "        goto L_0043DEDA;\n"
+    "    }")
+MAP_FLIPPED_HOOK = MAP_FLIPPED_HOOK_OLD.replace(
+    MAP_FLIPPED_ANCHOR,
+    MAP_FLIPPED_ANCHOR + "\n"
+    "    if (gex_graphics_map_cel_direct_try(ebx - 0x14, MEM8(esp + 0x2C) ?\n"
+    "            MEM32(esp + 0x20) : MEM32(esp + 0x1C), MEM32(esp + 0x4C),\n"
+    "            MEM32(esp + 0x48), MEM32(esp + 0x28), MEM16(esp + 0x3C),\n"
+    "            MEM16(esp + 0x40), MEM16(esp + 0x50), MEM16(esp + 0x54),\n"
+    "            MEM16(esp + 0x16))) {\n"
+    "        if (MEM32(esp + 0x4C) & 0xc0000000u) goto L_0043E2B2;\n"
     "        goto L_0043DEDA;\n"
     "    }")
 MAP_SCALED_ANCHOR = "L_00443895:"
@@ -73,6 +89,33 @@ FRAME_END = f"    gex_graphics_end_frame();\n{FRAME_RETURN}"
 ARENA_RETURN = "    RECOMP_FLAGS_OUT(); esp += 4; return; /* 0x0044114B: ret  */"
 ARENA_HOOK = f"    gex_graphics_packet_arena();\n{ARENA_RETURN}"
 SCREEN_HOOKS = {
+    "    RECOMP_ENTER(0x00440510u);": "    gex_graphics_tile_lists_merge(0);",
+    "    RECOMP_ENTER(0x00440560u);": "    gex_graphics_tile_lists_merge(1);",
+    "    MEM32(0x464E48) = ecx; /* 0x0043DB2E: mov dword ptr [0x464e48], ecx */":
+        "    gex_graphics_palette_reset();",
+    "    esi = MEM32(0x464E48); /* 0x0043DB7D: mov esi, dword ptr [0x464e48] */":
+        "    gex_graphics_palette_flush(0x464E48);",
+    "    esi = MEM32(esi); /* 0x0043DB97: mov esi, dword ptr [esi] */":
+        "    gex_graphics_palette_flush(esi);",
+    "    MEM32(0x464E48) = 0; /* 0x0043DB9D: mov dword ptr [0x464e48], 0 */":
+        "    gex_graphics_palette_reset();",
+    "    eax = MEM32(0x4A2AE4); /* 0x0043EDD2: mov eax, dword ptr [0x4a2ae4] */": (
+        "    {\n"
+        "        uint32_t palette = MEM32(ebp + (-0xC));\n"
+        "        unsigned width = MEM8(palette) ? 256 : 16;\n"
+        "        if (gex_graphics_palette_try(MEM32(0x4A2B1C), MEM32(ecx + 0xC),\n"
+        "                                     palette + 4, width)) {\n"
+        "            _flag_a = width == 16 ? 0xFFFFFF10u : 0;\n"
+        "            _flag_b = 0x100u; _cf = width == 16; _flag_k = FK_ADD;\n"
+        "            goto L_0043EE3E;\n"
+        "        }\n"
+        "    }"),
+    "    MEM32(0x4A2B14) = ebx; /* 0x0043DB1B: mov dword ptr [0x4a2b14], ebx */":
+        "    gex_graphics_title_lists_reset(MEM32(0x4A2B18), ebx);",
+    "    MEM32(0x4A2B14) = edx; /* 0x0043DC5C: mov dword ptr [0x4a2b14], edx */":
+        "    gex_graphics_title_lists_reset(MEM32(0x4A2B18), edx);",
+    "    MEM32(0x4A2B14) = ebx; /* 0x0043E569: mov dword ptr [0x4a2b14], ebx */":
+        "    gex_graphics_title_lists_reset(MEM32(0x4A2B18), ebx);",
     "    RECOMP_ENTER(0x00405240u);": "    gex_graphics_cpu_access();",
     "L_0040527A:": "    if (gex_graphics_native_operation(0x405240)) goto L_0040529C;",
     "    RECOMP_ENTER(0x00405450u);": (
@@ -116,7 +159,9 @@ VIEW_HOOKS = {
         "    gex_graphics_camera_barrier(MEM32(esp + 4));",
     "L_0040A36C:": "    gex_graphics_scene_begin();",
     "L_0040A4C0:": "    gex_graphics_scene_end();",
-    "    RECOMP_ENTER(0x0043FB40u);": "    if (gex_graphics_draw_tiles()) return;",
+    "    RECOMP_ENTER(0x0043FB40u);": (
+        "    if (gex_graphics_draw_tiles()) return;\n"
+        "    gex_graphics_tile_lists_reset();"),
 }
 
 # Original instruction addresses, not global numerical substitutions: atlas
@@ -165,6 +210,13 @@ PLAYER_DRAWS = (
 
 def rewrite_graphics(text):
     text = text.replace(
+        "    RECOMP_ENTER(0x0043FB40u);\n    if (gex_graphics_draw_tiles()) return;\n"
+        "    gex_graphics_tile_lists_reset();",
+        "    RECOMP_ENTER(0x0043FB40u);")
+    text = text.replace(
+        "    RECOMP_ENTER(0x0043FB40u);\n    if (gex_graphics_draw_tiles()) return;",
+        "    RECOMP_ENTER(0x0043FB40u);")
+    text = text.replace(
         "    RECOMP_ENTER(0x00440850u);\n    gex_graphics_transition_begin();",
         "    RECOMP_ENTER(0x00440850u);")
     for address in PLAYER_DRAWS:
@@ -199,13 +251,17 @@ def rewrite_graphics(text):
                     f"{original}\n    }}\n    gex_graphics_hud_end(esi);")
         # Both branches use the same normalized wrapper, including rotated CELs.
         text = re.sub(pattern, hud_draw, text)
-    text = text.replace(FRAME_BEGIN, FRAME_ENTRY).replace(FRAME_ENTRY, FRAME_BEGIN)
+    text = text.replace(FRAME_BEGIN, FRAME_ENTRY).replace(FRAME_BEGIN_OLD, FRAME_ENTRY)
+    text = text.replace(FRAME_ENTRY, FRAME_BEGIN)
     text = text.replace(PACKET_OLD, PACKET_ENTRY)
     text = text.replace(PACKET_BEGIN, PACKET_ENTRY).replace(PACKET_ENTRY, PACKET_BEGIN)
     text = text.replace(TITLE_HOOK, TITLE_ANCHOR).replace(TITLE_ANCHOR, TITLE_HOOK)
-    text = text.replace(BACKDROP_HOOK, BACKDROP_ANCHOR).replace(BACKDROP_ANCHOR, BACKDROP_HOOK)
-    text = text.replace(MAP_CHUNK_HOOK, MAP_CHUNK_CALL).replace(MAP_CHUNK_CALL, MAP_CHUNK_HOOK)
+    text = text.replace(BACKDROP_HOOK, BACKDROP_ANCHOR).replace(
+        BACKDROP_HOOK_OLD, BACKDROP_ANCHOR).replace(BACKDROP_ANCHOR, BACKDROP_HOOK)
+    text = text.replace(MAP_CHUNK_HOOK, MAP_CHUNK_CALL).replace(MAP_CHUNK_HOOK_OLD, MAP_CHUNK_CALL)
+    text = text.replace(MAP_CHUNK_CALL, MAP_CHUNK_HOOK)
     text = text.replace(MAP_FLIPPED_HOOK, MAP_FLIPPED_ANCHOR).replace(
+        MAP_FLIPPED_HOOK_OLD, MAP_FLIPPED_ANCHOR).replace(
         MAP_FLIPPED_ANCHOR, MAP_FLIPPED_HOOK)
     text = text.replace(MAP_SCALED_HOOK, MAP_SCALED_ANCHOR).replace(
         MAP_SCALED_ANCHOR, MAP_SCALED_HOOK)

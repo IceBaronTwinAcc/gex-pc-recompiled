@@ -48,10 +48,12 @@ static uint32_t backdrop_scene, backdrop_map;
 static uint32_t fixed_scene, fixed_map;
 static uint32_t fixed_level;
 static uint32_t frame_scene, frame_map;
+static uint32_t title_list_root;
 static int transition_active;
 static struct hud_range { uint32_t begin, end; int scale, offset_x; } *hud_ranges;
 static size_t hud_count, hud_capacity;
 static struct hud_range hud_draw;
+static int hud_active;
 static void synchronize(int remember);
 
 static int fixed_screen(void) {
@@ -188,6 +190,7 @@ int gex_graphics_hud_begin(uint32_t object, int anchor, int scaled) {
     int64_t fit = (int64_t)render_width * 65536 / 320;
     if (scale > fit) scale = fit;
     int fraction = anchor == 1 ? 3 : anchor == 2 ? 1 : anchor == 3 ? 2 : 0;
+    hud_active = 1;
     hud_draw.scale = 0;
     hud_draw.begin = MEM32(0x4A2AE4);
     if (scale >= 65536) {
@@ -229,9 +232,29 @@ void gex_graphics_hud_end(uint32_t object) {
         hud_draw.end = MEM32(0x4A2AE4);
         hud_ranges[hud_count++] = hud_draw;
     }
+    hud_active = 0;
     hud_draw.scale = 0;
     const unsigned fields[] = {0x78, 0x7C, 0xC8, 0xCC};
     for (int i = 0; i < 4; ++i) MEM32(object + fields[i]) = saved_hud[i];
+}
+
+int gex_graphics_hud_blocks_direct(uint32_t packet_bound) {
+    if (hud_active) return 1;
+    if (!hud_count) return 0;
+    uint32_t begin = MEM32(0x4A2AE0), end = MEM32(0x4A2ADC);
+    uint32_t cursor = MEM32(0x4A2AE4);
+    if (!packet_bound || begin != packet_address || end < begin ||
+        end - begin != packet_bytes || cursor < begin || cursor > end ||
+        packet_bound > end - cursor) return 1;
+    uint32_t next = cursor + packet_bound;
+    for (size_t i = 0; i < hud_count; ++i) {
+        uint32_t first = hud_ranges[i].begin, last = hud_ranges[i].end;
+        if (first < begin || first > end || last < begin || last > end) return 1;
+        if (first <= last) {
+            if (cursor < last && first < next) return 1;
+        } else if (cursor < last || first < next) return 1;
+    }
+    return 0;
 }
 
 void gex_graphics_packet_arena(void) {
@@ -422,6 +445,7 @@ int gex_graphics_draw_tiles(void) {
     uint32_t map = MEM32(g_esp + 4), tiles = MEM32(g_esp + 8);
     int32_t camera_x = (int32_t)MEM32(g_esp + 12);
     int32_t camera_y = (int32_t)MEM32(g_esp + 16);
+    gex_graphics_tile_lists_reset();
     MEM32(0x46BC58) = MEM32(0x46BC5C) = 0xFFFFFF;
     MEM32(0x46BC60) = MEM32(0x46BC64) = 0xFFFFFF;
     MEM32(0x46BC68) = 0x46BC5C; MEM32(0x46BC6C) = 0x46BC58;
@@ -440,8 +464,11 @@ int gex_graphics_draw_tiles(void) {
         for (int x = first_x; x < last_x; ++x) {
             uint32_t chunk = MEM32(map + 44 + (y * columns + x) * 4);
             if (!chunk) continue;
-            PUSH32(g_esp, (uint32_t)((int64_t)y * 16777216 - camera_y));
-            PUSH32(g_esp, (uint32_t)((int64_t)x * 16777216 - camera_x));
+            int32_t tile_x = (int32_t)((int64_t)x * 16777216 - camera_x);
+            int32_t tile_y = (int32_t)((int64_t)y * 16777216 - camera_y);
+            if (gex_graphics_map_chunk_try(chunk, tiles, tile_x, tile_y)) continue;
+            PUSH32(g_esp, (uint32_t)tile_y);
+            PUSH32(g_esp, (uint32_t)tile_x);
             PUSH32(g_esp, tiles);
             PUSH32(g_esp, chunk);
             PUSH32(g_esp, 0);
@@ -718,6 +745,7 @@ void gex_graphics_shutdown(void) {
     free(hud_ranges);
     hud_ranges = NULL;
     hud_count = hud_capacity = 0;
+    hud_active = 0;
     hud_draw.scale = 0;
     fixed_scene = fixed_map = 0;
     fixed_level = 0;
@@ -768,6 +796,64 @@ static int picture_overlap(unsigned offset, unsigned bytes) {
         offset = (offset + count) & 0xfffff;
     }
     return 0;
+}
+
+int gex_graphics_palette_try(uint32_t anchor, uint32_t rectangle, uint32_t source,
+                             unsigned width) {
+    if (!packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || !gex_graphics_gpu_owned() || MEM32(0x451040) ||
+        !MEM32(0x4A33AC))
+        return 0;
+    uint32_t scene = displayed_level();
+    if (scene != 49 && scene != 3) return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->title || !native->title->record_palette ||
+        !native->title->take_palette || !native->title->reset_palettes ||
+        (!native->atlas_write_rect && !native->atlas_write))
+        return 0;
+    int x = (int16_t)rectangle, y = (int16_t)(rectangle >> 16);
+    if (!source || (width != 16 && width != 256) || source > UINT32_MAX - width * 2 ||
+        x < 0 || y < 0 ||
+        x + (int)width > 1024 || y >= 512 ||
+        picture_overlap((unsigned)y * 2048 + (unsigned)x * 2, width * 2))
+        return 0;
+    const gex_gpu_palette_upload upload = {rectangle, source, width};
+    int result = native->title->record_palette(anchor, &upload);
+    if (result < 0) hle_fatal("[packet-gpu] cannot allocate deferred palette upload");
+    return result;
+}
+
+void gex_graphics_palette_flush(uint32_t anchor) {
+    if (!gex_graphics_gpu_owned()) return;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->title || !native->title->take_palette) return;
+    gex_gpu_palette_upload upload;
+    while (native->title->take_palette(anchor, &upload)) {
+        bind_pictures();
+        unsigned x = upload.rectangle & 0xffff, y = upload.rectangle >> 16;
+        size_t bytes = (size_t)upload.width * 2;
+        unsigned offset = y * 2048 + x * 2;
+        uint8_t *atlas = (uint8_t *)ADDR(MEM32(0x4A33AC));
+        const uint8_t *source = (const uint8_t *)ADDR(upload.source);
+        if (!memcmp(atlas + offset, source, bytes)) continue;
+        if (native->atlas_write_rect)
+            native->atlas_write_rect(atlas, offset, 2048, bytes, 1);
+        else if (native->atlas_write)
+            native->atlas_write(atlas, offset, bytes);
+        else hle_fatal("[packet-gpu] deferred palette upload has no atlas invalidation");
+        for (size_t i = 0; i < bytes; i += 2) {
+            uint8_t lo = source[i], hi = source[i + 1];
+            atlas[offset + i] = lo;
+            atlas[offset + i + 1] = hi;
+        }
+    }
+}
+
+void gex_graphics_palette_reset(void) {
+    if (!gex_graphics_gpu_owned()) return;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (native && native->title && native->title->reset_palettes)
+        native->title->reset_palettes();
 }
 
 void gex_graphics_atlas_access(uint32_t rectangle) {
@@ -935,7 +1021,7 @@ static int texture_picture_overlap(uint32_t packet, unsigned page, unsigned form
     return 0;
 }
 
-int gex_graphics_draw_packet(uint32_t packet) {
+static int draw_packet(uint32_t packet) {
     if (!targets[0] || MEM32(0x451040) || !MEM32(0x4A33AC)) return 0;
     unsigned opcode = MEM8(packet + 7);
     if (gex_graphics_gpu_owned()) bind_pictures();
@@ -1016,6 +1102,74 @@ int gex_graphics_draw_packet(uint32_t packet) {
     return exclusive_gpu;
 }
 
+int gex_graphics_draw_packet(uint32_t packet) {
+    int result = draw_packet(packet);
+    if (!result || !title_list_root || !gex_graphics_gpu_owned()) return result;
+    const gex_gpu_title_ops *title = gex_packet_gpu_get()->native->title;
+    if (!title || !title->has_direct || !title->has_direct(title_list_root, packet))
+        return result;
+    int origin = MEM32(0x450010) >= 240 ? 240 : 0;
+    int layout = fixed_screen() ? 1 : 0;
+    uint32_t offset = MEM32(0x4A2F78) - MEM32(0x4A33AC);
+    unsigned page = (MEM8(0x4A2F90) << 7) | (((offset & 0x7FFFF) / 128) & 15) |
+                    (offset & 0x80000 ? 16 : 0);
+    gex_raster_state state = {
+        .atlas = (const uint8_t *)ADDR(MEM32(0x4A33AC)),
+        .modulation = (const uint8_t *)ADDR(0x4A2B50),
+        .page = page,
+        .left = (int32_t)MEM32(0x450008), .top = (int32_t)MEM32(0x450010),
+        .right = (int32_t)MEM32(0x45000C), .bottom = (int32_t)MEM32(0x450014),
+        .origin_y = origin, .layout = layout,
+        .repeat_backdrop = !transition_active && fixed_level != 66
+    };
+    uint32_t scene = MEM32(0x4A2990);
+    if (!state.layout && world_clip_active && scene == world_clip_scene &&
+        scene && MEM32(scene + 4) == world_clip_map) {
+        state.world_clip = 1;
+        state.world_left = world_clip[0]; state.world_top = world_clip[1];
+        state.world_right = world_clip[2]; state.world_bottom = world_clip[3];
+    }
+    gex_gpu_direct_state result_state = {0};
+    gex_raster_title_direct(targets[origin / 240], title_list_root, packet, &state,
+                            &result_state);
+    if (result_state.page_valid) {
+        page = result_state.page;
+        MEM32(0x4A2F78) = MEM32(0x4A33AC) + (page & 15) * 128 +
+                          ((page & 16) ? 0x80000 : 0);
+        MEM8(0x4A2F90) = (uint8_t)((page >> 7) & 3);
+    }
+    if (result_state.page_command_valid)
+        MEM8(0x4A33A0) = (result_state.page_command & 0x30) ? 0x30 : 0;
+    return result;
+}
+
+void gex_graphics_list_begin(uint32_t root) {
+    title_list_root = root;
+}
+
+void gex_graphics_title_lists_reset(uint32_t first, uint32_t second) {
+    if (!gex_graphics_gpu_owned()) return;
+    const gex_gpu_title_ops *title = gex_packet_gpu_get()->native->title;
+    if (title && title->reset_lists) title->reset_lists(first, second);
+}
+
+void gex_graphics_tile_lists_reset(void) {
+    gex_graphics_title_lists_reset(0x46bc64, 0x46bc60);
+    gex_graphics_title_lists_reset(0x46bc58, 0x46bc5c);
+}
+
+void gex_graphics_tile_lists_merge(unsigned layer) {
+    if (layer > 1 || !gex_graphics_gpu_owned()) return;
+    const gex_gpu_title_ops *title = gex_packet_gpu_get()->native->title;
+    unsigned buffer = MEM8(0x467170);
+    if (!title || !title->merge_lists || buffer >= 2) return;
+    const uint32_t source[2] = {layer ? 0x46bc58 : 0x46bc64,
+                                layer ? 0x46bc5c : 0x46bc60};
+    const uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+    const uint32_t tails[2] = {MEM32(0x4a2b18), MEM32(0x4a2b14)};
+    title->merge_lists(source, roots, tails);
+}
+
 static int title_guest_read(void *context, uint32_t address, void *out, size_t size) {
     (void)context;
     if (!address || size > UINT32_MAX - address) return -1;
@@ -1039,6 +1193,23 @@ static void title_guest_allocated(void *context, uint32_t next) {
     gex_graphics_packet_allocated(next);
 }
 
+static uint16_t title_guest_prepare_palette(void *context, uint32_t address) {
+    (void)context;
+    uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx, esp = g_esp;
+    uint32_t ebx = g_ebx, esi = g_esi, edi = g_edi, ebp = g_ebp;
+    uint32_t flags_k = g_flag_k, flags_a = g_flag_a, flags_b = g_flag_b;
+    uint32_t flags_cf = g_flag_cf, caller = g_cur_func;
+    PUSH32(g_esp, address);
+    PUSH32(g_esp, RECOMP_RETADDR);
+    sub_0043ECF0();
+    uint16_t clut = (uint16_t)g_eax;
+    g_eax = eax; g_ecx = ecx; g_edx = edx; g_esp = esp;
+    g_ebx = ebx; g_esi = esi; g_edi = edi; g_ebp = ebp;
+    g_flag_k = flags_k; g_flag_a = flags_a; g_flag_b = flags_b; g_flag_cf = flags_cf;
+    g_cur_func = caller;
+    return clut;
+}
+
 int gex_graphics_title_try(uint32_t object, uint32_t cel) {
     if (!cel || !packet_bytes || render_width != 320 || render_height != 240 ||
         transition_active || !gex_graphics_gpu_owned() ||
@@ -1051,40 +1222,111 @@ int gex_graphics_title_try(uint32_t object, uint32_t cel) {
     char error[512] = {0};
     uint32_t scene = displayed_level();
     int result;
-    if (MEM32(0x4A2964) == 63 && native->title->record)
-        result = native->title->record(&io, object, cel, error, sizeof error);
-    else if (native->title->record_scene)
-        result = native->title->record_scene(&io, scene, object, cel, error, sizeof error);
-    else return 0;
+    if (MEM32(0x4A2964) == 63 && native->title->record) {
+        result = 0;
+        unsigned buffer = MEM8(0x467170);
+        if (native->title->record_direct && buffer < 2 && !backdrop_active &&
+            !menu_clip.enabled && !menu_clip.building && !hud_count && !hud_active) {
+            uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+            result = native->title->record_direct(&io, object, cel, roots, error, sizeof error);
+        }
+        if (!result) result = native->title->record(&io, object, cel, error, sizeof error);
+    }
+    else {
+        result = 0;
+        unsigned buffer = MEM8(0x467170);
+        if (native->title->record_scene_direct && buffer < 2 && !backdrop_active &&
+            !menu_clip.enabled && !menu_clip.building && !hud_count && !hud_active) {
+            uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+            result = native->title->record_scene_direct(&io, scene, object, cel, roots,
+                                                        error, sizeof error);
+        }
+        if (!result && native->title->record_scene)
+            result = native->title->record_scene(&io, scene, object, cel, error, sizeof error);
+    }
     if (result < 0) hle_fatal("[packet-gpu] %s", error);
     return result;
 }
 
-int gex_graphics_backdrop_try(void) {
+int gex_graphics_backdrop_try(uint32_t location, uint16_t palette) {
     if (!packet_bytes || render_width != 320 || render_height != 240 ||
         transition_active || !gex_graphics_gpu_owned() ||
         MEM32(0x451040) || !MEM32(0x4A33AC))
         return 0;
     const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
-    if (!native || !native->title || !native->title->backdrop) return 0;
+    if (!native || !native->title ||
+        (!native->title->backdrop && !native->title->backdrop_direct)) return 0;
     const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
                                   title_guest_allocated, title_guest_matches};
     char error[512] = {0};
-    int result = native->title->backdrop(&io, displayed_level(), error, sizeof error);
+    uint32_t scene = displayed_level();
+    int result = 0;
+    unsigned buffer = MEM8(0x467170);
+    if (scene == 3 && native->backdrop_tiles_direct && buffer < 2 &&
+        !menu_clip.enabled && !menu_clip.building &&
+        !gex_graphics_hud_blocks_direct(native->backdrop_packet_bound)) {
+        uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+        result = native->backdrop_tiles_direct(&io, location, palette, roots);
+        if (result < 0) hle_fatal("[packet-gpu] cannot allocate direct backdrop tiles");
+        if (result) return 1;
+    }
+    if (native->title->backdrop_direct && buffer < 2 && !menu_clip.enabled &&
+        !menu_clip.building && !hud_count && !hud_active) {
+        uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+        result = native->title->backdrop_direct(&io, scene, roots, error, sizeof error);
+    }
+    if (!result && native->title->backdrop)
+        result = native->title->backdrop(&io, scene, error, sizeof error);
     if (result < 0) hle_fatal("[packet-gpu] %s", error);
     return result;
 }
 
 int gex_graphics_map_chunk_try(uint32_t chunk, uint32_t definitions, int32_t x, int32_t y) {
     if (!packet_bytes || render_width != 320 || render_height != 240 ||
-        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        transition_active || !gex_graphics_gpu_owned() ||
         MEM32(0x451040) || !MEM32(0x4A33AC))
         return 0;
     const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
-    if (!native || !native->map_chunk) return 0;
+    if (!native) return 0;
+    const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
+                                  title_guest_allocated, title_guest_matches,
+                                  title_guest_prepare_palette};
+    uint32_t scene = displayed_level();
+    if (native->map_chunk_direct && (scene == 49 || scene == 3) &&
+        MEM8(0x467170) < 2 && !backdrop_active && !menu_clip.enabled &&
+        !menu_clip.building && !gex_graphics_hud_blocks_direct(native->map_chunk_packet_bound)) {
+        int result = native->map_chunk_direct(&io, chunk, definitions, x, y,
+                                              320, scene == 3 ? 256 : 240);
+        if (result < 0) hle_fatal("[packet-gpu] cannot allocate direct tile draws");
+        if (result) return 1;
+    }
+    if (scene == 49 && native->map_chunk)
+        return native->map_chunk(&io, chunk, definitions, x, y, 320, 240);
+    return 0;
+}
+
+int gex_graphics_map_cel_direct_try(uint32_t image, uint32_t atlas, uint32_t flags,
+                                    uint32_t tint, uint32_t rgb, uint16_t x, uint16_t y,
+                                    uint16_t wrap_x, uint16_t wrap_y, uint16_t palette) {
+    if (!packet_bytes || render_width != 320 || render_height != 240 ||
+        transition_active || !gex_graphics_gpu_owned() ||
+        MEM32(0x451040) || !MEM32(0x4A33AC))
+        return 0;
+    const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
+    if (!native || !native->map_cel_direct) return 0;
+    uint32_t scene = displayed_level();
+    unsigned buffer = MEM8(0x467170);
+    if ((scene != 49 && scene != 3) || buffer >= 2 || backdrop_active ||
+        menu_clip.enabled || menu_clip.building ||
+        gex_graphics_hud_blocks_direct(native->map_cel_packet_bound)) return 0;
     const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
                                   title_guest_allocated, title_guest_matches};
-    return native->map_chunk(&io, chunk, definitions, x, y, 320, 240);
+    const gex_gpu_cel_draw draw = {image, atlas, flags, tint, rgb,
+                                   x, y, wrap_x, wrap_y, palette};
+    uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+    int result = native->map_cel_direct(&io, &draw, roots);
+    if (result < 0) hle_fatal("[packet-gpu] cannot allocate direct CEL draws");
+    return result;
 }
 
 int gex_graphics_map_flipped_cel_try(uint32_t image, uint32_t atlas, uint32_t flags,
@@ -1123,17 +1365,29 @@ int gex_graphics_map_unflipped_cel_try(uint32_t image, uint32_t atlas, uint32_t 
 
 int gex_graphics_map_scaled_cel_try(const gex_gpu_scaled_cel_draw *draw, uint32_t *last_atlas) {
     if (!packet_bytes || render_width != 320 || render_height != 240 ||
-        transition_active || displayed_level() != 49 || !gex_graphics_gpu_owned() ||
+        transition_active || !gex_graphics_gpu_owned() ||
         MEM32(0x451040) || !MEM32(0x4A33AC))
         return 0;
     const gex_gpu_native_ops *native = gex_packet_gpu_get()->native;
-    if (!native || !native->map_scaled_cel) return 0;
+    if (!native) return 0;
     const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
                                   title_guest_allocated, title_guest_matches};
-    return native->map_scaled_cel(&io, draw, last_atlas);
+    uint32_t scene = displayed_level();
+    unsigned buffer = MEM8(0x467170);
+    if (native->map_scaled_cel_direct && (scene == 49 || scene == 3) && buffer < 2 &&
+        !backdrop_active && !menu_clip.enabled && !menu_clip.building &&
+        !gex_graphics_hud_blocks_direct(native->map_scaled_cel_packet_bound)) {
+        uint32_t roots[2] = {0x467178 + buffer * 4, 0x467180 + buffer * 4};
+        int result = native->map_scaled_cel_direct(&io, draw, roots, last_atlas);
+        if (result < 0) hle_fatal("[packet-gpu] cannot allocate direct scaled CEL draws");
+        if (result) return 1;
+    }
+    return scene == 49 && native->map_scaled_cel ?
+        native->map_scaled_cel(&io, draw, last_atlas) : 0;
 }
 
 void gex_graphics_end_frame(void) {
+    title_list_root = 0;
     gex_graphics_cpu_access();
     if (!exclusive_gpu) synchronize(1);
     /* Cached backdrop CELs outlive a frame; retire them with their scene/arena. */

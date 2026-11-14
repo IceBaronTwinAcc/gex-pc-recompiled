@@ -802,6 +802,50 @@ static void hud_packets(uint32_t atlas, int results, int hardware) {
     MEM32(0x4A2964) = 3;
 }
 
+static void direct_world_hud_ranges(void) {
+    uint32_t object = hle_va(hle_alloc(0x210));
+    CHECK(!gex_graphics_set_render_size(320, 240));
+    MEM32(0x4A2964) = 3;
+    MEM32(0x4A2990) = MEM32(0x455B84) = 0;
+    gex_graphics_packet_arena();
+    uint32_t begin = MEM32(0x4A2AE0), end = MEM32(0x4A2ADC);
+    CHECK(!gex_graphics_hud_blocks_direct(0));
+    MEM32(0x4A2AE4) = begin + 256;
+    CHECK(gex_graphics_hud_begin(object, 0, 0));
+    CHECK(gex_graphics_hud_blocks_direct(16));
+    MEM32(0x4A2AE4) = begin + 320;
+    gex_graphics_hud_end(object);
+    CHECK(!gex_graphics_hud_blocks_direct(16));
+    CHECK(gex_graphics_hud_blocks_direct(0));
+    MEM32(0x4A2AE4) = begin + 240;
+    CHECK(!gex_graphics_hud_blocks_direct(16));
+    CHECK(gex_graphics_hud_blocks_direct(20));
+    MEM32(0x4A2AE4) = end - 8;
+    CHECK(gex_graphics_hud_blocks_direct(16));
+    MEM32(0x4A2AE4) = begin - 4;
+    CHECK(gex_graphics_hud_blocks_direct(16));
+
+    gex_graphics_end_frame();
+    MEM32(0x4A2AE4) = end - 40;
+    CHECK(gex_graphics_hud_begin(object, 0, 0));
+    MEM32(0x4A2AE4) = begin + 40;
+    gex_graphics_hud_end(object);
+    CHECK(!gex_graphics_hud_blocks_direct(16));
+    MEM32(0x4A2AE4) = begin + 32;
+    CHECK(gex_graphics_hud_blocks_direct(16));
+    MEM32(0x4A2AE4) = end - 48;
+    CHECK(gex_graphics_hud_blocks_direct(16));
+    gex_graphics_end_frame();
+    CHECK(!gex_graphics_set_render_size(160, 112));
+    gex_graphics_packet_arena();
+    CHECK(gex_graphics_hud_begin(object, 0, 0));
+    CHECK(gex_graphics_hud_blocks_direct(16));
+    gex_graphics_hud_end(object);
+    CHECK(!gex_graphics_hud_blocks_direct(16));
+    gex_graphics_shutdown();
+    hle_free(hle_ptr(object));
+}
+
 static void portal_player_draws(void) {
     uint32_t fixture = hle_va(hle_alloc(0x500));
     uint32_t object = fixture, asset = fixture + 0x210, animations = fixture + 0x400;
@@ -1590,6 +1634,7 @@ int main(int argc, char **argv) {
     MEM32(0x4A2964) = 3;
     hud_packets(atlas, 0, 0);
     hud_packets(atlas, 1, 0);
+    direct_world_hud_ranges();
     expanded_viewport(atlas, quad);
     screen_layouts(atlas, quad);
     menu_clipping(atlas, 0);

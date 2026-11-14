@@ -14,6 +14,23 @@ static uint8_t atlas[0x100000] __attribute__((aligned(65536)));
 static uint8_t table[1024];
 static uint16_t pixels[320 * 240], other[320 * 240];
 static int failures;
+static unsigned misaligned_headers;
+static size_t counted_pvr_size;
+static unsigned counted_pvr_allocations;
+pvr_ptr_t __real_pvr_mem_malloc(size_t size);
+pvr_ptr_t __wrap_pvr_mem_malloc(size_t size) {
+    if (size == counted_pvr_size) ++counted_pvr_allocations;
+    return __real_pvr_mem_malloc(size);
+}
+void __real_pvr_poly_compile(pvr_poly_hdr_t *header, const pvr_poly_cxt_t *context);
+void __wrap_pvr_poly_compile(pvr_poly_hdr_t *header, const pvr_poly_cxt_t *context) {
+    if ((uintptr_t)header % _Alignof(pvr_poly_hdr_t)) {
+        if (!misaligned_headers) printf("PVR FAIL: misaligned polygon header\n");
+        ++misaligned_headers;
+        ++failures;
+    }
+    __real_pvr_poly_compile(header, context);
+}
 static void *raster_device;
 static void *remember_device(int width, int height, char *error, size_t size) {
     raster_device = gex_packet_gpu_get()->create(width, height, error, size);
@@ -102,6 +119,7 @@ static void title_image_regression(const gex_packet_gpu *gpu) {
         ++failures;
         return;
     }
+    EXPECT(!((uintptr_t)t % _Alignof(pvr_poly_hdr_t)));
     memset(title_guest_memory, 0, sizeof title_guest_memory);
     memset(title_guest_globals, 0, sizeof title_guest_globals);
     memset(title_guest_colors, 0, sizeof title_guest_colors);
@@ -3812,6 +3830,186 @@ static void fragmented_feedback_regression(const gex_packet_gpu *gpu) {
     gpu->destroy(t);
 }
 
+static void fragmented_page_regression(const gex_packet_gpu *gpu, int warm_page) {
+    const gex_gpu_native_ops *native = gpu->native;
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    if (!t) {
+        printf("PVR fragmented page target failed: %s\n", error);
+        ++failures;
+        return;
+    }
+    void *released = warm_page == 3 ? gpu->create(320, 240, error, sizeof error) : NULL;
+    if (warm_page == 3 && !released) {
+        printf("PVR fragmented page release target failed: %s\n", error);
+        ++failures;
+        gpu->destroy(t);
+        return;
+    }
+    native->bind(t, atlas, 0);
+    native->atlas_write(atlas, 0, sizeof atlas);
+    memset(atlas, 0, sizeof atlas);
+    for (unsigned i = 0; i <= 20; ++i) put(1024 + 240 * 2048 + i * 16, 31);
+    put(1024 + 240 * 2048 + 32, 0x3e0);
+    put(1024 + 240 * 2048 + 400, 0x3e0);
+    put(1152 + 240 * 2048, 0x7c00);
+    put(0xc0000 + 30, 31);
+
+    pvr_ptr_t separators[64] = {0};
+    uint16_t source[16 * 16];
+    gex_gpu_image image = {source, NULL, 16, 16};
+    gex_gpu_vertex q[] = {{10, 10, 0, 0}, {26, 10, 16, 0},
+                          {10, 26, 0, 16}, {26, 26, 16, 16}};
+    EXPECT(!native->clear(t, error, sizeof error));
+    if (warm_page == 1 || warm_page == 2) {
+        gex_gpu_material material = {9 | 256, 0, 0x64, 0x808080, atlas, table};
+        gex_gpu_vertex cell[] = {{40, 40, 0, 240}, {41, 40, 1, 240},
+                                 {40, 41, 0, 241}, {41, 41, 1, 241}};
+        EXPECT(!native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error));
+        EXPECT(!native->present(t, error, sizeof error));
+        EXPECT(!native->clear(t, error, sizeof error));
+    }
+    unsigned made = 0;
+    for (; made < 64; ++made) {
+        for (unsigned i = 0; i < 16 * 16; ++i)
+            source[i] = (uint16_t)(0x8000 | (made + 1));
+        if (native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error)) {
+            EXPECT(0);
+            break;
+        }
+        separators[made] = pvr_mem_malloc(4096);
+        if (!separators[made]) {
+            EXPECT(0);
+            break;
+        }
+    }
+    EXPECT(made == 64);
+    EXPECT(!native->present(t, error, sizeof error));
+
+    struct { pvr_ptr_t hole, guard; } blocks[128] = {{0}};
+    unsigned count = 0;
+    while (count < 128 && pvr_mem_available() > 80 * 1024 + 128) {
+        blocks[count].hole = pvr_mem_malloc(80 * 1024);
+        if (!blocks[count].hole) break;
+        blocks[count].guard = pvr_mem_malloc(32);
+        if (!blocks[count].guard) {
+            pvr_mem_free(blocks[count].hole);
+            break;
+        }
+        ++count;
+    }
+    for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].hole);
+    EXPECT(count > 2 && pvr_mem_available() > 256 * 1024);
+
+    EXPECT(!native->clear(t, error, sizeof error));
+    if (warm_page == 2) {
+        gex_gpu_material pinned = {9 | 256, 0, 0x64, 0x808080, atlas, table};
+        gex_gpu_vertex q[] = {{70, 40, 0, 240}, {71, 40, 1, 240},
+                              {70, 41, 0, 241}, {71, 41, 1, 241}};
+        EXPECT(!native->polygon(t, q, 0, 0, 320, 240, &pinned, error, sizeof error));
+    }
+    gex_gpu_material material = {8 | 256, 0, 0x64, 0x808080, atlas, table};
+    gex_gpu_vertex cell[] = {{40, 40, 0, 240}, {41, 40, 1, 240},
+                             {40, 41, 0, 241}, {41, 41, 1, 241}};
+    counted_pvr_size = 128 * 1024;
+    counted_pvr_allocations = 0;
+    size_t before = pvr_mem_available();
+    int result = native->polygon(t, cell, 0, 0, 320, 240, &material, error, sizeof error);
+    EXPECT(!result);
+    size_t after = pvr_mem_available();
+    printf("PVR fragmented page warm=%d free before=%lu after=%lu\n",
+           warm_page, (unsigned long)before, (unsigned long)after);
+    EXPECT(after <= before + 4096);
+    if (!result) {
+        if (!warm_page) {
+            for (unsigned i = 1; i <= 20; ++i) {
+                float u = i * 8, x = 44 + i;
+                gex_gpu_vertex next[] = {{x, 40, u, 240}, {x + 1, 40, u + 1, 240},
+                                         {x, 41, u, 241}, {x + 1, 41, u + 1, 241}};
+                EXPECT(!native->polygon(t, next, 0, 0, 320, 240, &material,
+                                        error, sizeof error));
+            }
+            printf("PVR fragmented page large attempts=%u\n", counted_pvr_allocations);
+            EXPECT(counted_pvr_allocations == 1);
+            gex_gpu_material small = {8, 0x6000, 0x64, 0x808080, atlas, table};
+            gex_gpu_vertex indexed[] = {{80, 40, 0, 240}, {81, 40, 1, 240},
+                                        {80, 41, 0, 241}, {81, 41, 1, 241}};
+            counted_pvr_size = 32 * 1024;
+            counted_pvr_allocations = 0;
+            EXPECT(!native->polygon(t, indexed, 0, 0, 320, 240, &small,
+                                    error, sizeof error));
+            EXPECT(counted_pvr_allocations == 2);
+            counted_pvr_size = 128 * 1024;
+            counted_pvr_allocations = 1;
+            for (unsigned i = 21; i <= 65; ++i) {
+                float u = ((i - 1) % 20 + 1) * 8, v = 240 + (i - 1) / 20;
+                float x = 44 + (i - 1) % 20, y = 41 + (i - 1) / 20;
+                gex_gpu_vertex next[] = {{x, y, u, v}, {x + 1, y, u + 1, v},
+                                         {x, y + 1, u, v + 1}, {x + 1, y + 1, u + 1, v + 1}};
+                EXPECT(!native->polygon(t, next, 0, 0, 320, 240, &material,
+                                        error, sizeof error));
+            }
+            EXPECT(counted_pvr_allocations == 2);
+        }
+        if (warm_page) {
+            gex_gpu_vertex next[] = {{42, 40, 16, 240}, {43, 40, 17, 240},
+                                     {42, 41, 16, 241}, {43, 41, 17, 241}};
+            if (warm_page == 2) {
+                EXPECT(!native->present(t, error, sizeof error));
+                counted_pvr_allocations = 0;
+            }
+            if (warm_page == 3) {
+                gpu->destroy(released);
+                released = NULL;
+                counted_pvr_allocations = 0;
+            }
+            before = pvr_mem_available();
+            EXPECT(!native->polygon(t, next, 0, 0, 320, 240, &material, error, sizeof error));
+            if (warm_page == 2) EXPECT(counted_pvr_allocations == 3);
+            if (warm_page == 3) {
+                EXPECT(counted_pvr_allocations == 2);
+                EXPECT(before > pvr_mem_available() &&
+                       before - pvr_mem_available() >= 256 * 1024);
+            } else {
+                EXPECT(pvr_mem_available() == before);
+            }
+        }
+        counted_pvr_size = 0;
+        for (unsigned i = 0; i < 16 * 16; ++i) source[i] = 0x8001;
+        before = pvr_mem_available();
+        EXPECT(!native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+        EXPECT(pvr_mem_available() == before);
+    }
+    for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].guard);
+    for (unsigned i = 0; i < made; ++i) pvr_mem_free(separators[i]);
+    EXPECT(!download_presented(gpu, t, pixels, error, sizeof error));
+    EXPECT(pixels[40 * 320 + 40] == 31);
+    if (!warm_page)
+        for (unsigned i = 1; i <= 20; ++i)
+            EXPECT(pixels[40 * 320 + 44 + i] ==
+                   (i == 2 ? 0x3e0 : i == 8 ? 0x7c00 : 31));
+    if (!warm_page) EXPECT(pixels[40 * 320 + 80] == 31);
+    if (warm_page) EXPECT(pixels[40 * 320 + 42] == 0x3e0);
+    EXPECT(pixels[10 * 320 + 10] == 0x400);
+    if (!warm_page) {
+        gex_gpu_vertex next[] = {{42, 40, 200, 240}, {43, 40, 201, 240},
+                                 {42, 41, 200, 241}, {43, 41, 201, 241}};
+        EXPECT(!native->clear(t, error, sizeof error));
+        before = pvr_mem_available();
+        counted_pvr_size = 128 * 1024;
+        counted_pvr_allocations = 0;
+        EXPECT(!native->polygon(t, next, 0, 0, 320, 240, &material, error, sizeof error));
+        EXPECT(counted_pvr_allocations == 2);
+        counted_pvr_size = 0;
+        after = pvr_mem_available();
+        EXPECT(before > after && before - after >= 256 * 1024);
+        EXPECT(!download_presented(gpu, t, pixels, error, sizeof error));
+        EXPECT(pixels[40 * 320 + 42] == 0x3e0);
+    }
+    if (released) gpu->destroy(released);
+    gpu->destroy(t);
+}
+
 static void direct_framebuffer_regression(const gex_packet_gpu *gpu) {
     char error[256] = {0};
     void *t = gpu->create(320, 240, error, sizeof error);
@@ -4034,6 +4232,7 @@ static int test_mode(void) {
         if (!strcmp(token, "--uv-precision")) return 4;
         if (!strcmp(token, "--uv-precision-hold")) return 5;
         if (!strcmp(token, "--direct-image")) return 6;
+        if (!strcmp(token, "--fragmented-page")) return 7;
         token = strtok_r(NULL, " \r\n\t", &save);
     }
     return 0;
@@ -4123,6 +4322,16 @@ int main(void) {
                failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
+    if (mode == 7) {
+        fragmented_page_regression(gpu, 0);
+        fragmented_page_regression(gpu, 1);
+        fragmented_page_regression(gpu, 2);
+        fragmented_page_regression(gpu, 3);
+        mmu_shutdown_basic();
+        printf("Dreamcast PVR fragmented page regression: %s (%d failures)\n",
+               failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
     if (mode == 4 || mode == 5) {
         uv_precision_regression(gpu, mode == 5);
         mmu_shutdown_basic();
@@ -4157,6 +4366,10 @@ int main(void) {
     deferred_pal8_regression(gpu);
     deferred_eviction_regression(gpu);
     fragmented_feedback_regression(gpu);
+    fragmented_page_regression(gpu, 0);
+    fragmented_page_regression(gpu, 1);
+    fragmented_page_regression(gpu, 2);
+    fragmented_page_regression(gpu, 3);
     /* Compatibility regressions explicitly exercise the diagnostic readback
      * contract. Production PVR targets use the native operations below. */
     gex_packet_gpu compatibility = *gpu;

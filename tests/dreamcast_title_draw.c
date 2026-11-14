@@ -15,11 +15,21 @@ static unsigned allocation_count;
 static uint32_t allocation_begin[4], allocation_end[4];
 static uint16_t rendered[4];
 static float rendered_x, rendered_y;
+static float submission_x[32];
 static uint64_t rendered_id;
 static unsigned rendered_rgb;
 static int rendered_vertex_tint;
 static unsigned backdrop_submissions;
 static uint16_t backdrop_color;
+static int clip_left, clip_top, clip_right, clip_bottom;
+static struct backdrop_sample {
+    gex_gpu_vertex q[4];
+    int left, top, right, bottom;
+    uint16_t color;
+    unsigned rgb;
+} backdrop_samples[80];
+static unsigned backdrop_samples_count;
+static unsigned sequence_backdrops, sequence_cels;
 
 static void put16(uint32_t address, uint16_t value) {
     memory[address] = (uint8_t)value;
@@ -77,6 +87,7 @@ static int submit(void *target, const gex_gpu_vertex q[4],
     assert(image->width == 2 && image->height == 2 && !image->half);
     memcpy(rendered, image->opaque, sizeof rendered);
     rendered_x = q[0].x; rendered_y = q[0].y;
+    if (submissions < 32) submission_x[submissions] = rendered_x;
     rendered_id = image_id;
     rendered_rgb = rgb;
     rendered_vertex_tint = vertex_tint;
@@ -95,6 +106,17 @@ static int submit_large(void *target, const gex_gpu_vertex q[4],
     return 0;
 }
 
+static int submit_clip(void *target, const gex_gpu_vertex q[4],
+                       int left, int top, int right, int bottom,
+                       const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                       int vertex_tint, char *error, size_t size) {
+    (void)target; (void)q; (void)image; (void)image_id; (void)rgb;
+    (void)vertex_tint; (void)error; (void)size;
+    clip_left = left; clip_top = top; clip_right = right; clip_bottom = bottom;
+    ++submissions;
+    return 0;
+}
+
 static int submit_backdrop(void *target, const gex_gpu_vertex q[4],
                            int left, int top, int right, int bottom,
                            const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
@@ -107,6 +129,36 @@ static int submit_backdrop(void *target, const gex_gpu_vertex q[4],
     assert(q[0].y == (float)((backdrop_submissions % 8) * 32));
     assert(rgb == 0x102030);
     ++backdrop_submissions;
+    return 0;
+}
+
+static int sample_backdrop(void *target, const gex_gpu_vertex q[4],
+                           int left, int top, int right, int bottom,
+                           const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                           int vertex_tint, char *error, size_t size) {
+    (void)target; (void)image_id; (void)vertex_tint; (void)error; (void)size;
+    assert(backdrop_samples_count < 80 && image->width == 64 && image->height == 32);
+    struct backdrop_sample *sample = &backdrop_samples[backdrop_samples_count++];
+    memcpy(sample->q, q, sizeof sample->q);
+    sample->left = left; sample->top = top;
+    sample->right = right; sample->bottom = bottom;
+    sample->color = image->opaque[0]; sample->rgb = rgb;
+    return 0;
+}
+
+static int sample_backdrop_sequence(void *target, const gex_gpu_vertex q[4],
+                                    int left, int top, int right, int bottom,
+                                    const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                                    int vertex_tint, char *error, size_t size) {
+    (void)target; (void)q; (void)left; (void)top; (void)right; (void)bottom;
+    (void)image_id; (void)rgb; (void)vertex_tint; (void)error; (void)size;
+    if (image->width == 64) {
+        assert(!sequence_cels);
+        ++sequence_backdrops;
+    } else {
+        assert(image->width == 2 && sequence_backdrops);
+        ++sequence_cels;
+    }
     return 0;
 }
 
@@ -139,6 +191,37 @@ static void setup(void) {
     put32(0x4a2b14, TAIL1);
 }
 
+static void palette_uploads(void) {
+    const uint32_t root = 0x464e48;
+    gex_gpu_palette_upload first = {0x01e00140, PALETTE, 16};
+    gex_gpu_palette_upload second = {0x01e10140, PALETTE + 32, 256};
+    gex_gpu_palette_upload taken;
+    gex_dreamcast_palette_reset();
+    assert(!gex_dreamcast_palette_record(0, &first));
+    assert(!gex_dreamcast_palette_record(root + 1, &first));
+    assert(gex_dreamcast_palette_record(root, &first) == 1);
+    assert(gex_dreamcast_palette_record(root, &second) == 1);
+    assert(gex_dreamcast_palette_record(TAIL0, &first) == 1);
+    assert(gex_dreamcast_palette_record(TAIL1, &second) == 1);
+    assert(gex_dreamcast_palette_take(root, &taken) && taken.source == first.source);
+    memory[first.source] = 0x75;
+    assert(memory[taken.source] == 0x75);
+    assert(gex_dreamcast_palette_take(root, &taken) && taken.source == second.source &&
+           taken.width == 256 && taken.rectangle == second.rectangle);
+    assert(!gex_dreamcast_palette_take(root, &taken));
+    gex_dreamcast_title_forget(TAIL0 + 3, TAIL0 + 4);
+    assert(!gex_dreamcast_palette_take(TAIL0, &taken));
+    assert(gex_dreamcast_palette_take(TAIL1, &taken) && taken.source == second.source);
+    assert(gex_dreamcast_palette_record(TAIL0, &first) == 1);
+    assert(gex_dreamcast_palette_record(TAIL1, &second) == 1);
+    gex_dreamcast_palette_reset();
+    assert(!gex_dreamcast_palette_take(TAIL0, &taken));
+    assert(!gex_dreamcast_palette_take(TAIL1, &taken));
+    assert(gex_dreamcast_palette_record(root, &first) == 1);
+    gex_dreamcast_title_reset();
+    assert(!gex_dreamcast_palette_take(root, &taken));
+}
+
 int main(void) {
     gex_gpu_guest_io io = {NULL, read_guest, write_guest, allocated, match_guest};
     uint8_t modulation[1024];
@@ -150,6 +233,7 @@ int main(void) {
     gex_raster_state state = {.modulation = modulation, .left = 0, .top = 8,
                               .right = 320, .bottom = 232, .layout = 1};
     char error[128] = {0};
+    palette_uploads();
     setup();
     assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
     assert(get32(TAIL0) == ARENA && get32(TAIL1) == ARENA + 8);
@@ -207,6 +291,92 @@ int main(void) {
     gex_dreamcast_title_forget(ARENA + 8, ARENA + 16);
     assert(!gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
                                        submit, error, sizeof error));
+    gex_dreamcast_title_reset();
+    setup();
+    submissions = 0;
+    const uint32_t roots[2] = {TAIL0, TAIL1};
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    put32(OBJECT + 0x78, 20u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA &&
+           !get32(TAIL0) && !get32(TAIL1));
+    assert(gex_dreamcast_title_has_direct(TAIL0, TAIL0));
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(submissions == 2 && submission_x[0] == 10 && submission_x[1] == 20);
+    memset(memory + PALETTE, 0, 32);
+    memset(memory + IMAGE + 44, 0, 8);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(submissions == 4 && submission_x[2] == 10 && submission_x[3] == 20 &&
+           rendered[0] == 0xfc00 && rendered[1] == 0x83e0);
+    put16(PALETTE + 2, 0x001f);
+    put16(PALETTE + 4, 0x03e0);
+    put16(PALETTE + 6, 0x7c00);
+    put16(PALETTE + 8, 0x7fff);
+    memory[IMAGE + 44] = 0x21; memory[IMAGE + 48] = 0x43;
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    put32(OBJECT + 0x78, 30u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_has_direct(TAIL0, ARENA));
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, ARENA, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(rendered_x == 30);
+    gex_dreamcast_title_reset_lists(TAIL0, 0);
+    assert(!gex_dreamcast_title_has_direct(TAIL0, TAIL0));
+    assert(gex_dreamcast_title_has_direct(TAIL1, TAIL1));
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL1, TAIL1, &state, submit,
+                                           error, sizeof error) == 1);
+    gex_dreamcast_title_forget(ARENA + 8, ARENA + 12);
+    assert(!gex_dreamcast_title_has_direct(TAIL1, ARENA + 8));
+    gex_dreamcast_title_reset_lists(TAIL1, 0);
+    assert(!gex_dreamcast_title_has_direct(TAIL1, TAIL1));
+    gex_dreamcast_title_reset();
+    setup();
+    uint32_t anchor_collision = TAIL0 + 4;
+    while (((anchor_collision >> 2) * UINT32_C(2654435761) >> 24) !=
+           ((TAIL0 >> 2) * UINT32_C(2654435761) >> 24))
+        anchor_collision += 4;
+    assert(anchor_collision < MEMORY_SIZE && anchor_collision != TAIL1);
+    submissions = 0;
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    put32(0x4a2b18, anchor_collision);
+    put32(OBJECT + 0x78, 20u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    put32(0x4a2b18, TAIL0);
+    put32(OBJECT + 0x78, 30u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(submissions == 2 && submission_x[0] == 10 && submission_x[1] == 30);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, anchor_collision, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(submissions == 3 && submission_x[2] == 20);
+    gex_dreamcast_title_forget(anchor_collision + 1, anchor_collision + 2);
+    assert(!gex_dreamcast_title_has_direct(TAIL0, anchor_collision) &&
+           gex_dreamcast_title_has_direct(TAIL0, TAIL0));
+    gex_dreamcast_title_forget(TAIL0, TAIL0 + 4);
+    put32(0x4a2b18, anchor_collision);
+    put32(OBJECT + 0x78, 40u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, anchor_collision, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(submissions == 4 && submission_x[3] == 40);
+    gex_dreamcast_title_reset();
+    setup();
+    put32(0x4a2b18, TAIL0 + 1);
+    assert(!gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error));
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA);
+    put32(0x4a2b18, TAIL1);
+    assert(!gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error));
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA);
+    gex_dreamcast_title_reset();
+    setup();
+    put32(PART + 4, 0x80000000);
+    assert(!gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error));
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA &&
+           !get32(TAIL0) && !get32(TAIL1) &&
+           !gex_dreamcast_title_has_direct(TAIL0, TAIL0));
     gex_dreamcast_title_reset();
     setup();
     put32(PART + 4, 0x80000000);
@@ -449,6 +619,56 @@ int main(void) {
     assert(get32(0x4a2ae4) == next);
     gex_dreamcast_title_reset();
     setup();
+    put32(0x46a534, PALETTE);
+    put16(BACKDROP + 20, 28);
+    memory[BACKDROP + 16] = 0x80;
+    memory[BACKDROP + 22] = 64; memory[BACKDROP + 23] = 32;
+    memset(memory + BACKDROP + 28, 0x11, 64 * 32 / 2);
+    state.layout = 2;
+    backdrop_samples_count = 0;
+    assert(gex_dreamcast_backdrop_record(&io, 49, error, sizeof error) == 1);
+    for (unsigned i = 0; i < 40; ++i)
+        assert(gex_dreamcast_title_packet(NULL, ARENA + i * 16,
+                                          memory + ARENA + i * 16, &state,
+                                          sample_backdrop, error, sizeof error) == 1);
+    struct backdrop_sample expected[80];
+    unsigned expected_count = backdrop_samples_count;
+    memcpy(expected, backdrop_samples, expected_count * sizeof *expected);
+    gex_dreamcast_title_reset();
+    setup();
+    put32(0x46a534, PALETTE);
+    put16(BACKDROP + 20, 28);
+    memory[BACKDROP + 16] = 0x80;
+    memory[BACKDROP + 22] = 64; memory[BACKDROP + 23] = 32;
+    memset(memory + BACKDROP + 28, 0x11, 64 * 32 / 2);
+    state.layout = 1;
+    state.repeat_backdrop = 1;
+    backdrop_samples_count = 0;
+    assert(gex_dreamcast_backdrop_record_direct(&io, 49, roots, error, sizeof error) == 1);
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, sample_backdrop,
+                                           error, sizeof error) == 1);
+    assert(backdrop_samples_count == expected_count);
+    assert(!memcmp(expected, backdrop_samples, expected_count * sizeof *expected));
+    state.repeat_backdrop = 0;
+    backdrop_samples_count = 0;
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, sample_backdrop,
+                                           error, sizeof error) == 1);
+    assert(backdrop_samples_count < expected_count);
+    state.repeat_backdrop = 1;
+    assert(gex_dreamcast_scene_cel_record_direct(&io, 49, OBJECT, CEL, roots,
+                                                  error, sizeof error) == 1);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state,
+                                           sample_backdrop_sequence, error, sizeof error) == 1);
+    assert(sequence_backdrops == expected_count && sequence_cels == 1);
+    gex_dreamcast_title_reset_lists(TAIL0, 0);
+    assert(!gex_dreamcast_title_has_direct(TAIL0, TAIL0));
+    assert(gex_dreamcast_title_has_direct(TAIL1, TAIL1));
+    memory[BACKDROP + 22] = 63;
+    assert(!gex_dreamcast_backdrop_record_direct(&io, 49, roots, error, sizeof error));
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA);
+    gex_dreamcast_title_reset();
+    setup();
     put32(0x4a2964, 55);
     assert(!gex_dreamcast_backdrop_record(&io, 55, error, sizeof error));
     assert(get32(0x4a2ae4) == ARENA && !get32(TAIL0) && !get32(TAIL1));
@@ -470,6 +690,32 @@ int main(void) {
     for (unsigned i = 0; i < 513; ++i) put32(LIST + i * 4, PART);
     assert(!gex_dreamcast_map_cel_record(&io, 49, OBJECT, CEL, error, sizeof error));
     assert(get32(0x4a2ae4) == ARENA && !get32(TAIL0) && !get32(TAIL1));
+    gex_dreamcast_title_reset();
+    setup();
+    assert(!gex_dreamcast_scene_cel_record_direct(&io, 55, OBJECT, CEL, roots,
+                                                   error, sizeof error));
+    assert(gex_dreamcast_scene_cel_record_direct(&io, 49, OBJECT, CEL, roots,
+                                                  error, sizeof error) == 1);
+    assert(!allocation_count && get32(0x4a2ae4) == ARENA && !get32(TAIL0));
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit,
+                                           error, sizeof error) == 1);
+    gex_dreamcast_title_reset();
+    setup();
+    state.layout = 0;
+    state.world_clip = 1;
+    state.world_left = 9; state.world_right = 11;
+    state.world_top = 18; state.world_bottom = 30;
+    submissions = 0;
+    assert(gex_dreamcast_scene_cel_record_direct(&io, 3, OBJECT, CEL, roots,
+                                                  error, sizeof error) == 1);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit_clip,
+                                           error, sizeof error) == 1);
+    assert(submissions == 1 && clip_left == 9 && clip_right == 11 &&
+           clip_top == 10 && clip_bottom == 22);
+    state.world_left = 12;
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit_clip,
+                                           error, sizeof error) == 1);
+    assert(submissions == 1);
     gex_dreamcast_title_reset();
     return 0;
 }

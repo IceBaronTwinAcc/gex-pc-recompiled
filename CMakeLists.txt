@@ -157,6 +157,8 @@ endif()
 if(BUILD_TESTING AND GEX_ENABLE_PVR_RENDERER)
     add_executable(gex_pvr_test tests/dreamcast_pvr.c)
     target_link_libraries(gex_pvr_test PRIVATE gex_renderer gex_packet_gpu)
+    target_link_options(gex_pvr_test PRIVATE "-Wl,--wrap=pvr_mem_malloc"
+        "-Wl,--wrap=pvr_poly_compile")
 endif()
 if(BUILD_TESTING AND GEX_PLATFORM_DESKTOP_TESTS)
     add_executable(gex_title_cel_test tests/dreamcast_title_cel.c

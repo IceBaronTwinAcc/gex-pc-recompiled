@@ -28,8 +28,18 @@ elif [[ "${AUTOPLAY:-0}" == 1 ]]; then
 else
     extra=()
 fi
-"$MKDCDISC" -e "$build/gex_recomp.elf" -d Gex "${extra[@]}" \
-    -n "Gex recompilation test" -o "$build/gex-test.cdi" > "$build/disc.log" 2>&1
+pack_files=()
+if [[ ${#extra[@]} -ne 0 ]]; then pack_files=(--file "${extra[1]}"); fi
+converted=0
+original=()
+if grep -Eq '^GEX_MOVIE_DECODER_SOURCE:FILEPATH=.*src/platform/dreamcast/movie_mpeg\.c$' "$build/CMakeCache.txt"; then
+    converted=1
+else
+    original=(--original-movies)
+fi
+python3 tools/package-dreamcast.py --elf "$build/gex_recomp.elf" \
+    --mkdcdisc "$MKDCDISC" "${pack_files[@]}" "${original[@]}" --name "Gex recompilation test" \
+    --output "$build/gex-test.cdi" > "$build/disc.log" 2>&1
 set +e
 python3 tools/run-dreamcast-test.py "$FLYCAST" "$build/gex-test.cdi" \
     "$build/test.log" "${TEST_SECONDS:-60}" "${GDB_ENABLED:-no}"
@@ -69,9 +79,14 @@ if [[ "${MOVIES:-0}" == 1 ]]; then
         exit 1
     fi
     [[ "$(grep -c '^\[movie\] playback completed' "$build/test.log")" == 2 ]]
-    grep -q '^\[movie\] playback completed: video=457 audio=335899' "$build/test.log"
-    grep -q '^\[movie\] playback completed: video=867 audio=1274490' "$build/test.log"
+    if [[ "$converted" == 1 ]]; then
+        grep -q '^\[movie\] playback completed: video=457 audio=975744' "$build/test.log"
+        grep -q '^\[movie\] playback completed: video=867 audio=1850112' "$build/test.log"
+    else
+        grep -q '^\[movie\] playback completed: video=457 audio=335899' "$build/test.log"
+        grep -q '^\[movie\] playback completed: video=867 audio=1274490' "$build/test.log"
+    fi
     grep -q '^\[smoke\] scene=63 ' "$build/test.log"
-    echo "Both original intro movies completed and returned to the title menu."
+    echo "Both intro movies completed and returned to the title menu."
 fi
 tail -25 "$build/test.log"

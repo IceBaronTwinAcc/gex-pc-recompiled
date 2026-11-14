@@ -25,7 +25,7 @@ Wine is used to test the cross-compiled Windows executable.
 | macOS ARM64 | Linux OSXCross build run headlessly on an M1 with macOS 15.7.7: software and bgfx/Metal first-level gameplay, complete startup AVIs, native audio through the silent null device, and normal guest exit. No visible-window testing or complete playthrough yet. |
 | macOS x86-64 | Separate Intel-only OSXCross build exercised headlessly through Rosetta 2 on the M1: 32 target checks, software/Metal first-level gameplay, both complete startup AVIs and normal guest exit. Physical Intel Macs and their GPUs remain untested. |
 | Android ARM64/x86-64 | Both debug APKs bundle Vulkan and OpenGL ES 3.1. Both APIs run on an Android 15 x86-64 emulator and a Pixel 9a running Android 17. Physical native-window gameplay captures confirm the compute-only swap flicker fix on both APIs. No full playthrough or physical audio/controller validation yet. |
-| Dreamcast | Experimental KallistiOS/SH4 backend renders and completes both original intro AVIs under headless Flycast with 16 MiB RAM. Physical hardware, a complete playthrough and VMU persistence remain unverified or unfinished. |
+| Dreamcast | Experimental KallistiOS/SH4 backend renders and plays locally converted intro movies under headless Flycast with 16 MiB RAM. Physical hardware, a complete playthrough and VMU persistence remain unverified or unfinished. |
 
 The lift contains 1,988 discovered function entries, including overlapping
 bodies and possible data misidentifications. This count is not proof of
@@ -1857,10 +1857,9 @@ cmake -S . -B build/linux/custom \
 ```
 
 This selects a real implementation of **all** functions in `movie_decoder.h`.
-The Dreamcast default now uses the shared FFmpeg decoder with native disc-I/O
-and pixel-conversion hooks rather than the old metadata-only stub.
-FFmpeg discovery/linking is conditional on
-selecting the default source. With the default platform manifest the rest of the
+The Dreamcast default uses a pinned Dreamcast pl_mpeg decoder. The shared FFmpeg
+decoder remains available as an explicit Dreamcast alternative. FFmpeg
+discovery/linking is conditional on the selected source. With the desktop manifest the rest of the
 project remains a desktop host, not a KallistiOS implementation. The Dreamcast manifest supplies the runtime services described above,
 including rendering, audio, filesystem, clocks and memory. Keep the existing MCI/player behavior
 when doing that work; only decoder internals should know the replacement
@@ -1875,16 +1874,17 @@ with a `pkg-config` wrapper that rejects FFmpeg queries. The desktop decoder
 tests separately decode each original AVI twice: all 457 video frames and
 335,899 stereo audio frames in the first movie, and all 867 video frames and
 1,274,490 mono audio frames in the second, must survive rewind with identical
-decoded hashes. Dreamcast-specific checks additionally compare complete
-RGB565/PCM hashes against the scalar host reference and exercise disc seeks,
-cache boundaries and EOF. Host synthetic-color tests compare the compact
+decoded hashes. The Dreamcast MPEG test decodes both converted movies twice,
+checks frame counts, buffer guards and deterministic rewind. Separate FFmpeg
+backend checks compare complete RGB565/PCM hashes against the scalar host
+reference and exercise disc seeks, cache boundaries and EOF. Host synthetic-color tests compare the compact
 converter byte-for-byte against scalar FFmpeg, including BGRA32, extremes,
 random chroma, odd pitches and untouched padding.
 
 ## Dreamcast backend
 
-The experimental backend uses KallistiOS, not Wine or SDL, with a minimal
-static FFmpeg build for the original AVI/Indeo 3 movies. All
+The experimental backend uses KallistiOS, not Wine or SDL, and decodes
+locally converted MPEG-1 movies with pl_mpeg. All
 Dreamcast-specific implementations live in `src/platform/dreamcast/`; the
 launcher, game logic, software rasterizer, input mapping, MCI scheduling and
 guest compatibility groups remain shared. It builds native SH4 code and uses
@@ -1964,7 +1964,7 @@ bash tools/build-dreamcast.sh
 ```
 
 Outputs are `build/dreamcast/gex_recomp.elf` (including debug symbols) and
-`gex_recomp.bin`. To package the owner's unmodified `Gex/` assets and run a
+`gex_recomp.bin`. To package a converted copy of the owner's `Gex/` assets and run a
 bounded headless Vulkan smoke check:
 
 ```sh
@@ -1995,27 +1995,33 @@ automatically reload the disc. It never changes persistent Flycast settings.
 
 The locally built CDI contains copyrighted installation data: do not
 redistribute it. The disc mounts assets at `/cd/Gex`. Default launch arguments
-play the original movies; `--skip-movies` remains an explicit option. No
-converted or replacement movie assets are supplied.
+play locally converted movies; `--skip-movies` remains an explicit option.
+No converted or replacement movie assets are supplied.
 
 ### Original intro movies
 
-`tools/build-dreamcast.sh` first runs `tools/build-dreamcast-ffmpeg.sh`, which
-verifies and builds the pinned, unmodified FFmpeg 8.0.1 archive for SH4. Only
-AVI, Indeo 3 and PCM U8 are enabled; there are no programs, networking, threads,
-assembly optimizations or general-purpose scaler. The target installation is
-`.deps/dreamcast-ffmpeg`; its LGPL notice is copied to
-`build/dreamcast/licenses/FFmpeg.txt`.
+`tools/build-dreamcast.sh` prepares the pinned Dreamcast pl_mpeg 2.0.1 header
+and license, then builds the MPEG decoder. Its local patch replaces store-queue
+copies incompatible with the game's MMU configuration and recognizes FFmpeg's
+unofficial 15 fps MPEG-1 frame-rate code. This extension is not standard
+MPEG-1; the packaged movies are intended for this decoder, not arbitrary
+MPEG players. Disc reads use a 64 KiB aligned sector cache.
 
-The shared decoder uses public FFmpeg custom AVIO with a 64 KiB, 32-byte-aligned
-sector cache. KOS needs both sector-aligned file offsets and aligned buffers
-for multi-sector DMA, including after arbitrary AVI seeks. Ordinary FFmpeg
-file reads made complete first/second-movie decoding take about 56/128 emulated
-seconds before pixel conversion; aligned read-ahead reduced those figures to
-about 8/19 seconds. The native converter preserves scalar FFmpeg's BT.601
-matrix, bilinear 4:1:0 chroma interpolation and RGB565 ordered dithering without
-linking `libswscale`. It supports the original 320x240 YUV410P frames as RGB565
-or BGRA32, not arbitrary video resizing or replacement pixel formats.
+Use the packaging helper instead of passing `Gex/` directly to `mkdcdisc`:
+
+```sh
+python3 tools/package-dreamcast.py --elf build/dreamcast/gex_recomp.elf \
+  --output build/dreamcast/gex_recomp.cdi
+```
+
+The helper requires host `ffmpeg` and `mkdcdisc`. It copies `Gex/` to a
+temporary staging directory, converts the two startup movies to 320x240,
+15 fps MPEG-1/MP2 (850 kbps video and 32 kHz stereo audio), then packs the
+copy and removes it. The original filenames retain their `.AVI` extensions so
+the guest can find them, although their disc contents are MPEG program streams.
+The original installation is never modified. The lower bitrate differs from
+the 1.5 Mbps visual preview. The decoder uses frame/sample counts for timing;
+pl_mpeg does not honor packet presentation timestamps.
 
 PVR uploads RGB565 through its CPU-written staging texture, then composes and
 presents through the normal GPU path without readback. Direct CPU replacement
@@ -2038,15 +2044,14 @@ automated Flycast runs. Do not select SDL's dummy video driver: the emulator
 still needs a hidden Vulkan-capable surface. The runner explicitly mutes AICA
 output. `MOVIES=1` is mutually exclusive with `AUTOPLAY=1` and requires both
 completion messages, a return to title scene 63, one boot and no memory errors.
-The verified PVR run completed all 457/867 video frames and 335,899/1,274,490
-audio frames, reached the title at about 90.8 emulated seconds and exited
-normally. This is emulator evidence, not physical-console or audible-fidelity
-validation.
+The converted movies contain 457/867 video frames and 975,744/1,850,112
+decoded stereo audio frames. Emulator completion does not establish physical
+console performance or audible synchronization.
 
 Complete intro playback currently requires PVR. The reference software path
 misses the second movie's original game deadline and exceeds main RAM at the
 title transition, even in a software-only binary. With the default movie
-decoder, non-PVR launches must explicitly use `--skip-movies`; unsupported
+decoder, non-PVR launches are rejected; unsupported
 movie/renderer combinations fail at startup rather than cancelling midway or
 running out of memory. Combining the PVR and software renderers with this decoder
 also leaves insufficient RAM for software title loading, even when movies are
@@ -2055,7 +2060,10 @@ skipped. The reference renderer requires a separate software-only build with
 `-DGEX_MOVIE_DECODER_SOURCE="$PWD/src/platform/dreamcast/movie_metadata.c"`
 and `--skip-movies`. This retains the former lightweight AVI metadata reader
 and `-O2` guest compilation for software diagnostics; decoding fails explicitly
-rather than faking playback.
+rather than faking playback. For this metadata-only build, pass
+`--original-movies` to `tools/package-dreamcast.py`; it needs the original AVI
+headers even when movies are skipped. `tools/test-dreamcast.sh` selects this
+mode automatically for non-MPEG decoder builds.
 The software profile is currently validated for title/menu rendering, not
 first-level gameplay: the timed Flycast autoplay check stalls in scene 55.
 Native PVR autoplay reaches scene 3 and exits normally.
@@ -3054,10 +3062,9 @@ To choose a renderer for the bounded run, set `RENDERER=pvr` or
 emulated PVR rendering. The resulting test CDI includes automated arguments;
 repackage without `AUTOPLAY=1` before normal play.
 
-An explicitly requested **manual test means visible fullscreen + gamepad input,
-Vulkan, and audible game audio**: open the application visibly in fullscreen,
-verify the controller is mapped to player one, and disable autoplay and
-fast-forward. Flycast must explicitly select `config:pvr.rend=4` (Vulkan),
+An explicitly requested **manual test means visible fullscreen, Vulkan, and
+audible game audio**: open the application visibly in fullscreen and disable
+autoplay and fast-forward. Keyboard or gamepad may be used. Flycast must explicitly select `config:pvr.rend=4` (Vulkan),
 `config:rend.EmulateFramebuffer=no`,
 `config:aica.Volume=100`, and `audio:backend=auto`, without inheriting
 `SDL_AUDIODRIVER=dummy` or other automated-test audio muting. Its Vulkan backend

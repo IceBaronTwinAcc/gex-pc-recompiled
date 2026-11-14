@@ -26,7 +26,7 @@ static uint64_t audio_frames;
 static void cancel_playback(void) {
     if (playing)
         fprintf(stderr, "[movie] playback cancelled: video=%u audio=%llu elapsed-ms=%u queued=%d\n",
-                video_frames, (unsigned long long)audio_frames, hle_ticks_ms() - movie_start,
+                video_frames, (unsigned long long)audio_frames, (unsigned)(hle_ticks_ms() - movie_start),
                 audio_stream >= 0 ? hle_audio_stream_queued(audio_stream) : 0);
     if (playing && callback) hle_post_message(callback, 0x3B9, 4, 1);
     playing = paused = pending = audio_offset = 0;
@@ -154,8 +154,8 @@ void gex_movie_pump(void) {
             playing = 0;
             if (audio_stream >= 0) hle_audio_stream_close(audio_stream);
             audio_stream = -1;
-            fprintf(stderr, "[movie] playback completed: video=%u audio=%llu\n",
-                    video_frames, (unsigned long long)audio_frames);
+            fprintf(stderr, "[movie] playback completed: video=%u audio=%llu elapsed-ms=%u\n",
+                    video_frames, (unsigned long long)audio_frames, (unsigned)(hle_ticks_ms() - movie_start));
             if (callback) hle_post_message(callback, 0x3B9, 1, 1);
             return;
         }

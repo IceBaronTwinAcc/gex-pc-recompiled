@@ -1,0 +1,49 @@
+--- pl_mpeg.h
++++ pl_mpeg.h
+@@ -1744,37 +1744,7 @@
+ }
+ 
+ inline void plm_sq_copy_bytes(void *dest, const void *src, size_t length) {
+-    uint8_t *d = (uint8_t *)dest;
+-    const uint8_t *s = (const uint8_t *)src;
+-
+-    size_t prefix = ((size_t)32 - ((uintptr_t)d & 31)) & 31;
+-    if (prefix > length) {
+-        prefix = length;
+-    }
+-
+-    for (size_t i = 0; i < prefix; i++) {
+-        d[i] = s[i];
+-    }
+-    d += prefix;
+-    s += prefix;
+-    length -= prefix;
+-
+-    if (length >= 32 && (((uintptr_t)s & 7) == 0)) {
+-        size_t block_bytes = length & ~(size_t)31;
+-        size_t blocks = block_bytes >> 5;
+-
+-        sq_lock(d);
+-        sq_fast_cpy(SQ_MASK_DEST(d), s, blocks);
+-        sq_unlock();
+-
+-        d += block_bytes;
+-        s += block_bytes;
+-        length -= block_bytes;
+-    }
+-
+-    while (length--) {
+-        *d++ = *s++;
+-    }
++    memcpy(dest, src, length);
+ }
+ 
+ int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
+@@ -2795,7 +2765,7 @@
+  __attribute__((aligned(32))) static const float PLM_VIDEO_PICTURE_RATE[] = {
+ 	0.000, 23.976, 24.000, 25.000, 29.970, 30.000, 50.000, 59.940,
+-	60.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000
++	60.000, 0.000, 0.000, 0.000, 0.000, 15.000, 0.000, 0.000
+ };
+ 
+  __attribute__((aligned(32))) static const uint8_t PLM_VIDEO_ZIG_ZAG[] = {

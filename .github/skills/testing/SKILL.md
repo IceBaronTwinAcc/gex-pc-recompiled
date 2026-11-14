@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Build, test, and debug this Gex recompilation with headless automated checks and visible fullscreen, gamepad-controlled manual tests with Vulkan and audio. Use for regressions, gameplay checks, movie playback, and rendering investigations.
+description: Build, test, and debug this Gex recompilation with headless automated checks and visible fullscreen manual tests with Vulkan and audio. Use for regressions, gameplay checks, movie playback, and rendering investigations.
 ---
 
 # Gex testing
@@ -32,8 +32,8 @@ toolchain itself.
 - Launch automated game and test applications headlessly. Use `--headless` for
   `gex_recomp` and `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy` for SDL tests.
   Do not open visible windows for automated checks, including through Wine.
-  An explicit manual test means visible fullscreen with gamepad input, as
-  described below; do not ask for headless-preference confirmation each time.
+  An explicit manual test means visible fullscreen, as described below; do not
+  ask for headless-preference confirmation each time.
 - Preserve `Gex/` and its original executable and assets. Never clean that
   directory or modify it to make a test pass.
 - Isolate automated settings with `XDG_DATA_HOME` in a temporary directory.
@@ -44,15 +44,14 @@ toolchain itself.
 
 ## Manual tests
 
-- "Manual" means **visible fullscreen + gamepad input**. Open the game or
-  emulator visibly in fullscreen and leave control to the user.
+- "Manual" means **visible fullscreen**. Open the game or emulator visibly in
+  fullscreen and leave control to the user.
 - Explicitly use the **Vulkan backend and audible game audio**. Do not inherit
   `SDL_AUDIODRIVER=dummy`, muted volume, or disabled audio drivers from
   automated tests.
 - Disable autoplay and emulator fast-forward. Do not set a dummy video driver
   or launch the visible application with a headless flag.
-- Verify that the connected gamepad is detected and mapped to player one.
-  Do not silently substitute keyboard-only input if the gamepad is unavailable.
+- Manual tests may use keyboard or gamepad.
 - Keep the application running across prompts for manual play, with a bounded
   timeout. Verify startup before handing it over, and stop only that test
   process when the user finishes or asks to stop.

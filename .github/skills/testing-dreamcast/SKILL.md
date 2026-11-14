@@ -31,4 +31,5 @@ and `audio:backend=auto`. For a Dreamcast PVR test, launch the current build in
 Flycast with the guest arguments selecting `--renderer pvr`. Use a separate
 manual-test disc/config without autoplay arguments; preserve the normal
 production disc and settings. Flycast's Vulkan selection is separate from the
-guest's PVR renderer.
+guest's PVR renderer. Keyboard or gamepad input may be used; a gamepad is not
+required.

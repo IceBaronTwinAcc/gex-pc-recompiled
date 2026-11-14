@@ -147,13 +147,13 @@ The [Dreamcast build instructions](development.md#build-and-smoke-check) and
 [Flycast runbook](flycast-testing.md) cover KOS, the supplied compatible
 emulator, manual/fullscreen and headless checks. For an explicitly requested
 Dreamcast build, `tools/build-dreamcast.sh` requires a sourced KOS environment,
-may build/download FFmpeg, and writes fixed paths in `build/dreamcast/`. It
+prepares the pinned MPEG decoder, and writes fixed paths in `build/dreamcast/`. It
 produces an ELF and a `.bin`; it does **not** itself create a CDI. Inspect
 those destinations first. Use the runbook's separate PVR scratch build when
 that specific manual profile is required.
 
 `tools/test-dreamcast.sh` creates a **test CDI** from the ELF and the user's
-`Gex/`, and writes `gex-test.cfg` for certain modes plus `disc.log` and
+`Gex/` after converting the startup movies in temporary staging, and writes `gex-test.cfg` for certain modes plus `disc.log` and
 `test.log` under `build/dreamcast/`. Its fixed paths may overwrite prior test
 artifacts; its emulator settings are not automatically isolated. Read the
 script and set up isolated emulator settings before use. Do not create a CDI

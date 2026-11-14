@@ -9,7 +9,7 @@ Do not reconstruct the commands from conversation history.
 | --- | --- |
 | Linux-only change or documentation | Do not build Dreamcast or run Flycast. |
 | Explicit Dreamcast automated test | Hidden window, muted audio, bounded runner. |
-| Explicit manual Flycast test | Visible fullscreen, Vulkan, audible audio, player-one gamepad; no autoplay or fast-forward. |
+| Explicit manual Flycast test | Visible fullscreen, Vulkan, audible audio, keyboard or gamepad; no autoplay or fast-forward. |
 | VMU image check | Manual test, VMU on port A, inspect its LCD. |
 
 Preserve `Gex/`, normal Flycast settings, existing saves, and release artifacts.
@@ -66,9 +66,9 @@ Only build a replacement when necessary, using the pinned commit and
 
 ## Manual test: complete launch recipe
 
-Prerequisites: Linux desktop, connected gamepad, installed KOS toolchain,
-`mkdcdisc`, `.venv/bin/python`, generated game sources, and the project's
-Dreamcast FFmpeg libraries in `.deps/dreamcast-ffmpeg`.
+Prerequisites: Linux desktop, installed KOS toolchain,
+`mkdcdisc`, `ffmpeg`, `.venv/bin/python`, generated game sources, and the
+project's pinned Dreamcast MPEG decoder.
 Check these before building. Follow the existing build tools for missing
 project prerequisites; do not download another emulator.
 
@@ -103,6 +103,7 @@ if test -d "$HOME/.config/flycast/mappings"; then
     cp -R "$HOME/.config/flycast/mappings" "$TEST_HOME/.config/flycast/"
 fi
 source "$KOS_ENV"
+bash tools/prepare-dreamcast-mpeg.sh
 cmake -S . -B "$WORK/build" \
     -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/dreamcast.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -113,9 +114,9 @@ cmake -S . -B "$WORK/build" \
 cmake --build "$WORK/build" --parallel 3 > "$WORK/build.log" 2>&1
 printf '%s\n' '--data /cd/Gex --skip-movies --renderer pvr' \
     > "$WORK/gex-test.cfg"
-mkdcdisc -e "$WORK/build/gex_recomp.elf" -d Gex \
-    -f "$WORK/gex-test.cfg" -n 'Gex VMU manual test' \
-    -o "$WORK/manual.cdi" > "$WORK/disc.log" 2>&1
+python3 tools/package-dreamcast.py --elf "$WORK/build/gex_recomp.elf" \
+    --file "$WORK/gex-test.cfg" --name 'Gex VMU manual test' \
+    --output "$WORK/manual.cdi" > "$WORK/disc.log" 2>&1
 env -u SDL_AUDIODRIVER -u SDL_VIDEODRIVER \
     HOME="$TEST_HOME" \
     XDG_CONFIG_HOME="$TEST_HOME/.config" \
@@ -148,7 +149,7 @@ does not prove the application is invisible.
 | Evidence | Required interpretation |
 | --- | --- |
 | Vulkan device/renderer initialization | Host presentation uses Vulkan. |
-| `Opened joystick ... on port 0` | Controller mapped to player one; not proof every button is correct. |
+| `Opened joystick ... on port 0` | If a controller is used, it is mapped to player one; not proof every button is correct. |
 | `Enabling Full MMU support` | MMU enabled, but game startup is not yet proven. |
 | `bound 180 imports, 0 unresolved` | Guest executable imports resolved. |
 | `presented first GPU framebuffer` | Guest reached native presentation; not a gameplay verdict. |
@@ -172,7 +173,7 @@ the game does not read or write VMU saves.
 | No serial guest output | Check `config:Debug.SerialConsoleEnabled=yes`; do not infer success from MMU logs. |
 | `bound 0 imports`, blocked SH4 exception | Suspect wrong/incompatible emulator. Verify path/hash before changing game code. |
 | RAM exhaustion, `GEX: Memory Error`, panic, fatal error | Keep the failure log; do not report readiness. Check the selected build/profile. |
-| No gamepad on port 0 | Correct the isolated input mapping or ask for a controller; do not silently switch to keyboard. |
+| No gamepad on port 0 | Use keyboard input, or correct the isolated input mapping if the user wants a controller. |
 | Exit zero before readiness markers | Test ended, not necessarily passed. Inspect output and whether the user closed it. |
 | Timeout exit 124 | Host time limit reached, not proof of a passing game test. |
 

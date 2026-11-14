@@ -263,13 +263,13 @@ int main(int argc, char **argv) {
 #endif
 #ifdef GEX_DREAMCAST_PVR_MOVIES
     if (!check && hardware_renderer != 2) {
-        fprintf(stderr, "[gex] Dreamcast FFmpeg builds require --renderer pvr; other renderers need a separate movie_metadata.c build with --skip-movies\n");
+        fprintf(stderr, "[gex] Dreamcast movie builds require --renderer pvr; other renderers need a separate movie_metadata.c build with --skip-movies\n");
         return 64;
     }
 #endif
 #ifdef GEX_DREAMCAST_SKIP_MOVIES
     if (!skip_movies && !check) {
-        fprintf(stderr, "[gex] metadata-only Dreamcast build requires --skip-movies; use the PVR/FFmpeg build for playback\n");
+        fprintf(stderr, "[gex] metadata-only Dreamcast build requires --skip-movies; use the PVR movie build for playback\n");
         return 64;
     }
 #endif

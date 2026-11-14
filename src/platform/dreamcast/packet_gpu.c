@@ -204,6 +204,23 @@ static unsigned previous_scheduler_hz;
 static target *last_presented;
 static unsigned last_present_vblank;
 static int presentation_paced;
+#ifdef GEX_DREAMCAST_OVERLAP
+static target *pending_present;
+static int async_present_requested;
+static int complete_pending(char *error, size_t size);
+static void complete_pending_or_abort(void) {
+    char error[256];
+    if (complete_pending(error, sizeof error)) {
+        fprintf(stderr, "%s\n", error);
+        abort();
+    }
+}
+#define FENCE(error, size) do { if (complete_pending(error, size)) return -1; } while (0)
+#define FENCE_VOID() complete_pending_or_abort()
+#else
+#define FENCE(error, size) ((void)0)
+#define FENCE_VOID() ((void)0)
+#endif
 static int fail(char *error, size_t size, const char *message);
 static void *zeroed_aligned(size_t alignment, size_t size) {
     void *memory = memalign(alignment, size);
@@ -706,14 +723,6 @@ static void invalidate_rect(texture *t, unsigned offset, unsigned bytes, unsigne
 static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, size_t pitch,
                                         size_t bytes, unsigned rows) {
     WORK(writes, 1);
-    uint64_t previous_epoch = atlas_write_epoch;
-    ++atlas_write_epoch;
-    if (tracked_atlas == atlas) {
-        for (transient_texture *t = transients; t; t = t->next)
-            if (t->atlas == atlas && t->epoch == previous_epoch &&
-                !snapshot_write_overlap(t, offset, pitch, bytes, rows))
-                t->epoch = atlas_write_epoch;
-    }
     if (tracked_atlas != atlas) {
         char error[256];
         if (active && background_replay(active, error, sizeof error)) {
@@ -735,10 +744,9 @@ static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, 
         for (unsigned i = 0; i < REMAP_COUNT; ++i) remaps[i].valid = 0;
         shared_dirty = 1;
     }
-    if (!bytes || !rows) return;
     int reset = bytes >= 0x100000 ||
                 (pitch == 2048 && bytes == 2048 && rows >= 512);
-    for (target *t = targets; t; t = t->next) {
+    for (target *t = targets; bytes && rows && t; t = t->next) {
         if (t->atlas != atlas) continue;
         if (background_affected(t, offset, pitch, bytes, rows)) {
             char error[256];
@@ -760,6 +768,14 @@ static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, 
             t->pal4_draws = 0;
         }
     }
+    /* Replay can create snapshots of the old atlas before the caller writes.
+     * Advance their epoch only after replay has finished. */
+    uint64_t previous_epoch = atlas_write_epoch++;
+    for (transient_texture *t = transients; t; t = t->next)
+        if (t->atlas == atlas && t->epoch == previous_epoch &&
+            !snapshot_write_overlap(t, offset, pitch, bytes, rows))
+            t->epoch = atlas_write_epoch;
+    if (!bytes || !rows) return;
     for (unsigned i = 0; i < 64; ++i) {
         if (palette_keys[i].valid && palette_keys[i].atlas == atlas &&
             write_overlap(palette_keys[i].offset, palette_keys[i].count * 2,
@@ -806,6 +822,7 @@ static void native_atlas_write_rect_impl(const uint8_t *atlas, unsigned offset, 
 
 static void native_atlas_write_rect(const uint8_t *atlas, unsigned offset, size_t pitch,
                                    size_t bytes, unsigned rows) {
+    FENCE_VOID();
     NATIVE_DRAW_BEGIN();
     PROFILE_BEGIN();
     native_atlas_write_rect_impl(atlas, offset, pitch, bytes, rows);
@@ -966,6 +983,19 @@ static void retire_command_resources(void) {
     for (unsigned i = 0; i < SHARED_GROUPS; ++i) shared_groups[i].bank = -1;
 }
 
+static int copy_scanout(target *t, uint32_t address, char *error, size_t size) {
+    if ((address & ~((uint32_t)PVR_RAM_SIZE - 1)) ||
+        address > PVR_RAM_SIZE - 320 * 240 * 2)
+        return fail(error, size, "invalid PVR render framebuffer address");
+    const uint32_t *source = (const uint32_t *)(PVR_RAM_BASE + address);
+    uint32_t *destination = sq_lock(t->image[t->current ^ 1]);
+    for (unsigned y = 0; y < 240; ++y)
+        sq_fast_cpy(destination + y * (TW / 2), source + y * (320 / 2), 320 * 2 / 32);
+    sq_wait();
+    sq_unlock();
+    return 0;
+}
+
 static int flush_commands_impl(int wait_for_render, char *error, size_t size) {
     if (!active || !command_size) return 0;
     if (wait_for_render && command_clear_only) {
@@ -999,19 +1029,17 @@ static int flush_commands_impl(int wait_for_render, char *error, size_t size) {
         if (pvr_list_finish() || pvr_scene_finish())
             return hardware_fail(error, size, "PVR list submission failed");
         if (pvr_wait_ready()) return hardware_fail(error, size, "PVR registration completion failed");
+#ifdef GEX_DREAMCAST_OVERLAP
+        if (!wait_for_render && async_present_requested) {
+            pending_present = active;
+            return 0;
+        }
+#endif
         if (pvr_wait_render_done())
             return hardware_fail(error, size, "PVR framebuffer rendering completion failed");
         if (!wait_for_render) {
             uint32_t address = PVR_GET(PVR_RENDER_ADDR);
-            if ((address & ~((uint32_t)PVR_RAM_SIZE - 1)) ||
-                address > PVR_RAM_SIZE - 320 * 240 * 2)
-                return fail(error, size, "invalid PVR render framebuffer address");
-            const uint32_t *source = (const uint32_t *)(PVR_RAM_BASE + address);
-            uint32_t *destination = sq_lock(active->image[active->current ^ 1]);
-            for (unsigned y = 0; y < 240; ++y)
-                sq_fast_cpy(destination + y * (TW / 2), source + y * (320 / 2), 320 * 2 / 32);
-            sq_wait();
-            sq_unlock();
+            if (copy_scanout(active, address, error, size)) return -1;
         }
         active->current ^= 1;
         active->known_clear = 0;
@@ -1028,6 +1056,30 @@ static int flush_commands(int wait_for_render, char *error, size_t size) {
     PROFILE_END(flush);
     return result;
 }
+
+#ifdef GEX_DREAMCAST_OVERLAP
+static int complete_pending(char *error, size_t size) {
+    /* Pending commands retain their textures, palettes and target until the
+     * completed scanout has been copied into the target's retained image. */
+    target *t = pending_present;
+    if (!t) return 0;
+    if (pvr_wait_render_done())
+        return hardware_fail(error, size, "PVR framebuffer rendering completion failed");
+    uint32_t address = PVR_GET(PVR_RENDER_ADDR);
+    if (copy_scanout(t, address, error, size)) return -1;
+    if (display_wait(address, error, size)) return -1;
+    t->current ^= 1;
+    t->known_clear = 0;
+    command_size = 0;
+    command_replaces = command_clear_only = 0;
+    retire_command_resources();
+    last_presented = t;
+    last_present_vblank = (unsigned)pvr_get_vbl_count();
+    presentation_paced = 1;
+    pending_present = NULL;
+    return 0;
+}
+#endif
 
 static int finish(char *error, size_t size) {
     if (active && background_replay(active, error, size)) return -1;
@@ -1128,6 +1180,9 @@ static void release_cache(void) {
 static void zero_texture_memory(pvr_ptr_t memory, size_t bytes);
 
 static void *create(int width, int height, char *error, size_t size) {
+#ifdef GEX_DREAMCAST_OVERLAP
+    if (complete_pending(error, size)) return NULL;
+#endif
     if (width != 320 || height != 240) {
         fail(error, size, "PVR packet targets require native 320x240");
         return NULL;
@@ -1224,6 +1279,7 @@ static void *create(int width, int height, char *error, size_t size) {
 }
 
 static void destroy(void *data) {
+    FENCE_VOID();
     target *t = data;
     if (active == t) {
         command_size = 0;
@@ -1274,6 +1330,7 @@ static void destroy(void *data) {
 }
 
 static int upload(void *data, const uint16_t *pixels, char *error, size_t size) {
+    FENCE(error, size);
     target *t = data;
     if (t->owned) return fail(error, size, "PVR live framebuffer CPU replacement is forbidden");
     if (background_stop(t, error, size) ||
@@ -1288,6 +1345,7 @@ static int upload(void *data, const uint16_t *pixels, char *error, size_t size) 
 }
 
 static int download(void *data, uint16_t *pixels, char *error, size_t size) {
+    FENCE(error, size);
     target *t = data;
     if (t->owned) return fail(error, size, "PVR live framebuffer readback is forbidden");
     if (background_stop(t, error, size) ||
@@ -1522,6 +1580,7 @@ static int cache_can_reserve(texture *protected, size_t storage, size_t replaced
     size_t available = CACHE_BYTES - cache_bytes + replaced;
     size_t page_available = CACHE_BYTES - SNAPSHOT_BYTES -
                             (cache_bytes - retained_snapshot_bytes) + replaced;
+    if (available >= storage && page_available >= storage) return 1;
     for (transient_texture *t = transients; t; t = t->next)
         if (t->retained_bytes && !t->current && !t->saved_refs && !transient_pinned(t))
             available += t->retained_bytes;
@@ -1837,18 +1896,20 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
             return t;
         }
         int equal = 1;
+        size_t width = end - begin;
+        uint32_t requested_mask = row_mask(begin, end);
+        uint32_t verified_mask = row_mask((begin + 15) & ~15u, end & ~15u);
         /* Pages at the atlas's right edge also contain wrapped framebuffer
          * bytes. Only sampled texels may invalidate a cached CEL texture. */
         for (int y = v0; equal && y < v1; ++y) {
-            unsigned at = (base + y * 2048 + begin) & 0xfffff;
-            size_t bytes = end - begin;
-            size_t first = bytes < 0x100000 - at ? bytes : 0x100000 - at;
             if (m->atlas == tracked_atlas && t->verified_atlas == m->atlas &&
-                !(t->dirty[y] & row_mask(begin, end)))
+                !(t->dirty[y] & requested_mask))
                 continue;
+            unsigned at = (base + y * 2048 + begin) & 0xfffff;
+            size_t first = width < 0x100000 - at ? width : 0x100000 - at;
             equal = same_bytes(t->source + y * row + begin, m->atlas + at, first) &&
-                    same_bytes(t->source + y * row + begin + first, m->atlas, bytes - first);
-            WORK(compared_bytes, bytes);
+                    same_bytes(t->source + y * row + begin + first, m->atlas, width - first);
+            WORK(compared_bytes, width);
             if (equal) {
                 /* Unsampled GPU bytes are unspecified, even when their
                  * zero source snapshot matches the newly requested texels. */
@@ -1861,7 +1922,7 @@ static texture *texture_region_base(const gex_gpu_material *m, int raw,
                 }
                 /* A partial comparison cannot verify neighboring bytes in
                  * its first/last dirty block. The exact region cache can. */
-                t->dirty[y] &= ~row_mask((begin + 15) & ~15u, end & ~15u);
+                t->dirty[y] &= ~verified_mask;
             }
         }
         if (equal) {
@@ -2223,16 +2284,21 @@ static remap_texture *remapped_region_impl(const gex_gpu_material *m, int u0, in
         WORK(remap_budget, 1);
         return NULL;
     }
+    if ((command_size || saved_count) &&
+        (remap_bytes + bytes > REMAP_BYTES ||
+         cache_bytes + bytes > CACHE_BYTES ||
+         cache_bytes - retained_snapshot_bytes + bytes > CACHE_BYTES - SNAPSHOT_BYTES)) {
+        WORK(remap_queued, 1);
+        defer_warming(m, u0, u1, v0, v1);
+        return NULL;
+    }
     remap_texture *victim = NULL;
     for (unsigned i = 0; i < REMAP_COUNT; ++i) {
         remap_texture *t = &remaps[i];
         if (!victim || (!t->valid && victim->valid) ||
             (t->valid == victim->valid && t->used < victim->used)) victim = t;
     }
-    if ((command_size || saved_count) &&
-        (victim->image || remap_bytes + bytes > REMAP_BYTES ||
-         cache_bytes + bytes > CACHE_BYTES ||
-         cache_bytes - retained_snapshot_bytes + bytes > CACHE_BYTES - SNAPSHOT_BYTES)) {
+    if ((command_size || saved_count) && victim->image) {
         WORK(remap_queued, 1);
         defer_warming(m, u0, u1, v0, v1);
         return NULL;
@@ -2460,7 +2526,7 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     uint32_t zero_mask[8] = {0};
     int masked = 0;
     unsigned format = m->page >> 7 & 3;
-    if (format == 2 && !(m->opcode & 2)) {
+    if (format == 2) {
         unsigned left, top, dimension;
         snapshot_bounds(u0, u1, v0, v1, &left, &top, &dimension);
         t->converted = find_snapshot(m, left, top, dimension, zero_mask);
@@ -2480,6 +2546,13 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
                 masked = 1;
             }
         }
+        unsigned left, top, dimension;
+        snapshot_bounds(u0, u1, v0, v1, &left, &top, &dimension);
+        t->converted = find_snapshot(m, left, top, dimension, zero_mask);
+        if (t->converted) {
+            *bank = 0;
+            return 0;
+        }
     }
     char remap_error[256];
     remap_error[0] = 0;
@@ -2497,7 +2570,8 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     if (!t->region) {
         gex_gpu_material neutral = *m;
         neutral.rgb = 0x808080;
-        char page_error[256] = {0};
+        char page_error[256];
+        page_error[0] = '\0';
         t->page = texture_region_impl(&neutral, 1, u0, u1, v0, v1, 1,
                                       page_error, sizeof page_error);
         if (!t->page) {
@@ -2623,6 +2697,7 @@ static int append_texture(const pvr_poly_hdr_t *header, const pvr_vertex_t v[4],
 }
 
 static int native_clear(void *data, char *error, size_t size) {
+    FENCE(error, size);
     NATIVE_DRAW_BEGIN();
     target *t = data;
 #if GEX_PROFILE_RENDERER
@@ -2707,6 +2782,7 @@ static int native_clear(void *data, char *error, size_t size) {
 }
 
 static int native_copy(void *destination, void *source, unsigned shade, char *error, size_t size) {
+    FENCE(error, size);
     target *src = source;
     target *dst = destination;
     if (!src || !dst) return fail(error, size, "invalid PVR framebuffer copy target");
@@ -2849,6 +2925,7 @@ static int native_copy(void *destination, void *source, unsigned shade, char *er
 
 static int native_blit(void *data, int x, int y, int width, int height,
                        const uint8_t *pixels, int pitch, int key, char *error, size_t size) {
+    FENCE(error, size);
     if (!pixels || width <= 0 || height <= 0 || width > TW || height > TH ||
         pitch < width * 2 || x < 0 || y < 0 || x + width > 320 || y + height > 240)
         return fail(error, size, "invalid PVR asset blit");
@@ -2889,6 +2966,7 @@ static int native_blit(void *data, int x, int y, int width, int height,
 }
 
 static int native_present(void *data, char *error, size_t size) {
+    FENCE(error, size);
     target *t = data;
     if (background_stop(t, error, size) || select_target(t, error, size)) return -1;
     if (!command_size && last_presented != t) {
@@ -2909,7 +2987,11 @@ static int native_present(void *data, char *error, size_t size) {
     }
     if (command_size) {
         int result = flush_commands(0, error, size);
-        if (result || display_wait(PVR_GET(PVR_RENDER_ADDR), error, size)) return -1;
+        if (result) return -1;
+#ifdef GEX_DREAMCAST_OVERLAP
+        if (pending_present) return 0;
+#endif
+        if (display_wait(PVR_GET(PVR_RENDER_ADDR), error, size)) return -1;
         last_presented = t;
     } else {
         unsigned vblank = (unsigned)pvr_get_vbl_count();
@@ -3005,8 +3087,19 @@ static int native_present(void *data, char *error, size_t size) {
     return 0;
 }
 
+#ifdef GEX_DREAMCAST_OVERLAP
+static int native_present_async(void *data, char *error, size_t size) {
+    FENCE(error, size);
+    async_present_requested = presentation_paced;
+    int result = native_present(data, error, size);
+    async_present_requested = 0;
+    return result;
+}
+#endif
+
 static int native_movie(void *data, const uint8_t *pixels, int width, int height, int pitch,
                         char *error, size_t size) {
+    FENCE(error, size);
     if (!pixels || width <= 0 || height <= 0 || width > TW || height > TH || pitch < width * 2)
         return fail(error, size, "PVR movie texture dimensions are unsupported");
     target *t = data;
@@ -3058,6 +3151,7 @@ static int native_movie(void *data, const uint8_t *pixels, int width, int height
 }
 
 static void native_bind(void *data, const uint8_t *atlas, unsigned plane) {
+    FENCE_VOID();
     target *t = data;
     if (plane > 1) { fprintf(stderr, "[packet-gpu] invalid picture plane\n"); abort(); }
     if (t->atlas != atlas || t->plane != plane || !t->owned || pictures[plane] != t) {
@@ -3746,6 +3840,7 @@ static int native_packet_impl(void *data, const uint8_t *packet, const gex_raste
 
 static int native_packet(void *data, const uint8_t *packet, const gex_raster_state *s,
                          int offset_x, int offset_y, char *error, size_t size) {
+    FENCE(error, size);
     NATIVE_DRAW_BEGIN();
     PROFILE_BEGIN();
     int result = native_packet_impl(data, packet, s, offset_x, offset_y, error, size);
@@ -3837,6 +3932,7 @@ static int native_polygon_impl(void *data, const gex_gpu_vertex input[4], int le
 static int native_polygon(void *data, const gex_gpu_vertex input[4], int left, int top,
                           int right, int bottom, const gex_gpu_material *m,
                           char *error, size_t size) {
+    FENCE(error, size);
     NATIVE_DRAW_BEGIN();
     PROFILE_BEGIN();
     int result = native_polygon_impl(data, input, left, top, right, bottom, 0, m, error, size);
@@ -3848,6 +3944,7 @@ static int native_polygon(void *data, const gex_gpu_vertex input[4], int left, i
 static int native_polygon_scaled(void *data, const gex_gpu_vertex input[4], int left, int top,
                                  int right, int bottom, int scale, const gex_gpu_material *m,
                                  char *error, size_t size) {
+    FENCE(error, size);
     NATIVE_DRAW_BEGIN();
     PROFILE_BEGIN();
     int result = scale > 0 ?
@@ -3860,6 +3957,7 @@ static int native_polygon_scaled(void *data, const gex_gpu_vertex input[4], int 
 
 static int draw(void *data, const gex_gpu_span *spans, size_t count, const gex_gpu_material *m,
                 char *error, size_t size) {
+    FENCE(error, size);
     if (background_stop(data, error, size) || select_target(data, error, size))
         return -1;
     if (!count)
@@ -3974,6 +4072,9 @@ static int draw(void *data, const gex_gpu_span *spans, size_t count, const gex_g
 }
 
 static uint16_t *history(void *data, size_t bytes, char *error, size_t size) {
+#ifdef GEX_DREAMCAST_OVERLAP
+    if (complete_pending(error, size)) return NULL;
+#endif
     target *t = data;
     if (t->history && t->history_bytes != bytes) {
         fail(error, size, "PVR compatibility history size changed");
@@ -4157,6 +4258,7 @@ done:
 static int native_image(void *data, const gex_gpu_vertex q[4],
                         int left, int top, int right, int bottom,
                         const gex_gpu_image *image, char *error, size_t size) {
+    FENCE(error, size);
     return native_image_with_id(data, q, left, top, right, bottom, image, 0, 0, 0, error, size);
 }
 
@@ -4171,6 +4273,7 @@ static int native_title_image(void *data, const gex_gpu_vertex q[4],
 
 static int native_title_packet(void *target, uint32_t address, const uint8_t *packet,
                                const gex_raster_state *state, char *error, size_t size) {
+    FENCE(error, size);
     return gex_dreamcast_title_packet(target, address, packet, state, native_title_image,
                                       error, size);
 }
@@ -4179,6 +4282,7 @@ static int native_title_packet(void *target, uint32_t address, const uint8_t *pa
 static int native_title_direct(void *target, uint32_t root, uint32_t anchor,
                                const gex_raster_state *state, gex_gpu_direct_state *result,
                                char *error, size_t size) {
+    FENCE(error, size);
     return gex_dreamcast_title_draw_direct_tiles(target, root, anchor, state,
                                                  native_title_image, native_polygon, result,
                                                  error, size);
@@ -4240,6 +4344,11 @@ const gex_packet_gpu *gex_packet_gpu_get(void) {
                                               GEX_DREAMCAST_BACKDROP_PACKET_BOUND
 #else
                                               , NULL, NULL, NULL, 0, 0, 0, NULL, 0
+#endif
+#ifdef GEX_DREAMCAST_OVERLAP
+                                              , native_present_async
+#else
+                                              , NULL
 #endif
     };
     static const gex_packet_gpu backend = {create, destroy, upload, download,

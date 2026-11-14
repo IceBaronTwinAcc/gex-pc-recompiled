@@ -277,6 +277,28 @@ int main(void) {
     assert(rendered[0] == 0 && rendered[1] == 0 && rendered[2] == 0);
     assert(rendered_id != before_modulation);
     modulation[16 * 32 + 31] = 31;
+    modulation[15 * 32 + 31] = 0;
+    assert(gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
+                                      submit, error, sizeof error) == 1);
+    memory[ARENA + 12] = memory[ARENA + 13] = memory[ARENA + 14] = 0x78;
+    assert(gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
+                                      submit, error, sizeof error) == 1);
+    assert(rendered[0] == 0 && rendered[1] == 0 && rendered[2] == 0);
+    modulation[15 * 32 + 31] = 29;
+    memory[ARENA + 12] = 0x28;
+    memory[ARENA + 13] = 0x30;
+    memory[ARENA + 14] = 0x18;
+    for (unsigned component = 0; component < 3; ++component) {
+        unsigned rows[] = {5, 6, 3};
+        unsigned index = rows[component] * 32 + 31;
+        uint8_t saved = modulation[index];
+        modulation[index] = 0;
+        assert(gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
+                                          submit, error, sizeof error) == 1);
+        assert(rendered[component] == 0);
+        modulation[index] = saved;
+    }
+    memory[ARENA + 12] = memory[ARENA + 13] = memory[ARENA + 14] = 0x80;
     state.left = 12;
     unsigned before = submissions;
     assert(gex_dreamcast_title_packet(NULL, ARENA, memory + ARENA, &state,
@@ -289,6 +311,13 @@ int main(void) {
     assert(gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
                                       submit, error, sizeof error) == 1);
     gex_dreamcast_title_forget(ARENA + 8, ARENA + 16);
+    assert(!gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
+                                       submit, error, sizeof error));
+    setup();
+    assert(gex_dreamcast_title_record(&io, OBJECT, CEL, error, sizeof error) == 1);
+    gex_dreamcast_title_forget(ARENA, ARENA + 16);
+    assert(!gex_dreamcast_title_packet(NULL, ARENA, memory + ARENA, &state,
+                                       submit, error, sizeof error));
     assert(!gex_dreamcast_title_packet(NULL, ARENA + 8, memory + ARENA + 8, &state,
                                        submit, error, sizeof error));
     gex_dreamcast_title_reset();
@@ -330,6 +359,16 @@ int main(void) {
     gex_dreamcast_title_forget(ARENA + 8, ARENA + 12);
     assert(!gex_dreamcast_title_has_direct(TAIL1, ARENA + 8));
     gex_dreamcast_title_reset_lists(TAIL1, 0);
+    assert(!gex_dreamcast_title_has_direct(TAIL1, TAIL1));
+    put32(0x4a2b18, TAIL0);
+    put32(0x4a2b14, TAIL1);
+    put32(OBJECT + 0x78, 40u << 16);
+    assert(gex_dreamcast_title_record_direct(&io, OBJECT, CEL, roots, error, sizeof error) == 1);
+    assert(gex_dreamcast_title_draw_direct(NULL, TAIL0, TAIL0, &state, submit,
+                                           error, sizeof error) == 1);
+    assert(rendered_x == 40);
+    gex_dreamcast_title_reset_lists(TAIL0, TAIL1);
+    assert(!gex_dreamcast_title_has_direct(TAIL0, TAIL0));
     assert(!gex_dreamcast_title_has_direct(TAIL1, TAIL1));
     gex_dreamcast_title_reset();
     setup();

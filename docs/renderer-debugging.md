@@ -79,6 +79,54 @@ reuse a matching snapshot before attempting to allocate a full page. Immutable
 transient textures retain their PVR headers separately for each alpha pass;
 per-draw tint remains in the vertices.
 
+For indexed snapshots, recompute the modulation-dependent zero mask before
+lookup: PVR tinting occurs after palette lookup, unlike the software path's
+discard. Direct-color page cache entries that bake modulation also compare the
+modulation table, not just its pointer. Atlas write callbacks run before the
+bytes change: they advance the epoch, retain unaffected snapshots, and leave
+overlapping snapshots stale. Already queued draws retain their old textures.
+Marker retirement can skip the legacy-marker scan when none remain, but must
+still retire direct markers and palettes first.
+
+`GEX_DREAMCAST_OVERLAP` is off by default. Its optional asynchronous present
+submits a scene while retaining commands, textures, palettes and the target.
+The next fenced backend operation waits for rendering, copies scanout into the
+retained target, waits for the display flip, and only then retires resources.
+Atlas writes and destruction also fence. The first present and the normal
+`present` callback remain synchronous. Do not remove these fences or the copy
+without preserving resource and presentation lifetimes.
+
+In a headless Flycast gameplay comparison, synchronous and overlapping runs
+each had 19 of 90 display intervals over 40 ms; their game states were not
+identical. The next clear fenced the pending gameplay frame, limiting the
+opportunity for overlap. Stable 30 FPS, full-route correctness and physical
+hardware behavior remain unverified. A scratch probe of the KOS flip timestamp
+found one pacing wait after a flip already more than 17 ms old in 463 gameplay
+frames, and one in 785 map frames. Recording the vblank at fence completion
+can therefore cause an extra wait, but this sample does not explain the
+frequent slow gameplay frames.
+
+Slow-frame CPU sampling on a packetless gameplay route also found bursts of
+CEL decode, color conversion and texture upload. CELs with up to 16 tiles
+now check rectangle overlap before decoding rather than checking each output
+pixel; larger CELs keep the original per-pixel check. A 12-tile PAL4 synthetic
+Flycast benchmark reduced game-thread CPU time for 300 decodes from about
+442 ms to 371 ms with identical decoded pixels. In separate gameplay samples,
+80 of 365 display intervals were slow before the change and 86 of 372 after;
+the states were not matched. This optimization does not establish a gameplay
+frame-rate improvement or physical hardware performance.
+
+A gameplay trace captured 254 CELs; 193 recaptures matched an earlier guest
+address, source hash, palette hash, pixel count and tile count. Two large,
+13-tile CELs accounted for 56 captures. Hash matches identify candidates for
+investigation, not byte-for-byte proof of equality. A scratch two-entry cache
+for large idle assets produced 47–50 reuse hits over the route. Two 90-frame
+samples had 12 and 14 slow display intervals, versus 18 and 16 in controls,
+but used about 24.3 ms game-thread CPU per frame versus 23.1 ms in controls.
+The sampled state fingerprints differed. The cache was not integrated: these
+results do not prove a benefit, and lifetime and memory-pressure behavior still
+need validation.
+
 For cadence profiling, buffer frame and vblank measurements before printing
 them: serial output every 30 frames can itself cause a missed vblank. Flycast
 timings do not establish physical Dreamcast performance.
@@ -148,8 +196,14 @@ build's `free_transient`.
 
 `00000001 8C336FB8 17DD26FC 8C38F0CC 0000040 8CC152B8`
 
-TODO: [Human-written explanation of the alignment evidence and remaining
-physical-hardware verification.]
+In that diagnostic ELF, the second PC resolved to snapshot-index removal in
+`free_transient`. The reported transient pointer was only 8-byte aligned even
+though its embedded PVR headers require 32-byte alignment. KOS header
+compilation uses cache-line allocation, so a misaligned header could corrupt
+adjacent snapshot-index fields. Dynamic target and transient records now use
+zeroed allocations aligned to their actual types. The user subsequently
+confirmed that the alignment fix worked on hardware; this does not establish
+correctness for every scene or configuration.
 
 ## Experimental packetless map and gameplay draws
 

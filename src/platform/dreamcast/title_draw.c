@@ -8,7 +8,7 @@
 enum { TITLE_PART_LIMIT = 512, TITLE_STORAGE_LIMIT = 2 * 1024 * 1024,
        TITLE_MARKER_SIZE = 8, TITLE_PAIR_SIZE = 16, TITLE_OPCODE = 0x7f,
        TITLE_BUCKETS = 4096, TITLE_DIRECT_BUCKETS = 256,
-       TITLE_ASSET_BUCKETS = 256, MAP_LOCAL_PARTS = 16 };
+       TITLE_ASSET_BUCKETS = 256, MAP_LOCAL_PARTS = 16, TITLE_DRAW_POOL_LIMIT = 512 };
 
 typedef struct {
     uint8_t modulation[1024];
@@ -64,8 +64,10 @@ static title_marker *direct_markers[TITLE_DIRECT_BUCKETS];
 static title_marker **direct_tails[TITLE_DIRECT_BUCKETS];
 static title_marker *root_markers[TITLE_DIRECT_BUCKETS];
 static title_marker **root_tails[TITLE_DIRECT_BUCKETS];
-static size_t direct_count;
+static size_t direct_count, marker_count;
 static size_t storage;
+static title_draw *draw_pool;
+static size_t draw_pool_count;
 static uint64_t next_image_id;
 static palette_transfer *palette_transfers;
 static palette_transfer **palette_tail = &palette_transfers;
@@ -83,6 +85,13 @@ static void insert_asset(title_asset *asset) {
 }
 
 static int make_room(size_t bytes) {
+    while (bytes > TITLE_STORAGE_LIMIT - storage && draw_pool) {
+        title_draw *draw = draw_pool;
+        draw_pool = draw->next;
+        --draw_pool_count;
+        storage -= sizeof *draw;
+        free(draw);
+    }
     for (title_asset *asset = assets;
          bytes > TITLE_STORAGE_LIMIT - storage && asset; asset = asset->next) {
         if (!asset->colors) continue;
@@ -199,8 +208,28 @@ static void release_asset(title_asset *asset) {
 
 static void release_draw(title_draw *draw) {
     if (!draw->is_tile) release_asset(draw->asset);
-    storage -= sizeof *draw;
-    free(draw);
+    if (draw_pool_count < TITLE_DRAW_POOL_LIMIT) {
+        draw->next = draw_pool;
+        draw_pool = draw;
+        ++draw_pool_count;
+    } else {
+        storage -= sizeof *draw;
+        free(draw);
+    }
+}
+
+static int acquire_draw(title_draw **out) {
+    if (draw_pool) {
+        *out = draw_pool;
+        draw_pool = draw_pool->next;
+        --draw_pool_count;
+        return 1;
+    }
+    if (!make_room(sizeof(title_draw))) return 0;
+    *out = malloc(sizeof **out);
+    if (!*out) return -1;
+    storage += sizeof **out;
+    return 1;
 }
 
 static void release_pending(title_draw *pending) {
@@ -304,17 +333,16 @@ static int record_tiles(const gex_gpu_guest_io *io, const gex_dreamcast_tile_dra
             if (tails[i] == tails[j]) return 0;
     title_draw *pending = NULL, **next = &pending;
     for (size_t i = 0; i < count; ++i) {
-        if (tiles[i].layer >= lists / 2 || (tiles[i].palette_address && (!io || !io->prepare_palette)) ||
-            !make_room(sizeof(title_draw))) {
+        if (tiles[i].layer >= lists / 2 || (tiles[i].palette_address && (!io || !io->prepare_palette))) {
             release_pending(pending);
             return 0;
         }
-        title_draw *draw = malloc(sizeof *draw);
-        if (!draw) {
+        title_draw *draw;
+        int acquired = acquire_draw(&draw);
+        if (acquired <= 0) {
             release_pending(pending);
-            return -1;
+            return acquired;
         }
-        storage += sizeof *draw;
         unsigned list = tiles[i].layer * 2;
         *draw = (title_draw){.marker = {{.address = tails[list], .root = roots[list], .draw = draw},
                                         {.address = tails[list + 1], .root = roots[list + 1], .draw = draw}},
@@ -430,6 +458,7 @@ void gex_dreamcast_title_forget(uint32_t begin, uint32_t end) {
     if (begin >= end) return;
     forget_direct(begin, end);
     forget_palettes(begin, end);
+    if (!marker_count) return;
     uint32_t start = begin >= TITLE_MARKER_SIZE - 1 ? begin - (TITLE_MARKER_SIZE - 1) : 0;
     start &= ~3u;
     for (uint64_t at = start; at < end; at += 4) {
@@ -443,6 +472,7 @@ void gex_dreamcast_title_forget(uint32_t begin, uint32_t end) {
                 continue;
             }
             *link = marker->next;
+            --marker_count;
             release_marker(marker);
         }
     }
@@ -465,6 +495,14 @@ void gex_dreamcast_title_reset(void) {
             markers[i] = marker->next;
             release_marker(marker);
         }
+    marker_count = 0;
+    while (draw_pool) {
+        title_draw *draw = draw_pool;
+        draw_pool = draw->next;
+        --draw_pool_count;
+        storage -= sizeof *draw;
+        free(draw);
+    }
 }
 
 static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int backdrop,
@@ -621,16 +659,12 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
         }
         if (backdrop) backdrop_asset = asset;
         ++asset->references;
-        if (!make_room(sizeof(title_draw))) {
+        title_draw *draw;
+        int acquired = acquire_draw(&draw);
+        if (acquired <= 0) {
             release_asset(asset);
-            status = 0; goto rollback;
+            status = acquired; goto rollback;
         }
-        title_draw *draw = malloc(sizeof *draw);
-        if (!draw) {
-            release_asset(asset);
-            status = -1; goto rollback;
-        }
-        storage += sizeof *draw;
         *draw = (title_draw){.marker = {{.address = roots ? tails[0] : position,
                                          .root = roots ? roots[0] : 0, .draw = draw},
                                         {.address = roots ? tails[1] : position + TITLE_MARKER_SIZE,
@@ -687,6 +721,7 @@ static int record(const gex_gpu_guest_io *io, uint32_t object, uint32_t cel, int
                 unsigned bucket = (marker->address >> 2) * 2654435761u >> 20;
                 marker->next = markers[bucket];
                 markers[bucket] = marker;
+                ++marker_count;
             }
         } while (pending != after);
     }
@@ -736,6 +771,14 @@ int gex_dreamcast_scene_cel_record_direct(const gex_gpu_guest_io *io, uint32_t s
 static int signed16(int value) {
     unsigned v = (unsigned)value & 0xffffu;
     return v & 0x8000u ? (int)v - 65536 : (int)v;
+}
+
+static int modulation_matches(const uint8_t *saved, const uint8_t *current, unsigned rgb) {
+    for (unsigned component = 0; component < 3; ++component) {
+        unsigned row = (rgb >> (component * 8 + 3)) & 31;
+        if (memcmp(saved + row * 32, current + row * 32, 32)) return 0;
+    }
+    return 1;
 }
 
 static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned rgb,
@@ -795,7 +838,8 @@ static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned r
     }
     uint16_t *planes = colors->planes;
     if (!colors->valid || colors->rgb != rgb || colors->semitransparent != draw->semitransparent ||
-        !state->modulation || memcmp(colors->modulation, state->modulation, sizeof colors->modulation)) {
+        !state->modulation || (snapshot->cel.format < 2 &&
+                               !modulation_matches(colors->modulation, state->modulation, rgb))) {
         uint32_t visibility[8];
         if (gex_title_cel_visibility(&snapshot->cel, snapshot->palette,
                                      snapshot->palette_size, state->modulation,

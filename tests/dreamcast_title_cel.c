@@ -112,11 +112,55 @@ int main(void) {
 
     put16(image + 32, (uint16_t)-1);
     put16(image + 34, 1);
-    assert(gex_title_cel_bounds(image, sizeof image, &cel) == GEX_TITLE_CEL_OK);
-    assert(gex_title_cel_decode(image, sizeof image, &cel, pixels, 256) == GEX_TITLE_CEL_OVERLAP);
+    for (unsigned format = 0; format < 3; ++format) {
+        image[16] = format;
+        assert(gex_title_cel_bounds(image, sizeof image, &cel) == GEX_TITLE_CEL_OK);
+        assert(gex_title_cel_decode(image, sizeof image, &cel, pixels, 256) == GEX_TITLE_CEL_OVERLAP);
+    }
+
+    {
+        uint8_t many[1024];
+        uint32_t decoded[68];
+        for (unsigned format = 0; format < 3; ++format) {
+            for (unsigned tiles = 16; tiles <= 17; ++tiles) {
+                memset(many, 0, sizeof many);
+                many[16] = (uint8_t)format;
+                unsigned pitch = format == 0 ? 4 : format == 1 ? 8 : 16;
+                for (unsigned i = 0; i < tiles; ++i) {
+                    unsigned source = 200 + i * pitch * 2;
+                    tile(many + 20 + i * 8, source, 2, 2, (int)i * 2 - 7, -3);
+                    for (unsigned row = 0; row < 2; ++row) {
+                        uint8_t *p = many + source + row * pitch;
+                        if (format == 0) p[0] = 0x10;
+                        else if (format == 1) p[1] = 1;
+                        else put16(p + 2, 1);
+                    }
+                }
+                memset(decoded, 0xff, sizeof decoded);
+                assert(gex_title_cel_bounds(many, sizeof many, &cel) == GEX_TITLE_CEL_OK);
+                assert(gex_title_cel_decode(many, sizeof many, &cel, decoded,
+                                            4 * tiles) == GEX_TITLE_CEL_OK);
+                for (unsigned i = 0; i < 4 * tiles; ++i)
+                    assert(decoded[i] == 0x10000u + (i & 1));
+                put16(many + 20 + (tiles - 1) * 8 + 4, (uint16_t)-7);
+                assert(gex_title_cel_bounds(many, sizeof many, &cel) == GEX_TITLE_CEL_OK);
+                assert(gex_title_cel_decode(many, sizeof many, &cel, decoded,
+                                            4 * tiles) == GEX_TITLE_CEL_OVERLAP);
+            }
+        }
+    }
 
     memset(image, 0, sizeof image);
-    tile(image + 20, 36, 3, 2, 0, 0);
+    tile(image + 20, 36, 3, 2, -7, 9);
+    image[36] = 0x10; image[37] = 0x02;
+    image[40] = 0x43; image[41] = 0x05;
+    memset(pixels, 0xff, sizeof pixels);
+    assert(gex_title_cel_bounds(image, sizeof image, &cel) == GEX_TITLE_CEL_OK);
+    assert(cel.left == -7 && cel.top == 9);
+    assert(gex_title_cel_decode(image, sizeof image, &cel, pixels, 6) == GEX_TITLE_CEL_OK);
+    for (unsigned i = 0; i < 6; ++i) assert(pixels[i] == 0x10000u + i);
+    assert(pixels[6] == UINT32_MAX);
+
     image[16] = 1;
     image[36] = 7; image[37] = 0; image[38] = 9;
     image[44] = 11; image[45] = 12; image[46] = 13;
@@ -174,6 +218,21 @@ int main(void) {
     assert(gex_title_cel_colors(&cel, samples, 5, palette, sizeof palette, modulation,
                                 0, 0, opaque, blended) == GEX_TITLE_CEL_OK);
     assert(opaque[1] == 0 && opaque[2] == 0x8000);
+    {
+        uint8_t palette8[512] = {0};
+        uint32_t indices[] = {0x10000, 0x10080, 0x100ff, 0xff, 0x101ff};
+        put16(palette8, 0x001f);
+        put16(palette8 + 0x80 * 2, 0x8001);
+        put16(palette8 + 0xff * 2, 0x7c00);
+        cel.format = 1;
+        assert(gex_title_cel_colors(&cel, indices, 5, palette8, sizeof palette8, modulation,
+                                    0x808080, 1, opaque, blended) == GEX_TITLE_CEL_OK);
+        assert(opaque[0] == 0xfc00 && blended[0] == 0);
+        assert(opaque[1] == 0 && blended[1] == 0x8400);
+        assert(opaque[2] == 0x801f && blended[2] == 0);
+        assert(opaque[3] == 0 && blended[3] == 0);
+        assert(opaque[4] == 0x801f && blended[4] == 0);
+    }
     cel.format = 2;
     samples[1] = 0x1801f;
     assert(gex_title_cel_colors(&cel, samples, 5, NULL, 0, NULL,

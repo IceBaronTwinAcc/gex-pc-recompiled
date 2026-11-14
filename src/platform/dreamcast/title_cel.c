@@ -76,6 +76,47 @@ int gex_title_cel_decode(const uint8_t *image, size_t size,
         cel->width != actual.width || cel->height != actual.height ||
         cel->format != actual.format || cel->tiles != actual.tiles ||
         count < (size_t)actual.width * actual.height) return GEX_TITLE_CEL_INVALID;
+    if (actual.tiles <= 16) {
+        /* Coverage marks every texel, including zero; rectangle overlap is
+         * therefore equivalent to the per-pixel overlap check below. */
+        for (unsigned i = 0; i < actual.tiles; ++i) {
+            const uint8_t *a = image + 20 + i * 8;
+            int ax = (int16_t)word(a + 4), ay = (int16_t)word(a + 6);
+            for (unsigned j = 0; j < i; ++j) {
+                const uint8_t *b = image + 20 + j * 8;
+                int bx = (int16_t)word(b + 4), by = (int16_t)word(b + 6);
+                if (ax < bx + b[2] && bx < ax + a[2] &&
+                    ay < by + b[3] && by < ay + a[3])
+                    return GEX_TITLE_CEL_OVERLAP;
+            }
+        }
+        if (actual.tiles != 1)
+            memset(pixels, 0, (size_t)actual.width * actual.height * sizeof *pixels);
+        for (unsigned tile = 0; tile < actual.tiles; ++tile) {
+            const uint8_t *record = image + 20 + tile * 8;
+            unsigned source = word(record), width = record[2], height = record[3];
+            unsigned padded = (width + 7) & ~7u;
+            size_t pitch = actual.format == 0 ? padded / 2 :
+                           actual.format == 1 ? padded : padded * 2;
+            int x = (int16_t)word(record + 4) - actual.left;
+            int y = (int16_t)word(record + 6) - actual.top;
+            for (unsigned row = 0; row < height; ++row) {
+                const uint8_t *src = image + source + pitch * row;
+                uint32_t *dst = pixels + (y + row) * actual.width + x;
+                if (actual.format == 0) {
+                    for (unsigned col = 0; col < width; ++col)
+                        dst[col] = 0x10000u | ((src[col / 2] >> ((col & 1) * 4)) & 15);
+                } else if (actual.format == 1) {
+                    for (unsigned col = 0; col < width; ++col)
+                        dst[col] = 0x10000u | src[col];
+                } else {
+                    for (unsigned col = 0; col < width; ++col)
+                        dst[col] = 0x10000u | word(src + col * 2);
+                }
+            }
+        }
+        return GEX_TITLE_CEL_OK;
+    }
     memset(pixels, 0, (size_t)actual.width * actual.height * sizeof *pixels);
     for (unsigned tile = 0; tile < actual.tiles; ++tile) {
         size_t at = 20 + 8 * tile;
@@ -87,11 +128,21 @@ int gex_title_cel_decode(const uint8_t *image, size_t size,
         for (unsigned row = 0; row < height; ++row) {
             const uint8_t *src = image + source + pitch * row;
             uint32_t *dst = pixels + (y + row) * actual.width + x;
-            for (unsigned col = 0; col < width; ++col) {
-                if (dst[col]) return GEX_TITLE_CEL_OVERLAP;
-                unsigned value = actual.format == 0 ? (src[col / 2] >> ((col & 1) * 4)) & 15 :
-                                 actual.format == 1 ? src[col] : word(src + col * 2);
-                dst[col] = 0x10000u | value;
+            if (actual.format == 0) {
+                for (unsigned col = 0; col < width; ++col) {
+                    if (dst[col]) return GEX_TITLE_CEL_OVERLAP;
+                    dst[col] = 0x10000u | ((src[col / 2] >> ((col & 1) * 4)) & 15);
+                }
+            } else if (actual.format == 1) {
+                for (unsigned col = 0; col < width; ++col) {
+                    if (dst[col]) return GEX_TITLE_CEL_OVERLAP;
+                    dst[col] = 0x10000u | src[col];
+                }
+            } else {
+                for (unsigned col = 0; col < width; ++col) {
+                    if (dst[col]) return GEX_TITLE_CEL_OVERLAP;
+                    dst[col] = 0x10000u | word(src + col * 2);
+                }
             }
         }
     }
@@ -360,17 +411,30 @@ int gex_title_cel_colors(const gex_title_cel *cel, const uint32_t *pixels,
         count < (size_t)cel->width * cel->height ||
         gex_title_cel_visibility(cel, palette, palette_size, modulation, rgb, mask))
         return GEX_TITLE_CEL_INVALID;
+    if (cel->format < 2) {
+        uint32_t lookup[256];
+        unsigned entries = cel->format ? 256 : 16;
+        for (unsigned index = 0; index < entries; ++index) {
+            unsigned color = word(palette + index * 2);
+            unsigned visible = (mask[index / 32] >> (index & 31)) & 1;
+            uint16_t native = visible ? (uint16_t)(0x8000u | (color & 31u) << 10 |
+                                      (color & 0x3e0u) | (color >> 10 & 31u)) : 0;
+            lookup[index] = semitransparent && (color & 0x8000u) ?
+                            (uint32_t)native << 16 : native;
+        }
+        for (size_t i = 0, n = (size_t)cel->width * cel->height; i < n; ++i) {
+            unsigned value = pixels[i];
+            uint32_t pair = value & 0x10000u ? lookup[value & (entries - 1)] : 0;
+            opaque[i] = (uint16_t)pair;
+            blended[i] = (uint16_t)(pair >> 16);
+        }
+        return GEX_TITLE_CEL_OK;
+    }
     for (size_t i = 0, n = (size_t)cel->width * cel->height; i < n; ++i) {
         unsigned value = pixels[i], color = 0, visible = 0;
         if (value & 0x10000u) {
-            if (cel->format < 2) {
-                unsigned index = value & (cel->format ? 255u : 15u);
-                color = word(palette + index * 2);
-                visible = (mask[index / 32] >> (index & 31)) & 1;
-            } else {
-                color = value & 0xffffu;
-                visible = color != 0;
-            }
+            color = value & 0xffffu;
+            visible = color != 0;
         }
         uint16_t native = visible ? (uint16_t)(0x8000u | (color & 31u) << 10 |
                                               (color & 0x3e0u) | (color >> 10 & 31u)) : 0;

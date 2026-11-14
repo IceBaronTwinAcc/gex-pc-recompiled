@@ -127,7 +127,8 @@ int gex_raster_title_packet(gex_raster *r, uint32_t address, const uint8_t *pack
                             const gex_raster_state *state) {
     if (!gex_raster_gpu_owned(r) || !r->gpu->native->title ||
         !r->gpu->native->title->packet) return 0;
-    char error[512] = {0};
+    char error[512];
+    error[0] = '\0';
     int result = r->gpu->native->title->packet(r->device, address, packet, state,
                                                 error, sizeof error);
     if (result < 0) gpu_fail(error);
@@ -162,7 +163,9 @@ void gex_raster_blit(gex_raster *r, int x, int y, int width, int height,
 void gex_raster_present(gex_raster *r) {
     char error[512] = {0};
     if (!gex_raster_gpu_owned(r)) gpu_fail("device presentation requires a GPU-owned target");
-    if (r->gpu->native->present(r->device, error, sizeof error)) gpu_fail(error);
+    int (*present)(void *, char *, size_t) = r->gpu->native->present_async ?
+        r->gpu->native->present_async : r->gpu->native->present;
+    if (present(r->device, error, sizeof error)) gpu_fail(error);
     if (gex_renderer_device_commit()) gpu_fail(gex_renderer_error());
 }
 
@@ -618,7 +621,8 @@ static void raster_packet_decode(gex_raster *r, const uint8_t *p, const gex_rast
         for (int i = 0; i < 4; ++i)
             vertices[i] = (gex_gpu_vertex){(float)(q[i].x * scale + ox),
                 (float)(q[i].y * scale + oy), (float)q[i].u, (float)q[i].v};
-        char error[512] = {0};
+        char error[512];
+        error[0] = '\0';
         int result = r->gpu->native->polygon_scaled ?
             r->gpu->native->polygon_scaled(r->device, vertices,
                 maximum(0, x0 * scale + ox), maximum(0, y0 * scale + oy),
@@ -762,7 +766,8 @@ static void raster_packet_decode(gex_raster *r, const uint8_t *p, const gex_rast
 static void raster_packet(gex_raster *r, const uint8_t *p, const gex_raster_state *s,
                           int offset_x, int offset_y) {
     if (gex_raster_gpu_owned(r) && r->gpu->native->packet) {
-        char error[256] = {0};
+        char error[256];
+        error[0] = '\0';
         int consumed = r->gpu->native->packet(r->device, p, s, offset_x, offset_y,
                                               error, sizeof error);
         if (consumed < 0) gpu_fail(error);
@@ -773,7 +778,8 @@ static void raster_packet(gex_raster *r, const uint8_t *p, const gex_raster_stat
     }
     raster_packet_decode(r, p, s, offset_x, offset_y);
     if (gex_raster_gpu_owned(r) && r->gpu->native->packet) {
-        char error[256] = {0};
+        char error[256];
+        error[0] = '\0';
         if (r->gpu->native->packet(r->device, NULL, NULL, 0, 0, error, sizeof error) < 0)
             gpu_fail(error);
     }

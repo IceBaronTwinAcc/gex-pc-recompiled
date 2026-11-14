@@ -1219,7 +1219,8 @@ int gex_graphics_title_try(uint32_t object, uint32_t cel) {
     if (!native || !native->title) return 0;
     const gex_gpu_guest_io io = {NULL, title_guest_read, title_guest_write,
                                   title_guest_allocated, title_guest_matches};
-    char error[512] = {0};
+    char error[512];
+    error[0] = '\0';
     uint32_t scene = displayed_level();
     int result;
     if (MEM32(0x4A2964) == 63 && native->title->record) {

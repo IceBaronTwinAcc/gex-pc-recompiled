@@ -15,6 +15,14 @@ static uint8_t table[1024];
 static uint16_t pixels[320 * 240], other[320 * 240];
 static int failures;
 static unsigned misaligned_headers;
+static unsigned render_waits;
+int __real_pvr_wait_render_done(void);
+int __wrap_pvr_wait_render_done(void) {
+    ++render_waits;
+    return __real_pvr_wait_render_done();
+}
+static unsigned counted_headers;
+static int count_headers;
 static size_t counted_pvr_size;
 static unsigned counted_pvr_allocations;
 pvr_ptr_t __real_pvr_mem_malloc(size_t size);
@@ -24,6 +32,7 @@ pvr_ptr_t __wrap_pvr_mem_malloc(size_t size) {
 }
 void __real_pvr_poly_compile(pvr_poly_hdr_t *header, const pvr_poly_cxt_t *context);
 void __wrap_pvr_poly_compile(pvr_poly_hdr_t *header, const pvr_poly_cxt_t *context) {
+    if (count_headers) ++counted_headers;
     if ((uintptr_t)header % _Alignof(pvr_poly_hdr_t)) {
         if (!misaligned_headers) printf("PVR FAIL: misaligned polygon header\n");
         ++misaligned_headers;
@@ -581,6 +590,7 @@ static void shared_palette_regression(const gex_packet_gpu *gpu, int rectangular
     EXPECT(!native->clear(t, error, sizeof error));
     row_cell[0].x = row_cell[2].x = 104; row_cell[1].x = row_cell[3].x = 105;
     EXPECT(!native->polygon(t, row_cell, 0, 0, 320, 240, &material, error, sizeof error));
+    /* The pre-write notification replays the retained background before the mutation. */
     native->atlas_write_rect(atlas, 3 * 2048 + 512, 2048, 1, 2);
     atlas[3 * 2048 + 512] = atlas[4 * 2048 + 512] = 0;
     row_cell[0].x = row_cell[2].x = 105; row_cell[1].x = row_cell[3].x = 106;
@@ -716,6 +726,78 @@ static void deferred_command_regression(const gex_packet_gpu *gpu) {
     for (unsigned i = 0; i < 600; ++i)
         EXPECT(pixels[(10 + i / 300) * 320 + i % 300] == 31);
     gpu->destroy(t);
+}
+
+static void overlap_regression(const gex_packet_gpu *gpu) {
+    if (!gpu->native->present_async) return;
+    char error[256] = {0};
+    void *t = gpu->create(320, 240, error, sizeof error);
+    EXPECT(t != NULL);
+    if (!t) return;
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->present(t, error, sizeof error));
+    gex_gpu_material material = {.opcode = 0x60, .rgb = 0xff};
+    gex_gpu_vertex rect[] = {{10, 10, 0, 0}, {20, 10, 0, 0},
+                             {10, 20, 0, 0}, {20, 20, 0, 0}};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->polygon(t, rect, 0, 0, 320, 240, &material, error, sizeof error));
+    unsigned before = render_waits;
+    EXPECT(!gpu->native->present_async(t, error, sizeof error));
+    EXPECT(render_waits == before);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(render_waits > before);
+    EXPECT(pixels[15 * 320 + 15] == 31);
+
+    uint16_t source[64];
+    for (unsigned i = 0; i < 64; ++i) source[i] = 0xfc00;
+    gex_gpu_image image = {source, NULL, 8, 8};
+    gex_gpu_vertex q[] = {{30, 30, 0, 0}, {38, 30, 8, 0},
+                          {30, 38, 0, 8}, {38, 38, 8, 8}};
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->image(t, q, 0, 0, 320, 240, &image, error, sizeof error));
+    EXPECT(!gpu->native->present_async(t, error, sizeof error));
+    before = render_waits;
+    gpu->native->atlas_write(atlas, 0, 2);
+    EXPECT(render_waits > before);
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[33 * 320 + 33] == 31);
+
+    void *copy = gpu->create(320, 240, error, sizeof error);
+    EXPECT(copy != NULL);
+    if (copy) {
+        gpu->native->bind(t, atlas, 0);
+        gpu->native->atlas_write(atlas, 0, sizeof atlas);
+        memset(atlas, 0, sizeof atlas);
+        put(0xc4002, 31);
+        atlas[1024] = 0x11;
+        gex_gpu_material indexed = {8, 0x6200, 0x2c, 0x808080, atlas, table};
+        gex_gpu_vertex cell[] = {{10, 10, 0, 0}, {11, 10, 1, 0},
+                                 {10, 11, 0, 1}, {11, 11, 1, 1}};
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240, &indexed, error, sizeof error));
+        EXPECT(!gpu->native->present_async(t, error, sizeof error));
+        before = render_waits;
+        gpu->native->atlas_write(atlas, 0xc4002, 2);
+        EXPECT(render_waits > before);
+        put(0xc4002, 0x3e0);
+        EXPECT(!gpu->native->copy(copy, t, 255, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
+        EXPECT(pixels[10 * 320 + 10] == 31);
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        EXPECT(!gpu->native->polygon(t, cell, 0, 0, 320, 240, &indexed, error, sizeof error));
+        EXPECT(!gpu->native->present_async(t, error, sizeof error));
+        EXPECT(!gpu->native->copy(copy, t, 255, error, sizeof error));
+        EXPECT(!download_presented(gpu, copy, pixels, error, sizeof error));
+        EXPECT(pixels[10 * 320 + 10] == 0x3e0);
+        gpu->destroy(copy);
+    }
+
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->polygon(t, rect, 0, 0, 320, 240, &material, error, sizeof error));
+    EXPECT(!gpu->native->present_async(t, error, sizeof error));
+    before = render_waits;
+    gpu->destroy(t);
+    EXPECT(render_waits > before);
 }
 
 static void deferred_clear_switch_regression(const gex_packet_gpu *gpu) {
@@ -2237,6 +2319,22 @@ static void retained_texture_snapshot_regression(const gex_packet_gpu *gpu) {
         EXPECT(pixels[20 * 320 + 14] == (frame == 2 ? 0x3e0 : 5));
         if (frame == 1) EXPECT(pixels[20 * 320 + 30] == 0x3e0);
         if (frame == 2) EXPECT(pixels[20 * 320 + 30] == 0x7c00);
+        if (!frame) {
+            EXPECT(!gpu->native->clear(t, error, sizeof error));
+            material.clut = 0x6040;
+            gex_gpu_vertex cell[] = {{30, 20, 0, 0}, {31, 20, 1, 0},
+                                     {30, 21, 0, 1}, {31, 21, 1, 1}};
+            counted_headers = 0;
+            count_headers = 1;
+            int result = gpu->native->polygon(t, cell, 0, 0, 320, 240,
+                                              &material, error, sizeof error);
+            count_headers = 0;
+            EXPECT(!result);
+            EXPECT(!counted_headers);
+            EXPECT(!gpu->native->present(t, error, sizeof error));
+            EXPECT(!gpu->download(t, pixels, error, sizeof error));
+            EXPECT(pixels[20 * 320 + 30] == 5);
+        }
     }
     gpu->destroy(t);
 }
@@ -3762,6 +3860,21 @@ static void fragmented_alpha_regression(const gex_packet_gpu *gpu, int remap) {
         EXPECT(pixels[50 * 320 + 50] == 31 && pixels[50 * 320 + 51] == 0x3e0);
     }
     for (unsigned i = 0; i < count; ++i) pvr_mem_free(blocks[i].guard);
+    if (!remap && !result) {
+        EXPECT(!native->clear(t, error, sizeof error));
+        material.page = 256 | pages[3];
+        material.opcode = 0x66;
+        counted_headers = 0;
+        count_headers = 1;
+        int repeated = native->polygon(t, alpha, 0, 0, 320, 240,
+                                       &material, error, sizeof error);
+        count_headers = 0;
+        EXPECT(!repeated);
+        EXPECT(!counted_headers);
+        EXPECT(!download_presented(gpu, t, pixels, error, sizeof error));
+        EXPECT(pixels[50 * 320 + 40] >= 14 && pixels[50 * 320 + 40] <= 16);
+        EXPECT(pixels[50 * 320 + 41] == 0x3e0);
+    }
     gpu->destroy(copy); gpu->destroy(t);
 }
 
@@ -5159,6 +5272,7 @@ int main(void) {
     fragmented_alpha_regression(gpu, 0);
     fragmented_alpha_regression(gpu, 1);
     presentation_pacing_regression(gpu);
+    overlap_regression(gpu);
     opaque_region_regression(gpu);
     shared_color_reclamation_regression(gpu);
     shared_palette_regression(gpu, 0);

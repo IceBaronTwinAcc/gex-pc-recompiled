@@ -161,6 +161,9 @@ typedef struct {
     int (*backdrop_tiles_direct)(const gex_gpu_guest_io *io, uint32_t location,
                                  uint16_t palette, const uint32_t roots[2]);
     uint32_t backdrop_packet_bound;
+    /* Optional opt-in submission may return before scanout; subsequent
+     * backend operations must fence its resources before accessing them. */
+    int (*present_async)(void *target, char *error, size_t size);
 } gex_gpu_native_ops;
 
 typedef struct {

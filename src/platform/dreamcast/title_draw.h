@@ -4,9 +4,14 @@
 #include "packet_gpu.h"
 #include "raster.h"
 
+typedef struct {
+    const uint32_t *opaque, *half;
+    unsigned width, height;
+} gex_title_image;
+
 typedef int (*gex_title_image_submit)(void *target, const gex_gpu_vertex vertices[4],
                                       int left, int top, int right, int bottom,
-                                      const gex_gpu_image *image, uint64_t image_id,
+                                      const gex_title_image *image, uint64_t image_id,
                                       unsigned rgb, int vertex_tint,
                                       char *error, size_t size);
 

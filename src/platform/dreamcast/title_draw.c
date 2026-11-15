@@ -16,7 +16,7 @@ typedef struct {
     unsigned rgb, semitransparent;
     int valid, blended;
     uint64_t image_id;
-    uint16_t planes[];
+    uint32_t planes[];
 } title_colors;
 
 typedef struct title_asset {
@@ -72,6 +72,13 @@ static uint64_t next_image_id;
 static palette_transfer *palette_transfers;
 static palette_transfer **palette_tail = &palette_transfers;
 
+static size_t title_plane_words(unsigned width, unsigned height) {
+    unsigned w = 8, h = 8;
+    while (w < width) w *= 2;
+    while (h < height) h *= 2;
+    return (size_t)w * h / 2;
+}
+
 static unsigned asset_bucket(uint32_t image) {
     return (image * UINT32_C(2654435761)) >> 24;
 }
@@ -95,8 +102,9 @@ static int make_room(size_t bytes) {
     for (title_asset *asset = assets;
          bytes > TITLE_STORAGE_LIMIT - storage && asset; asset = asset->next) {
         if (!asset->colors) continue;
-        size_t used = sizeof(title_colors) + (size_t)asset->image.cel.width *
-                      asset->image.cel.height * 2 * sizeof(uint16_t);
+        size_t used = sizeof(title_colors) +
+                      title_plane_words(asset->image.cel.width, asset->image.cel.height) *
+                      2 * sizeof(uint32_t);
         free(asset->colors);
         asset->colors = NULL;
         asset->bytes -= used;
@@ -821,7 +829,11 @@ static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned r
     }
     if (!visible) return 1;
     size_t count = (size_t)snapshot->cel.width * snapshot->cel.height;
-    size_t color_bytes = sizeof(title_colors) + count * 2 * sizeof(uint16_t);
+    unsigned width = 8, height = 8;
+    while (width < snapshot->cel.width) width *= 2;
+    while (height < snapshot->cel.height) height *= 2;
+    size_t words = (size_t)width * height / 2;
+    size_t color_bytes = sizeof(title_colors) + words * 2 * sizeof(uint32_t);
     title_colors *colors = draw->asset->colors;
     int temporary = 0;
     if (!colors) {
@@ -836,7 +848,7 @@ static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned r
             temporary = 1;
         }
     }
-    uint16_t *planes = colors->planes;
+    uint32_t *planes = colors->planes;
     if (!colors->valid || colors->rgb != rgb || colors->semitransparent != draw->semitransparent ||
         !state->modulation || (snapshot->cel.format < 2 &&
                                !modulation_matches(colors->modulation, state->modulation, rgb))) {
@@ -850,14 +862,14 @@ static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned r
         if (!colors->valid || colors->semitransparent != draw->semitransparent ||
             memcmp(colors->visibility, visibility, sizeof visibility)) {
             colors->valid = 0;
-            if (gex_title_cel_colors(&snapshot->cel, snapshot->pixels, count,
-                                     snapshot->palette, snapshot->palette_size, state->modulation,
-                                     rgb, draw->semitransparent, planes, planes + count)) {
+            if (gex_title_cel_colors_twiddle(&snapshot->cel, snapshot->pixels, count,
+                                             snapshot->palette, snapshot->palette_size,
+                                             state->modulation, rgb, draw->semitransparent,
+                                             width, height, planes, planes + words, words,
+                                             &colors->blended)) {
                 if (temporary) free(colors);
                 return fail(error, size, "cannot convert deferred title colors");
             }
-            colors->blended = 0;
-            for (size_t i = 0; i < count; ++i) colors->blended |= planes[count + i] != 0;
             colors->image_id = !temporary && next_image_id != UINT64_MAX ? ++next_image_id : 0;
             memcpy(colors->visibility, visibility, sizeof visibility);
         }
@@ -868,8 +880,8 @@ static int submit_draw(void *target, title_draw *draw, unsigned copy, unsigned r
             colors->valid = 1;
         }
     }
-    gex_gpu_image image = {planes, colors->blended ? planes + count : NULL,
-                           snapshot->cel.width, snapshot->cel.height};
+    gex_title_image image = {planes, colors->blended ? planes + words : NULL,
+                             snapshot->cel.width, snapshot->cel.height};
     int vertex_tint = snapshot->cel.format < 2 ||
                       (!draw->semitransparent && (rgb & 255) != 128 &&
                        ((rgb >> 8) & 255) != 128 && ((rgb >> 16) & 255) != 128);

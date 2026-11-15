@@ -67,11 +67,11 @@ static uint16_t prepare_palette(void *ctx, uint32_t address) {
 
 static int submit_snapshot(void *target, const gex_gpu_vertex vertices[4],
                            int left, int top, int right, int bottom,
-                           const gex_gpu_image *image, uint64_t image_id,
+                           const gex_title_image *image, uint64_t image_id,
                            unsigned rgb, int vertex_tint, char *error, size_t size) {
     (void)target; (void)vertices; (void)left; (void)top; (void)right; (void)bottom;
     (void)image_id; (void)rgb; (void)vertex_tint; (void)error; (void)size;
-    assert(image->width == 2 && image->height == 2 && image->opaque[0] == 0xfc00);
+    assert(image->width == 2 && image->height == 2 && (uint16_t)image->opaque[0] == 0xfc00);
     return 0;
 }
 

@@ -748,6 +748,13 @@ static void overlap_regression(const gex_packet_gpu *gpu) {
     EXPECT(render_waits > before);
     EXPECT(pixels[15 * 320 + 15] == 31);
 
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->native->polygon(t, rect, 0, 0, 320, 240, &material, error, sizeof error));
+    EXPECT(!gpu->native->present_async(t, error, sizeof error));
+    EXPECT(!gpu->native->clear(t, error, sizeof error));
+    EXPECT(!gpu->download(t, pixels, error, sizeof error));
+    EXPECT(pixels[15 * 320 + 15] == 0);
+
     uint16_t source[64];
     for (unsigned i = 0; i < 64; ++i) source[i] = 0xfc00;
     gex_gpu_image image = {source, NULL, 8, 8};
@@ -765,6 +772,13 @@ static void overlap_regression(const gex_packet_gpu *gpu) {
     void *copy = gpu->create(320, 240, error, sizeof error);
     EXPECT(copy != NULL);
     if (copy) {
+        EXPECT(!gpu->native->clear(t, error, sizeof error));
+        EXPECT(!gpu->native->polygon(t, rect, 0, 0, 320, 240, &material, error, sizeof error));
+        EXPECT(!gpu->native->present_async(t, error, sizeof error));
+        EXPECT(!gpu->native->clear(copy, error, sizeof error));
+        EXPECT(!gpu->download(t, pixels, error, sizeof error));
+        EXPECT(pixels[15 * 320 + 15] == 31);
+
         gpu->native->bind(t, atlas, 0);
         gpu->native->atlas_write(atlas, 0, sizeof atlas);
         memset(atlas, 0, sizeof atlas);

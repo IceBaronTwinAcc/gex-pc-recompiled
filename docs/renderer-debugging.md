@@ -66,6 +66,12 @@ a transient cleanup sweep; command retirement and allocation paths still
 perform cleanup. Keep the existing arena retirement and VRAM cache limits when
 changing either index.
 
+Uncompressed CEL verification combines adjacent or overlapping header and tile
+source ranges into a single comparison, but never compares uncaptured gaps.
+Compressed CELs still compare their complete captured source. This reduces
+comparison calls, not the number of source bytes verified; guest mutations
+and palette changes must still be detected between records.
+
 Title packet retirement batches contiguous runs before installing new markers.
 Runs split at arena wrap and before a wrapped range reaches the old cursor, so
 the allocation callback can recognize the wrap. Pending draws hold their
@@ -88,13 +94,29 @@ overlapping snapshots stale. Already queued draws retain their old textures.
 Marker retirement can skip the legacy-marker scan when none remain, but must
 still retire direct markers and palettes first.
 
+The indexed zero-mask scan handles PAL4 directly and scans PAL8 as one or two
+contiguous ranges, splitting at the 1 MiB atlas boundary. It reads the current
+palette and modulation table each time. In a synthetic Flycast SH-4 benchmark,
+40,000 random-palette scans took about 76 ms before and 62 ms after for PAL4,
+and 1,022 ms before and 930 ms after for PAL8. This does not establish a gameplay
+or hardware speedup. A separate byte-verified mask cache increased texture time
+in sampled gameplay and was not retained.
+
 `GEX_DREAMCAST_OVERLAP` is off by default. Its optional asynchronous present
 submits a scene while retaining commands, textures, palettes and the target.
-The next fenced backend operation waits for rendering, copies scanout into the
-retained target, waits for the display flip, and only then retires resources.
+The next fenced backend operation waits for rendering, normally copies scanout
+into the retained target, waits for the display flip, and only then retires
+resources. An immediately following clear of the same active target can skip
+the copy when no background replay remains; the clear replaces its contents.
 Atlas writes and destruction also fence. The first present and the normal
 `present` callback remain synchronous. Do not remove these fences or the copy
 without preserving resource and presentation lifetimes.
+
+On the measured Flycast autoplay route, a scratch counter recorded 120
+consecutive skipped copies during gameplay after earlier mixed copy/skip
+periods. This establishes that the path is reached, not its hardware speed.
+On physical hardware, the earlier diagnostic reported 24 ms in scanout copy
+and 92 ms per sampled frame; the optimized path has not yet been measured.
 
 In a headless Flycast gameplay comparison, synchronous and overlapping runs
 each had 19 of 90 display intervals over 40 ms; their game states were not
@@ -126,6 +148,29 @@ but used about 24.3 ms game-thread CPU per frame versus 23.1 ms in controls.
 The sampled state fingerprints differed. The cache was not integrated: these
 results do not prove a benefit, and lifetime and memory-pressure behavior still
 need validation.
+
+The live CEL path expands covered texels into 32-bit values, then produces
+padded, twiddled color planes directly while tracking blended visibility.
+Deferred title and gameplay CELs upload those planes without a second
+twiddling pass. The decoded snapshot and dynamic palette and modulation
+checks remain in place. Retaining padded planes can increase RAM use; the
+existing storage limit and temporary fallback still apply.
+
+In a synthetic Flycast benchmark of 200 conversions of a 125-by-117 PAL4
+image, the old and fused paths took about 485 and 487 ms for opaque pixels,
+and 625 and 487 ms with blended pixels. These emulator timings do not establish
+an improvement in gameplay frame rate or on physical hardware.
+
+[SH4ZAM](https://github.com/gyrovorbis/sh4zam) supplies SH-4 math and memory
+routines, not a CEL decoder or PVR twiddler. Its
+[memory API](https://github.com/gyrovorbis/sh4zam/blob/master/include/sh4zam/shz_mem.h)
+includes aligned copy and store-queue routines, so it is a candidate for
+testing the final transfer, not a replacement for conversion. KOS also
+provides `pvr_txr_load`, which uses store queues and requires a size divisible
+by 32; the current direct-image path instead writes 32-bit words to VRAM.
+Any transfer experiment must verify source/destination alignment, queue and
+render synchronization, and output before measuring. Neither alternative has
+been benchmarked here on physical hardware.
 
 For cadence profiling, buffer frame and vblank measurements before printing
 them: serial output every 30 frames can itself cause a missed vblank. Flycast

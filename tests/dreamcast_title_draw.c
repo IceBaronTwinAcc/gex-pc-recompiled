@@ -80,12 +80,15 @@ static void allocated(void *context, uint32_t next) {
 
 static int submit(void *target, const gex_gpu_vertex q[4],
                   int left, int top, int right, int bottom,
-                  const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                  const gex_title_image *image, uint64_t image_id, unsigned rgb,
                   int vertex_tint, char *error, size_t size) {
     (void)target; (void)error; (void)size;
     assert(left == 0 && top == 8 && right == 320 && bottom == 232);
     assert(image->width == 2 && image->height == 2 && !image->half);
-    memcpy(rendered, image->opaque, sizeof rendered);
+    rendered[0] = (uint16_t)image->opaque[0];
+    rendered[1] = (uint16_t)image->opaque[1];
+    rendered[2] = (uint16_t)(image->opaque[0] >> 16);
+    rendered[3] = (uint16_t)(image->opaque[1] >> 16);
     rendered_x = q[0].x; rendered_y = q[0].y;
     if (submissions < 32) submission_x[submissions] = rendered_x;
     rendered_id = image_id;
@@ -97,18 +100,18 @@ static int submit(void *target, const gex_gpu_vertex q[4],
 
 static int submit_large(void *target, const gex_gpu_vertex q[4],
                         int left, int top, int right, int bottom,
-                        const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                        const gex_title_image *image, uint64_t image_id, unsigned rgb,
                         int vertex_tint, char *error, size_t size) {
     (void)target; (void)q; (void)left; (void)top; (void)right; (void)bottom;
     (void)image_id; (void)rgb; (void)vertex_tint; (void)error; (void)size;
     assert(image->width == 255 && image->height == 255);
-    rendered[0] = image->opaque[0];
+    rendered[0] = (uint16_t)image->opaque[0];
     return 0;
 }
 
 static int submit_clip(void *target, const gex_gpu_vertex q[4],
                        int left, int top, int right, int bottom,
-                       const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                       const gex_title_image *image, uint64_t image_id, unsigned rgb,
                        int vertex_tint, char *error, size_t size) {
     (void)target; (void)q; (void)image; (void)image_id; (void)rgb;
     (void)vertex_tint; (void)error; (void)size;
@@ -119,12 +122,12 @@ static int submit_clip(void *target, const gex_gpu_vertex q[4],
 
 static int submit_backdrop(void *target, const gex_gpu_vertex q[4],
                            int left, int top, int right, int bottom,
-                           const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                           const gex_title_image *image, uint64_t image_id, unsigned rgb,
                            int vertex_tint, char *error, size_t size) {
     (void)target; (void)error; (void)size; (void)vertex_tint;
     assert(left == 0 && top == 8 && right == 320 && bottom == 232);
     assert(image->width == 64 && image->height == 32 && !image->half && image_id);
-    assert(image->opaque[0] == backdrop_color);
+    assert((uint16_t)image->opaque[0] == backdrop_color);
     assert(q[0].x == (float)((backdrop_submissions / 8) * 64));
     assert(q[0].y == (float)((backdrop_submissions % 8) * 32));
     assert(rgb == 0x102030);
@@ -134,7 +137,7 @@ static int submit_backdrop(void *target, const gex_gpu_vertex q[4],
 
 static int sample_backdrop(void *target, const gex_gpu_vertex q[4],
                            int left, int top, int right, int bottom,
-                           const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                           const gex_title_image *image, uint64_t image_id, unsigned rgb,
                            int vertex_tint, char *error, size_t size) {
     (void)target; (void)image_id; (void)vertex_tint; (void)error; (void)size;
     assert(backdrop_samples_count < 80 && image->width == 64 && image->height == 32);
@@ -142,13 +145,13 @@ static int sample_backdrop(void *target, const gex_gpu_vertex q[4],
     memcpy(sample->q, q, sizeof sample->q);
     sample->left = left; sample->top = top;
     sample->right = right; sample->bottom = bottom;
-    sample->color = image->opaque[0]; sample->rgb = rgb;
+    sample->color = (uint16_t)image->opaque[0]; sample->rgb = rgb;
     return 0;
 }
 
 static int sample_backdrop_sequence(void *target, const gex_gpu_vertex q[4],
                                     int left, int top, int right, int bottom,
-                                    const gex_gpu_image *image, uint64_t image_id, unsigned rgb,
+                                    const gex_title_image *image, uint64_t image_id, unsigned rgb,
                                     int vertex_tint, char *error, size_t size) {
     (void)target; (void)q; (void)left; (void)top; (void)right; (void)bottom;
     (void)image_id; (void)rgb; (void)vertex_tint; (void)error; (void)size;

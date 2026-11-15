@@ -104,8 +104,13 @@ int gex_title_cel_decode(const uint8_t *image, size_t size,
                 const uint8_t *src = image + source + pitch * row;
                 uint32_t *dst = pixels + (y + row) * actual.width + x;
                 if (actual.format == 0) {
-                    for (unsigned col = 0; col < width; ++col)
-                        dst[col] = 0x10000u | ((src[col / 2] >> ((col & 1) * 4)) & 15);
+                    unsigned col = 0;
+                    for (; col + 1 < width; col += 2) {
+                        unsigned pair = src[col / 2];
+                        dst[col] = 0x10000u | (pair & 15);
+                        dst[col + 1] = 0x10000u | (pair >> 4);
+                    }
+                    if (col < width) dst[col] = 0x10000u | (src[col / 2] & 15);
                 } else if (actual.format == 1) {
                     for (unsigned col = 0; col < width; ++col)
                         dst[col] = 0x10000u | src[col];
@@ -352,9 +357,8 @@ int gex_title_cel_matches_image(gex_title_cel_read read, gex_title_cel_match mat
         return matches_bytes(read, match, context, image, 0, snapshot->source,
                              snapshot->source_size);
     size_t records = 20 + ((size_t)snapshot->cel.tiles + 1) * 8;
-    if (records > snapshot->source_size ||
-        !matches_bytes(read, match, context, image, 0, snapshot->source, records))
-        return 0;
+    if (records > snapshot->source_size) return 0;
+    size_t begin = 0, end = records;
     for (unsigned i = 0; i < snapshot->cel.tiles; ++i) {
         const uint8_t *record = snapshot->source + 20 + i * 8;
         size_t source = word(record), width = record[2], height = record[3];
@@ -362,11 +366,19 @@ int gex_title_cel_matches_image(gex_title_cel_read read, gex_title_cel_match mat
         size_t pitch = snapshot->cel.format == 0 ? padded / 2 :
                        snapshot->cel.format == 1 ? padded : padded * 2;
         size_t bytes = pitch * height;
-        if (source > snapshot->source_size || bytes > snapshot->source_size - source ||
-            !matches_bytes(read, match, context, image, source, snapshot->source + source, bytes))
-            return 0;
+        if (source > snapshot->source_size || bytes > snapshot->source_size - source) return 0;
+        if (source <= end && source + bytes >= begin) {
+            if (source < begin) begin = source;
+            if (source + bytes > end) end = source + bytes;
+        } else {
+            if (!matches_bytes(read, match, context, image, begin,
+                               snapshot->source + begin, end - begin)) return 0;
+            begin = source;
+            end = source + bytes;
+        }
     }
-    return 1;
+    return matches_bytes(read, match, context, image, begin,
+                         snapshot->source + begin, end - begin);
 }
 
 int gex_title_cel_matches(gex_title_cel_read read, gex_title_cel_match match, void *context,
@@ -449,6 +461,69 @@ static unsigned spread(unsigned value) {
     value = (value | value << 4) & 0x0f0f;
     value = (value | value << 2) & 0x3333;
     return (value | value << 1) & 0x5555;
+}
+
+static uint32_t direct_color_pair(uint32_t value, int semitransparent) {
+    unsigned color = value & 0xffffu;
+    if (!(value & 0x10000u) || !color) return 0;
+    unsigned native = 0x8000u | (color & 31u) << 10 |
+                      (color & 0x3e0u) | (color >> 10 & 31u);
+    return semitransparent && (color & 0x8000u) ? native << 16 : native;
+}
+
+int gex_title_cel_colors_twiddle(const gex_title_cel *cel, const uint32_t *pixels,
+                                 size_t count, const uint8_t *palette, size_t palette_size,
+                                 const uint8_t *modulation, unsigned rgb, int semitransparent,
+                                 unsigned width, unsigned height, uint32_t *opaque,
+                                 uint32_t *blended, size_t word_count, int *has_blended) {
+    uint32_t visibility[8], lookup[256];
+    if (!cel || !pixels || !opaque || !blended || !has_blended ||
+        !cel->width || !cel->height || width < 8 || width > 256 ||
+        (width & (width - 1)) || height < 8 || height > 256 ||
+        (height & (height - 1)) || cel->width > width || cel->height > height ||
+        count < (size_t)cel->width * cel->height ||
+        word_count < (size_t)width * height / 2 ||
+        gex_title_cel_visibility(cel, palette, palette_size, modulation, rgb, visibility))
+        return GEX_TITLE_CEL_INVALID;
+    unsigned entries = cel->format == 0 ? 16 : 256;
+    if (cel->format < 2) {
+        for (unsigned index = 0; index < entries; ++index) {
+            unsigned color = word(palette + index * 2);
+            unsigned visible = (visibility[index / 32] >> (index & 31)) & 1;
+            uint32_t native = visible ? 0x8000u | (color & 31u) << 10 |
+                                      (color & 0x3e0u) | (color >> 10 & 31u) : 0;
+            lookup[index] = semitransparent && (color & 0x8000u) ? native << 16 : native;
+        }
+    }
+    size_t output_words = (size_t)width * height / 2;
+    memset(opaque, 0, output_words * sizeof *opaque);
+    memset(blended, 0, output_words * sizeof *blended);
+    unsigned side = width < height ? width : height, mask = side - 1;
+    unsigned x_offsets[128], any_blended = 0;
+    for (unsigned x = 0; x < width; x += 2)
+        x_offsets[x / 2] = (spread(x & mask) << 1) / 2 +
+                           (x / side) * side * side / 2;
+    for (unsigned y = 0; y < cel->height; y += 2) {
+        unsigned y_offset = spread(y & mask) / 2 + (y / side) * side * side / 2;
+        const uint32_t *row = pixels + (size_t)y * cel->width;
+        const uint32_t *next = y + 1 < cel->height ? row + cel->width : NULL;
+        for (unsigned x = 0; x < cel->width; ++x) {
+            uint32_t p = row[x], q = next ? next[x] : 0;
+            if (cel->format < 2) {
+                p = p & 0x10000u ? lookup[p & (entries - 1)] : 0;
+                q = q & 0x10000u ? lookup[q & (entries - 1)] : 0;
+            } else {
+                p = direct_color_pair(p, semitransparent);
+                q = direct_color_pair(q, semitransparent);
+            }
+            unsigned at = y_offset + x_offsets[x / 2] + (x & 1);
+            opaque[at] = (p & 0xffffu) | (q & 0xffffu) << 16;
+            blended[at] = (p >> 16) | (q & 0xffff0000u);
+            any_blended |= blended[at];
+        }
+    }
+    *has_blended = any_blended != 0;
+    return GEX_TITLE_CEL_OK;
 }
 
 int gex_title_cel_twiddle(const gex_title_cel *cel, const uint16_t *pixels,

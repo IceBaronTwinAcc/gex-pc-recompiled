@@ -23,8 +23,11 @@ static int read_guest(void *context, uint32_t address, void *out, size_t size) {
     return 0;
 }
 
+static unsigned match_calls;
+
 static int match_guest(void *context, uint32_t address, const void *data, size_t size) {
     const uint8_t *memory = context;
+    ++match_calls;
     if (address > 1024 || size > 1024 - address) return -1;
     return memcmp(memory + address, data, size) == 0;
 }
@@ -67,10 +70,49 @@ static void check_rectangular_twiddle(unsigned width, unsigned height) {
         }
 }
 
+static void check_fused_colors(unsigned image_width, unsigned image_height,
+                               unsigned width, unsigned height, unsigned format,
+                               unsigned rgb, int semitransparent) {
+    uint32_t pixels[256], opaque_words[128], blended_words[128], actual_opaque[128], actual_blended[128];
+    uint16_t opaque[256], blended[256];
+    uint8_t palette[512], modulation[1024];
+    size_t count = image_width * image_height, words = width * height / 2;
+    gex_title_cel cel = {.width = image_width, .height = image_height, .format = format};
+    for (unsigned i = 0; i < 256; ++i)
+        put16(palette + i * 2, i % 11 ? (i * 733u) & 0xffffu : 0);
+    for (unsigned tint = 0; tint < 32; ++tint)
+        for (unsigned channel = 0; channel < 32; ++channel)
+            modulation[tint * 32 + channel] = (uint8_t)((tint * channel / 16) & 31);
+    for (size_t i = 0; i < count; ++i)
+        pixels[i] = i % 7 ? 0x10000u | ((i * 2749u) & 0xffffu) : 0;
+    assert(gex_title_cel_colors(&cel, pixels, count, palette, sizeof palette, modulation,
+                                rgb, semitransparent, opaque, blended) == GEX_TITLE_CEL_OK);
+    assert(gex_title_cel_twiddle(&cel, opaque, count, width, height,
+                                 opaque_words, words) == GEX_TITLE_CEL_OK);
+    assert(gex_title_cel_twiddle(&cel, blended, count, width, height,
+                                 blended_words, words) == GEX_TITLE_CEL_OK);
+    int has_blended = -1, expected = 0;
+    for (size_t i = 0; i < count; ++i) expected |= blended[i] != 0;
+    assert(gex_title_cel_colors_twiddle(&cel, pixels, count, palette, sizeof palette,
+                                        modulation, rgb, semitransparent, width, height,
+                                        actual_opaque, actual_blended, words,
+                                        &has_blended) == GEX_TITLE_CEL_OK);
+    assert(has_blended == expected);
+    assert(!memcmp(actual_opaque, opaque_words, words * sizeof *opaque_words));
+    assert(!memcmp(actual_blended, blended_words, words * sizeof *blended_words));
+}
+
 int main(void) {
     uint8_t image[128] = {0};
     uint32_t pixels[256];
     gex_title_cel cel;
+
+    for (unsigned format = 0; format < 3; ++format)
+        for (int semitransparent = 0; semitransparent < 2; ++semitransparent) {
+            check_fused_colors(13, 5, 16, 8, format, 0x808080, semitransparent);
+            check_fused_colors(5, 13, 8, 16, format, 0, semitransparent);
+            check_fused_colors(8, 8, 8, 8, format, 0x4d83cb, semitransparent);
+        }
 
     uint8_t compressed[] = {7, 0, 0, 0, 0x82, 2, 0,
                             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
@@ -160,6 +202,27 @@ int main(void) {
     assert(gex_title_cel_decode(image, sizeof image, &cel, pixels, 6) == GEX_TITLE_CEL_OK);
     for (unsigned i = 0; i < 6; ++i) assert(pixels[i] == 0x10000u + i);
     assert(pixels[6] == UINT32_MAX);
+
+    {
+        uint8_t packed[36 + 128 * 2] = {0};
+        uint32_t decoded[255 * 2];
+        for (unsigned width = 1; width <= 255; ++width) {
+            unsigned pitch = ((width + 7) & ~7u) / 2;
+            tile(packed + 20, 36, width, 2, 0, 0);
+            for (unsigned row = 0; row < 2; ++row)
+                for (unsigned col = 0; col < pitch; ++col)
+                    packed[36 + row * pitch + col] = (uint8_t)(col * 37 + row * 53);
+            assert(gex_title_cel_bounds(packed, sizeof packed, &cel) == GEX_TITLE_CEL_OK);
+            assert(gex_title_cel_decode(packed, sizeof packed, &cel, decoded,
+                                        width * 2) == GEX_TITLE_CEL_OK);
+            for (unsigned row = 0; row < 2; ++row)
+                for (unsigned col = 0; col < width; ++col) {
+                    unsigned byte = packed[36 + row * pitch + col / 2];
+                    assert(decoded[row * width + col] ==
+                           (0x10000u | ((byte >> ((col & 1) * 4)) & 15)));
+                }
+        }
+    }
 
     image[16] = 1;
     image[36] = 7; image[37] = 0; image[38] = 9;
@@ -406,6 +469,9 @@ int main(void) {
            snapshot.cel.width == 7 && snapshot.cel.height == 3);
     assert(snapshot.palette_size == 32 && snapshot.pixels[0] == 0x10000 &&
            snapshot.pixels[1] == 0x10001 && snapshot.pixels[19] == 0x10004);
+    match_calls = 0;
+    assert(gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    assert(match_calls == 1);
     assert(gex_title_cel_matches(read_guest, NULL, memory, capture_image, capture_palette, &snapshot));
     assert(gex_title_cel_matches(read_guest, match_guest, memory, capture_image, capture_palette, &snapshot));
     assert(!gex_title_cel_matches(read_guest, match_error, memory, capture_image, capture_palette, &snapshot));
@@ -417,6 +483,9 @@ int main(void) {
     assert(!gex_title_cel_matches(read_guest, match_guest, memory, capture_image, capture_palette, &snapshot));
     assert(!gex_title_cel_matches(read_guest, NULL, memory, capture_image, capture_palette, &snapshot));
     memory[capture_image + 44] ^= 1;
+    memory[capture_image + 52] ^= 1;
+    assert(!gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    memory[capture_image + 52] ^= 1;
     memory[capture_image + 24] ^= 1;
     assert(!gex_title_cel_matches(read_guest, match_guest, memory, capture_image, capture_palette, &snapshot));
     memory[capture_image + 24] ^= 1;
@@ -427,6 +496,22 @@ int main(void) {
            snapshot.palette[2] == 0xe0);
     gex_title_cel_release(&snapshot);
     assert(!snapshot.pixels && !snapshot.palette_size);
+
+    memset(memory + capture_image, 0, 100);
+    tile(memory + capture_image + 20, 48, 3, 2, -2, 1);
+    tile(memory + capture_image + 28, 64, 2, 1, 3, 3);
+    assert(gex_title_cel_capture(read_guest, memory, capture_image, capture_palette,
+                                 &snapshot) == GEX_TITLE_CEL_OK);
+    match_calls = 0;
+    assert(gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    assert(match_calls == 3);
+    memory[capture_image + 45] ^= 1;
+    memory[capture_image + 60] ^= 1;
+    assert(gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    memory[capture_image + 64] ^= 1;
+    assert(!gex_title_cel_matches_image(read_guest, match_guest, memory, capture_image, &snapshot));
+    gex_title_cel_release(&snapshot);
+    memset(memory + capture_image, 0, 100);
 
     tile(memory + capture_image + 20, 44, 3, 2, 0, 0);
     tile(memory + capture_image + 28, 52, 2, 1, 1, 1);

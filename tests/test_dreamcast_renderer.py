@@ -8,6 +8,68 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DreamcastRendererTests(unittest.TestCase):
+    def test_indexed_visibility_mask_wrap_and_modulation(self):
+        source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
+        start = source.index("static int modulates_to_zero(")
+        helper = source[start:source.index("static void context(", start)]
+        harness = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef struct {
+    unsigned clut, rgb;
+    const uint8_t *atlas, *modulation;
+} gex_gpu_material;
+static unsigned word(const uint8_t *p) { return p[0] | (unsigned)p[1] << 8; }
+"""
+        harness += helper
+        harness += r"""
+static uint8_t atlas[0x100000], modulation[1024];
+static unsigned random_state = 1;
+static unsigned next(void) {
+    random_state = random_state * 1664525u + 1013904223u;
+    return random_state;
+}
+int main(void) {
+    for (unsigned i = 0; i < sizeof atlas; ++i) atlas[i] = next() >> 24;
+    for (unsigned i = 0; i < sizeof modulation; ++i) modulation[i] = (next() >> 30) & 1;
+    for (unsigned trial = 0; trial < 4000; ++trial) {
+        unsigned format = trial & 1;
+        unsigned clut = trial < 32 ? 32767 - trial : next() & 32767;
+        unsigned rgb = next() & 0xffffff;
+        gex_gpu_material m = {clut, rgb, atlas, modulation};
+        uint32_t expected[8] = {0}, actual[8] = {0};
+        unsigned count = format ? 256 : 16;
+        for (unsigned i = 0; i < count; ++i) {
+            unsigned c = word(atlas + ((clut * 32 + i * 2) & 0xffffe));
+            if (c && !(c & 0x8000) &&
+                !modulation[(rgb & 255) / 8 * 32 + (c & 31)] &&
+                !modulation[(rgb >> 8 & 255) / 8 * 32 + (c >> 5 & 31)] &&
+                !modulation[(rgb >> 16 & 255) / 8 * 32 + (c >> 10 & 31)])
+                expected[i / 32] |= UINT32_C(1) << (i & 31);
+        }
+        int any = 0;
+        for (unsigned i = 0; i < 8; ++i) any |= expected[i] != 0;
+        int result = indexed_visibility_mask(&m, format, actual);
+        if (result != any || memcmp(actual, expected, sizeof actual)) {
+            fprintf(stderr, "mask mismatch: trial=%u format=%u clut=%u\n", trial, format, clut);
+            return 1;
+        }
+        modulation[next() % sizeof modulation] ^= 1;
+        atlas[next() % sizeof atlas] ^= 1;
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="gex-pvr-visibility-") as work:
+            work = Path(work)
+            (work / "test.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                            "-fno-sanitize-recover=all", str(work / "test.c"),
+                            "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True, timeout=30)
+
     def test_pvr_fractional_rectangle_fit(self):
         source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
         start = source.index("static int fit_rectangle_axis(")
@@ -366,13 +428,15 @@ int main(void) {
         source = (ROOT / "src/platform/dreamcast/packet_gpu.c").read_text()
         flush = source[source.index("static int flush_commands_impl("):
                        source.index("static int flush_commands(", source.index("static int flush_commands_impl("))]
+        copy = source[source.index("static int copy_scanout("):
+                      source.index("static int flush_commands_impl(")]
         context = source[source.index("static void context("):
                          source.index("static void vertices(")]
         quad = source[source.index("static void picture_quad("):
                       source.index("static void clear_texture_reads(")]
         self.assertIn("PVR_FILTER_NONE", context)
         self.assertIn("if (!wait_for_render) {", flush)
-        self.assertIn("source + y * (320 / 2), 320 * 2 / 32", flush)
+        self.assertIn("source + y * (320 / 2), 320 * 2 / 32", copy)
         self.assertIn("PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, TW, TH", quad)
         self.assertIn("vertices(v, 0, 0, 320, 240, 0, 0, 320.0f / TW, 240.0f / TH,", quad)
         self.assertIn("picture_quad(&header, v, current_image(active), 255)", flush)

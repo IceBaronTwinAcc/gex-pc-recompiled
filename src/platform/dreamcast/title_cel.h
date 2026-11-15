@@ -49,6 +49,11 @@ int gex_title_cel_colors(const gex_title_cel *cel, const uint32_t *pixels,
 int gex_title_cel_twiddle(const gex_title_cel *cel, const uint16_t *pixels,
                           size_t count, unsigned width, unsigned height,
                           uint32_t *words, size_t word_count);
+int gex_title_cel_colors_twiddle(const gex_title_cel *cel, const uint32_t *pixels,
+                                 size_t count, const uint8_t *palette, size_t palette_size,
+                                 const uint8_t *modulation, unsigned rgb, int semitransparent,
+                                 unsigned width, unsigned height, uint32_t *opaque,
+                                 uint32_t *blended, size_t word_count, int *has_blended);
 
 /* Capture pixels and, for indexed images, the palette for deferred replay.
  * The palette address must contain 16 or 256 BGR555 entries matching the

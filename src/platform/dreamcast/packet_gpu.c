@@ -119,7 +119,7 @@ typedef struct transient_texture {
     unsigned current, saved_refs;
     uint16_t *direct_pixels;
     size_t direct_count;
-    unsigned direct_width, direct_height, direct_passes;
+    unsigned direct_width, direct_height, direct_passes, direct_twiddled;
     uint32_t direct_hash;
     struct transient_texture *next;
     struct transient_texture *title_next;
@@ -882,11 +882,51 @@ static unsigned modulate(unsigned c, const gex_gpu_material *m, int mask) {
                                           ((c >> (i * 5)) & 31)] << (i * 5);
     return result;
 }
-static int modulates_to_zero(unsigned c, const gex_gpu_material *m) {
+static int modulates_to_zero(unsigned c, const uint8_t *red,
+                             const uint8_t *green, const uint8_t *blue) {
     return c && !(c & 0x8000) &&
-           !m->modulation[(m->rgb & 255) / 8 * 32 + (c & 31)] &&
-           !m->modulation[(m->rgb >> 8 & 255) / 8 * 32 + (c >> 5 & 31)] &&
-           !m->modulation[(m->rgb >> 16 & 255) / 8 * 32 + (c >> 10 & 31)];
+           !red[c & 31] && !green[c >> 5 & 31] && !blue[c >> 10 & 31];
+}
+
+static int visibility_mask_range(const uint8_t *palette, unsigned first, unsigned end,
+                                 const uint8_t *red, const uint8_t *green,
+                                 const uint8_t *blue, uint32_t mask[8]) {
+    int masked = 0;
+    for (unsigned i = first; i < end; ++i, palette += 2) {
+        if (modulates_to_zero(word(palette), red, green, blue)) {
+            mask[i / 32] |= UINT32_C(1) << (i & 31);
+            masked = 1;
+        }
+    }
+    return masked;
+}
+
+static int indexed_visibility_mask(const gex_gpu_material *m, unsigned format, uint32_t mask[8]) {
+    if (format == 0) {
+        int masked = 0;
+        for (unsigned i = 0; i < 16; ++i) {
+            unsigned c = word(m->atlas + ((m->clut * 32 + i * 2) & 0xffffe));
+            if (c && !(c & 0x8000) &&
+                !m->modulation[(m->rgb & 255) / 8 * 32 + (c & 31)] &&
+                !m->modulation[(m->rgb >> 8 & 255) / 8 * 32 + (c >> 5 & 31)] &&
+                !m->modulation[(m->rgb >> 16 & 255) / 8 * 32 + (c >> 10 & 31)]) {
+                mask[0] |= UINT32_C(1) << i;
+                masked = 1;
+            }
+        }
+        return masked;
+    }
+    unsigned count = 256;
+    unsigned source = m->clut * 32 & 0xfffff;
+    unsigned first = (0x100000 - source) / 2;
+    if (first > count) first = count;
+    const uint8_t *red = m->modulation + (m->rgb & 255) / 8 * 32;
+    const uint8_t *green = m->modulation + (m->rgb >> 8 & 255) / 8 * 32;
+    const uint8_t *blue = m->modulation + (m->rgb >> 16 & 255) / 8 * 32;
+    int masked = visibility_mask_range(m->atlas + source, 0, first, red, green, blue, mask);
+    if (first < count)
+        masked |= visibility_mask_range(m->atlas, first, count, red, green, blue, mask);
+    return masked;
 }
 
 static void context(pvr_poly_cxt_t *c, pvr_ptr_t image, int format, int w, int h) {
@@ -1058,17 +1098,19 @@ static int flush_commands(int wait_for_render, char *error, size_t size) {
 }
 
 #ifdef GEX_DREAMCAST_OVERLAP
-static int complete_pending(char *error, size_t size) {
-    /* Pending commands retain their textures, palettes and target until the
-     * completed scanout has been copied into the target's retained image. */
+static int complete_pending_for_clear(target *clear_target, char *error, size_t size) {
+    /* Retain submitted resources through render completion and the flip. */
     target *t = pending_present;
     if (!t) return 0;
     if (pvr_wait_render_done())
         return hardware_fail(error, size, "PVR framebuffer rendering completion failed");
     uint32_t address = PVR_GET(PVR_RENDER_ADDR);
-    if (copy_scanout(t, address, error, size)) return -1;
+    /* An immediately following clear replaces this target before its retained
+     * image can be read. Other fences must preserve the completed scanout. */
+    int discard = t == clear_target && active == t && !t->background_mode;
+    if (!discard && copy_scanout(t, address, error, size)) return -1;
     if (display_wait(address, error, size)) return -1;
-    t->current ^= 1;
+    if (!discard) t->current ^= 1;
     t->known_clear = 0;
     command_size = 0;
     command_replaces = command_clear_only = 0;
@@ -1078,6 +1120,10 @@ static int complete_pending(char *error, size_t size) {
     presentation_paced = 1;
     pending_present = NULL;
     return 0;
+}
+
+static int complete_pending(char *error, size_t size) {
+    return complete_pending_for_clear(NULL, error, size);
 }
 #endif
 
@@ -2538,14 +2584,7 @@ static int native_texture_region_impl(const gex_gpu_material *m, int u0, int u1,
     if (format < 2) {
         /* Software discards indexed colors after modulation, but PVR applies
          * tint after palette lookup. Preserve those discarded indices in alpha. */
-        unsigned count = format == 0 ? 16 : 256;
-        for (unsigned i = 0; i < count; ++i) {
-            unsigned c = word(m->atlas + ((m->clut * 32 + i * 2) & 0xffffe));
-            if (modulates_to_zero(c, m)) {
-                zero_mask[i / 32] |= UINT32_C(1) << (i & 31);
-                masked = 1;
-            }
-        }
+        masked = indexed_visibility_mask(m, format, zero_mask);
         unsigned left, top, dimension;
         snapshot_bounds(u0, u1, v0, v1, &left, &top, &dimension);
         t->converted = find_snapshot(m, left, top, dimension, zero_mask);
@@ -2697,7 +2736,11 @@ static int append_texture(const pvr_poly_hdr_t *header, const pvr_vertex_t v[4],
 }
 
 static int native_clear(void *data, char *error, size_t size) {
+#ifdef GEX_DREAMCAST_OVERLAP
+    if (complete_pending_for_clear(data, error, size)) return -1;
+#else
     FENCE(error, size);
+#endif
     NATIVE_DRAW_BEGIN();
     target *t = data;
 #if GEX_PROFILE_RENDERER
@@ -4089,12 +4132,19 @@ static uint16_t *history(void *data, size_t bytes, char *error, size_t size) {
     return t->history;
 }
 
-static uint32_t direct_image_hash(const gex_gpu_image *image, unsigned passes) {
+static uint32_t direct_image_hash(const gex_gpu_image *image, unsigned passes,
+                                  size_t count, int already_twiddled) {
     uint32_t hash = 2166136261u;
-    size_t count = (size_t)image->width * image->height;
     for (unsigned pass = 0; pass < passes; ++pass) {
         const uint16_t *pixels = pass ? image->half : image->opaque;
-        for (size_t i = 0; i < count; ++i) hash = (hash ^ pixels[i]) * 16777619u;
+        if (already_twiddled) {
+            const uint32_t *words = (const uint32_t *)pixels;
+            for (size_t i = 0; i < count / 2; ++i)
+                hash = (hash ^ words[i]) * 16777619u;
+        } else {
+            for (size_t i = 0; i < count; ++i)
+                hash = (hash ^ pixels[i]) * 16777619u;
+        }
     }
     return hash;
 }
@@ -4102,7 +4152,7 @@ static uint32_t direct_image_hash(const gex_gpu_image *image, unsigned passes) {
 static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                                 int left, int top, int right, int bottom,
                                 const gex_gpu_image *image, uint64_t title_id,
-                                unsigned rgb, int vertex_tint,
+                                unsigned rgb, int vertex_tint, int already_twiddled,
                                 char *error, size_t size) {
     if (!data || !q || !image || !image->opaque || !image->width || !image->height ||
         image->width > 256 || image->height > 256)
@@ -4128,8 +4178,9 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
     while (height < image->height) height *= 2;
     size_t bytes = (size_t)width * height * sizeof(uint16_t);
     unsigned passes = image->half ? 2 : 1;
-    size_t count = (size_t)image->width * image->height;
-    uint32_t hash = title_id ? 0 : direct_image_hash(image, passes);
+    size_t count = already_twiddled ? (size_t)width * height :
+                                     (size_t)image->width * image->height;
+    uint32_t hash = title_id ? 0 : direct_image_hash(image, passes, count, already_twiddled);
     transient_texture *texture = NULL;
     for (transient_texture *t = title_id ? title_textures[title_texture_bucket(title_id)] : transients;
          t; t = title_id ? t->title_next : t->next)
@@ -4141,6 +4192,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                                      count * sizeof(uint16_t)))) &&
             t->direct_width == image->width &&
             t->direct_height == image->height && t->direct_passes == passes &&
+            t->direct_twiddled == (unsigned)already_twiddled &&
             t->direct_count == count) {
             texture = t;
             break;
@@ -4151,9 +4203,9 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
     int result = -1;
     uint32_t *staging = NULL;
     if (!texture) {
-        staging = malloc(bytes);
+        if (!already_twiddled) staging = malloc(bytes);
         texture = zeroed_aligned(_Alignof(transient_texture), sizeof *texture);
-        if (!staging || !texture) {
+        if ((!already_twiddled && !staging) || !texture) {
             free(texture);
             fail(error, size, "cannot allocate PVR direct image staging");
             goto done;
@@ -4164,7 +4216,8 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
         gex_title_cel cel = {.width = image->width, .height = image->height};
         for (unsigned pass = 0; pass < passes; ++pass) {
             const uint16_t *pixels = pass ? image->half : image->opaque;
-            if (gex_title_cel_twiddle(&cel, pixels, count, width, height,
+            if (!already_twiddled &&
+                gex_title_cel_twiddle(&cel, pixels, count, width, height,
                                       staging, bytes / sizeof *staging) != GEX_TITLE_CEL_OK) {
                 fail(error, size, "invalid PVR direct image staging");
                 goto done;
@@ -4178,7 +4231,8 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                 goto done;
             }
             volatile uint32_t *destination = texture->image[pass];
-            for (size_t i = 0; i < bytes / sizeof *staging; ++i) destination[i] = staging[i];
+            const uint32_t *source = already_twiddled ? (const uint32_t *)pixels : staging;
+            for (size_t i = 0; i < bytes / sizeof *source; ++i) destination[i] = source[i];
         }
         size_t storage = bytes * passes;
         size_t limit = title_id ? TITLE_SNAPSHOT_BYTES : SNAPSHOT_BYTES;
@@ -4215,6 +4269,7 @@ static int native_image_with_id(void *data, const gex_gpu_vertex q[4],
                 texture->direct_width = image->width;
                 texture->direct_height = image->height;
                 texture->direct_passes = passes;
+                texture->direct_twiddled = (unsigned)already_twiddled;
                 texture->direct_count = count;
                 texture->direct_hash = hash;
                 texture->retained_bytes = storage;
@@ -4259,16 +4314,18 @@ static int native_image(void *data, const gex_gpu_vertex q[4],
                         int left, int top, int right, int bottom,
                         const gex_gpu_image *image, char *error, size_t size) {
     FENCE(error, size);
-    return native_image_with_id(data, q, left, top, right, bottom, image, 0, 0, 0, error, size);
+    return native_image_with_id(data, q, left, top, right, bottom, image, 0, 0, 0, 0, error, size);
 }
 
 static int native_title_image(void *data, const gex_gpu_vertex q[4],
                               int left, int top, int right, int bottom,
-                              const gex_gpu_image *image, uint64_t title_id,
+                              const gex_title_image *image, uint64_t title_id,
                               unsigned rgb, int vertex_tint,
                               char *error, size_t size) {
-    return native_image_with_id(data, q, left, top, right, bottom, image, title_id,
-                                rgb, vertex_tint, error, size);
+    gex_gpu_image view = {(const uint16_t *)image->opaque, (const uint16_t *)image->half,
+                          image->width, image->height};
+    return native_image_with_id(data, q, left, top, right, bottom, &view, title_id,
+                                rgb, vertex_tint, 1, error, size);
 }
 
 static int native_title_packet(void *target, uint32_t address, const uint8_t *packet,

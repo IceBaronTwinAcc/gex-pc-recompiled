@@ -1,3 +1,8 @@
+## POOPY BAD DON'T PLAY THIS
+This project is more of an experiment to investigate the possibility of quick porting of PC games to the Dreamcast via static recompilation.
+Technically it works but the product is far from optimal and the decompilation approach produces better results, partially due to LLMs understanding the codebase better.
+The PC version technically works but eh
+
 ![GexRecompiled logo](docs/GexRecompLogo.png)
 
 [![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/1158-gex/)
